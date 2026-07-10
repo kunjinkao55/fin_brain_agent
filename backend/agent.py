@@ -13,7 +13,9 @@ from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-load_dotenv()
+# 从项目根目录加载.env（兼容从任意目录运行）
+_env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", ".env")
+load_dotenv(_env_path)
 
 # ============================================================
 #  LLM 初始化（多提供商切换）
@@ -58,13 +60,13 @@ class FinBrainState(TypedDict):
 @tool
 def stock_price(symbol: str) -> str:
     """查询A股实时价格。输入股票代码如 '601991' 或 '300502'"""
-    from tools import fetch_stock_price
+    from backend.tools import fetch_stock_price
     return json.dumps(fetch_stock_price(symbol), ensure_ascii=False, indent=2)
 
 @tool
 def stock_history(symbol: str, scale: int = 240, datalen: int = 30) -> str:
     """查询A股历史K线数据。symbol:股票代码 scale:240=日线 datalen:条数"""
-    from tools import fetch_stock_history
+    from backend.tools import fetch_stock_history
     result = fetch_stock_history(symbol, scale, datalen)
     if "data" in result and len(result["data"]) > 10:
         result["data"] = result["data"][-10:]
@@ -73,41 +75,120 @@ def stock_history(symbol: str, scale: int = 240, datalen: int = 30) -> str:
 @tool
 def financial_statements(symbol: str) -> str:
     """查询近三年三大报表：利润表、资产负债表、现金流量表。输入股票代码"""
-    from tools import get_financial_statements
+    from backend.tools import get_financial_statements
     return json.dumps(get_financial_statements(symbol), ensure_ascii=False, indent=2)
 
 @tool
 def valuation(symbol: str) -> str:
     """查询估值指标：ROE、毛利率、净利率、每股收益、资产负债率等。输入股票代码"""
-    from tools import get_valuation
+    from backend.tools import get_valuation
     return json.dumps(get_valuation(symbol), ensure_ascii=False, indent=2)
 
 @tool
 def industry_info(symbol: str) -> str:
     """查询个股所属行业分类及行业指数表现。输入股票代码"""
-    from tools import get_industry_info
+    from backend.tools import get_industry_info
     return json.dumps(get_industry_info(symbol), ensure_ascii=False, indent=2)
 
 @tool
 def fund_flow(symbol: str) -> str:
     """查询个股当日资金流向：主力净流入/流出/净额。输入股票代码如 601991"""
-    from tools import get_fund_flow
+    from backend.tools import get_fund_flow
     return json.dumps(get_fund_flow(symbol), ensure_ascii=False, indent=2)
 
 @tool
 def limit_up_pool(top_n: int = 30) -> str:
     """获取今日涨停板股票池。返回涨停股列表及涨幅/换手率/市值。参数: top_n=返回数量"""
-    from tools import get_limit_up_pool
+    from backend.tools import get_limit_up_pool
     result = get_limit_up_pool(top_n)
     if "列表" in result and len(result["列表"]) > 15:
         # 只返回前15只给LLM，节省token
         result["列表"] = result["列表"][:15]
     return json.dumps(result, ensure_ascii=False, indent=2)
 
+# ============================================================
+#  模拟盘工具
+# ============================================================
+
+@tool
+def place_order(action: str, symbol: str, shares: int = 0, price: float = None,
+                pct: float = 0) -> str:
+    """模拟盘下单。action:'buy'/'sell'/'reset', symbol:股票代码, shares:股数(sell时-1=全仓),
+       pct:按百分比买入(>0时忽略shares), reset用: action='reset', symbol='1000000'(初始资金)"""
+    from backend.portfolio import get_portfolio
+    pf = get_portfolio()
+    if action.lower() == "reset":
+        cash = float(symbol) if symbol.replace(".","").isdigit() else None
+        result = pf.reset(cash)
+    elif action.lower() == "buy":
+        if pct > 0:
+            result = pf.buy_pct(symbol, pct)
+        else:
+            result = pf.buy(symbol, shares, price)
+    elif action.lower() == "sell":
+        if pct > 0:
+            result = pf.sell_pct(symbol, pct)
+        else:
+            result = pf.sell(symbol, shares, price)
+    else:
+        result = {"error": "action必须是buy/sell/reset"}
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+@tool
+def show_portfolio(dummy: str = "") -> str:
+    """查看模拟盘持仓和盈亏总览。"""
+    from backend.portfolio import get_portfolio
+    pf = get_portfolio()
+    data = pf.summary()
+    lines = ["=" * 64, "  FinBrain 模拟盘", "=" * 64, ""]
+    lines.append(f"  初始资金: {data['初始资金']:>12,.0f}")
+    lines.append(f"  现金:     {data['现金']:>12,.0f}  持仓市值: {data['持仓市值']:>12,.0f}  总资产: {data['总资产']:>12,.0f}")
+    lines.append(f"  累计收益率: {data['累计收益率']:>10}  浮动盈亏: {data['总盈亏']:>12,.0f} ({data['总盈亏%']})")
+    lines.append("")
+    if data["持仓明细"]:
+        lines.append(f"  {'代码':<8} {'名称':<8} {'持仓':>6} {'成本':>8} {'现价':>8} {'市值':>10} {'盈亏':>10} {'盈亏%':>8}")
+        lines.append(f"  {'-'*8} {'-'*8} {'-'*6} {'-'*8} {'-'*8} {'-'*10} {'-'*10} {'-'*8}")
+        for p in data["持仓明细"]:
+            lines.append(f"  {p['代码']:<8} {p['名称']:<8} {p['持仓']:>6} {p['成本价']:>8.2f} {p['现价']:>8.2f} {p['市值']:>10,.0f} {p['盈亏']:>10,.0f} {p['盈亏%']:>8}")
+    else:
+        lines.append("  (空仓)")
+    lines.append("")
+    return "\n".join(lines)
+
+@tool
+def trade_history(n: int = 10) -> str:
+    """查看最近N笔交易记录。"""
+    from backend.portfolio import get_portfolio
+    pf = get_portfolio()
+    trades = pf.recent_trades(n)
+    if not trades:
+        return "(无交易记录)"
+    lines = [f"最近{len(trades)}笔交易:"]
+    for t in trades[-n:]:
+        lines.append(f"  {t['date']} {t['action']:4} {t['symbol']} {t['name']} x{t['shares']} @{t['price']} {t.get('pnl_pct','')}")
+    return "\n".join(lines)
+
+
+@tool
+def execute_analysis(action: str = "buy", symbol: str = "", pct: float = 5) -> str:
+    """一键执行分析建议下单。action:'buy'/'sell', symbol:股票代码, pct:仓位百分比(默认5%)"""
+    from backend.portfolio import get_portfolio
+    pf = get_portfolio()
+    if not symbol:
+        return json.dumps({"error":"请指定股票代码"}, ensure_ascii=False)
+    if action == "buy":
+        result = pf.buy_pct(symbol, pct)
+    elif action == "sell":
+        result = pf.sell_pct(symbol, pct)
+    else:
+        result = {"error": "action必须是buy或sell"}
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 @tool
 def concept_ranking(top_n: int = 20) -> str:
     """获取同花顺概念板块列表。返回概念名称和代码。参数: top_n=返回数量"""
-    from tools import get_concept_ranking
+    from backend.tools import get_concept_ranking
     return json.dumps(get_concept_ranking(top_n), ensure_ascii=False, indent=2)
 
 
@@ -116,7 +197,7 @@ def screen_stocks(max_pe: float = 30, max_pb: float = 5,
                   min_mktcap: float = 20, top_n: int = 30) -> str:
     """全市场扫描，返回PE从低到高排列的A股列表。
     参数: max_pe=市盈率上限, max_pb=市净率上限, min_mktcap=最低市值(亿), top_n=返回条数"""
-    from tools import screen_stocks as do_screen
+    from backend.tools import screen_stocks as do_screen
     result = do_screen(max_pe, max_pb, min_mktcap, top_n)
     if "text" in result:
         return result["text"]
@@ -129,18 +210,19 @@ def screen_stocks(max_pe: float = 30, max_pb: float = 5,
 @tool
 def dragon_tiger_list(date: str = "") -> str:
     """获取今日龙虎榜上榜股票列表。返回上榜股及买入/卖出总额。"""
-    from tools import get_dragon_tiger_list
+    from backend.tools import get_dragon_tiger_list
     return json.dumps(get_dragon_tiger_list(date), ensure_ascii=False, indent=2)
 
 @tool
 def dragon_tiger_detail(symbol: str) -> str:
     """查询个股龙虎榜买卖席位明细，识别知名游资（炒股养家/方新侠/上塘路等）。输入股票代码"""
-    from tools import get_dragon_tiger_detail
+    from backend.tools import get_dragon_tiger_detail
     return json.dumps(get_dragon_tiger_detail(symbol), ensure_ascii=False, indent=2)
 
 # ---- 妖股猎人工具集 ----
 _PHANTOM_TOOLS = [limit_up_pool, concept_ranking, dragon_tiger_list, dragon_tiger_detail,
-                  stock_price, stock_history, fund_flow, financial_statements, valuation, industry_info]
+                  stock_price, stock_history, fund_flow, financial_statements, valuation, industry_info,
+                  place_order, execute_analysis, show_portfolio, trade_history]
 _PHANTOM_AGENT = None
 
 def _get_phantom_agent():
@@ -221,7 +303,9 @@ ANALYST_PROMPT = """你是 FinBrain 高级分析师。根据搜集到的财务�
   },
   "亮点": [...], "风险": [...],
   "操作建议": "一句话", "止损": "条件",
-  "结论": {"总评":"...","买入策略":"...","持有策略":"...","卖出条件":"...","预期收益":"...","持仓周期":"..."}
+  "结论": {"总评":"...","买入策略":"...","持有策略":"...","卖出条件":"...","预期收益":"...","持仓周期":"..."},
+  "交易指令": {"action":"buy","symbol":"300502","pct":5,"condition":"回调至450元"}
+  // action: buy/sell/hold, pct: 仓位百分比, condition: 触发条件
 }
 """
 
@@ -230,7 +314,8 @@ ANALYST_PROMPT = """你是 FinBrain 高级分析师。根据搜集到的财务�
 # ============================================================
 
 _data_collector_tools = [stock_price, stock_history, financial_statements,
-                         valuation, industry_info, screen_stocks, fund_flow]
+                         valuation, industry_info, screen_stocks, fund_flow,
+                         place_order, execute_analysis, show_portfolio, trade_history]
 
 _COLLECTOR_AGENT = None
 
@@ -273,7 +358,7 @@ REPORTER_PROMPT = """你是 FinBrain 报告格式化专员。
 
 def reporter_node(state: FinBrainState) -> dict:
     """代码生成评分卡（对齐表格）+ LLM生成叙述"""
-    from tools import format_report
+    from backend.tools import format_report
     raw = state.get("analysis", "")
 
     if not raw.strip():
@@ -380,7 +465,7 @@ def _dicts_to_messages(history: list) -> list:
             msgs.append(AIMessage(content=m["content"]))
     return msgs
 
-_CHAT_TOOLS = [stock_price, stock_history]
+_CHAT_TOOLS = [stock_price, stock_history, place_order, execute_analysis, show_portfolio, trade_history]
 _CHAT_AGENT = None
 
 def _get_chat_agent():

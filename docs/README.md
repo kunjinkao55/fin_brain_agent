@@ -71,8 +71,11 @@ pip install akshare pandas requests beautifulsoup4 py-mini-racer
 echo "LLM_PROVIDER=deepseek" > .env
 echo "DEEPSEEK_API_KEY=sk-your-key" >> .env
 
-# 3. 运行
-python agent.py
+# 3. 运行 (CLI)
+python run.py
+
+# 4. 运行 (Web界面)
+streamlit run frontend/app.py
 ```
 
 ```
@@ -94,16 +97,26 @@ Type 'quit' to exit, 'clear' to reset context
 
 ```
 agent/
-├── agent.py               # LangGraph Agent 主程序
-├── tools.py               # 10个纯数据函数 + 格式化工具
-├── MCP_server.py          # MCP 兼容层(可给Claude Code用)
-├── .env                   # LLM配置 + API Key
-├── .gitignore
-├── README.md              # 本文件
-├── 开发文档.md             # 详细设计文档
-├── 财报选股agent.md        # 原始需求文档
-├── kline_601991.html      # K线图示例
-└── kline_300502.html      # K线图示例
+├── run.py                    # 启动入口: python run.py
+├── configs/
+│   ├── .env                  # LLM配置 + API Key
+│   └── .gitignore
+├── backend/
+│   ├── agent.py              # LangGraph Agent (~550行)
+│   ├── tools.py              # 10个数据工具 (~750行)
+│   ├── portfolio.py          # 模拟盘模块 (~180行)
+│   ├── portfolio.json        # 持仓数据(自动生成)
+│   └── MCP_server.py         # MCP兼容层
+├── frontend/
+│   └── app.py                # Streamlit 前端
+├── docs/
+│   ├── README.md             # 本文件
+│   ├── 开发文档.md            # 详细设计文档
+│   └── 财报选股agent.md       # 原始需求文档
+├── data/
+│   ├── raw/                  # 中间数据
+│   └── final/                # 最终输出
+└── .gitignore
 ```
 
 ## 技术栈
@@ -120,13 +133,11 @@ agent/
 
 | 优先级 | 模块 | 说明 |
 |:--:|------|------|
-| 1 | Streamlit 前端 | 可视化仪表盘、K线图、报告卡片 |
-| 2 | RAG 知识库 | ChromaDB, 会计准则+游资风格+题材舆情向量检索 |
-| 3 | 记忆持久化 | SQLite/MongoDB 存用户偏好+历史会话 |
-| 4 | 席位级游资分析 | 需付费数据源 (东方财富push2被封) |
-| 5 | Harness 熔断落地 | 妖股3日回撤>10%自动暂停模块 |
-| 6 | 分时量价工具 | 日内分时数据 + 烂板出妖股识别 |
-| 7 | 测试用例 | 端到端回归测试 + 离线评估集 |
+| 1 | RAG 知识库 | ChromaDB, 会计准则+游资风格+题材舆情向量检索 |
+| 2 | 记忆持久化 | 数据库存用户偏好+历史会话 |
+| 3 | 席位级游资分析 | 需付费数据源 |
+| 4 | Harness 熔断落地 | 妖股回撤>10%自动暂停 |
+| 5 | 测试用例 | 端到端回归测试 |
 
 ## 简历要点
 
