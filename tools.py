@@ -462,3 +462,308 @@ def get_fund_flow(symbol: str) -> dict:
 
     except Exception as e:
         return {"error": f"资金流查询失败: {str(e)}"}
+
+
+# ============================================================
+#  工具7：格式化报告（Reporter 用，纯函数，不需要 LLM）
+# ============================================================
+
+def format_report(analysis: dict) -> str:
+    """将 Analyst 的结构化 JSON 转换为对齐文本表格。
+
+    期望输入格式:
+    {
+      "代码": "300502", "名称": "新易盛",
+      "评分": {
+        "盈利能力": {"得分": 9, "依据": "ROE 72.75%, 毛利率47.8%, 净利率38.5%"},
+        "成长性":   {"得分": 10, "依据": "营收+187%, 净利润+236%, 两季增速>30%"},
+        "财务健康": {"得分": 8, "依据": "负债率30.2%, 经营现金流77亿, 利润含金量高"},
+        "估值合理": {"得分": 6, "依据": "PE 53倍偏高, PEG约0.2, 行业高景气可接受"},
+        "行业前景": {"得分": 9, "依据": "AI光模块龙头, 全球算力基建持续3-5年"},
+        "资金认可": {"得分": 8, "依据": "当日净流入19.18亿, 主力认可度高"}
+      },
+      "亮点": ["ROE 72.75% A股顶尖", "2年利润14倍", "现金流远超净利润"],
+      "风险": ["客户集中北美地缘风险", "PE 53倍波动大", "竞争格局变化"],
+      "操作建议": "等待回调10-15%至450附近轻仓试错",
+      "止损": "成本价-8% 或跌破60日线",
+      "结论": "基本面A+, 估值中等, 回调是买点, AI算力最受益标的"
+    }
+    """
+    try:
+        lines = []
+        code = analysis.get("代码", "?")
+        name = analysis.get("名称", "?")
+
+        lines.append(f"=" * 64)
+        lines.append(f"  FinBrain 分析报告: {name} ({code})")
+        lines.append(f"=" * 64)
+
+        # ---- 评分表格 ----
+        scores = analysis.get("评分", {})
+        if scores:
+            lines.append("")
+            lines.append("  [评分卡]  满分10分")
+            lines.append(f"  {'维度':<8}  {'得分':>4}  {'评级':<6}  依据")
+            lines.append(f"  {'-'*8}  {'-'*4}  {'-'*6}  {'-'*44}")
+
+            def grade(s):
+                if s >= 9: return "S"
+                if s >= 7: return "A"
+                if s >= 5: return "B"
+                return "C"
+
+            total = 0
+            max_total = 0
+            for dim, info in scores.items():
+                s_val = info.get("得分")
+                reason = info.get("依据", "")
+                if s_val is None:
+                    # 数据缺失，不参与计分
+                    lines.append(f"  {dim:<8}  {'N/A':>4}  {'-':<6}  {reason}")
+                else:
+                    g = grade(s_val)
+                    lines.append(f"  {dim:<8}  {s_val:>4}  {g:<6}  {reason}")
+                    total += s_val
+                    max_total += 10
+
+            lines.append(f"  {'-'*8}  {'-'*4}  {'-'*6}  {'-'*44}")
+            if max_total > 0:
+                lines.append(f"  {'合计':<8}  {total:>4}/{max_total}   {'':<6}  " +
+                             f"{'S:>=9 A:>=7 B:>=5 C:<5'}")
+
+        # ---- 亮点 ----
+        highlights = analysis.get("亮点", [])
+        if highlights:
+            lines.append("")
+            lines.append("  [亮点]")
+            for h in highlights:
+                lines.append(f"    + {h}")
+
+        # ---- 风险 ----
+        risks = analysis.get("风险", [])
+        if risks:
+            lines.append("")
+            lines.append("  [风险]")
+            for r in risks:
+                lines.append(f"    - {r}")
+
+        # ---- 建议 ----
+        advice = analysis.get("操作建议", "")
+        stop_loss = analysis.get("止损", "")
+        if advice:
+            lines.append("")
+            lines.append(f"  [操作建议] {advice}")
+        if stop_loss:
+            lines.append(f"  [止损]     {stop_loss}")
+
+        # ---- 结论 ----
+        conclusion = analysis.get("结论", "")
+        if conclusion:
+            lines.append("")
+            if isinstance(conclusion, dict):
+                lines.append(f"  [综合结论]")
+                for key in ["总评", "买入策略", "持有策略", "卖出条件", "预期收益", "持仓周期"]:
+                    val = conclusion.get(key, "")
+                    if val:
+                        lines.append(f"    {key}: {val}")
+            else:
+                lines.append(f"  [结论] {conclusion}")
+
+        lines.append("")
+        lines.append(f"  * 以上基于公开财务数据, 不构成投资建议")
+        lines.append(f"=" * 64)
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"[Report Error] {e}"
+
+
+# ============================================================
+#  工具8：涨停板池（Phantom Hunter 用）
+# ============================================================
+
+def get_limit_up_pool(top_n: int = 30) -> dict:
+    """获取今日A股涨停板股票池，按涨幅降序"""
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        headers = {"User-Agent":
+                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+        url = ("http://vip.stock.finance.sina.com.cn/quotes_service/api/"
+               "json_v2.php/Market_Center.getHQNodeData?"
+               "page=1&num=200&sort=changepercent&asc=0&node=hs_a")
+
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            data = json.loads(resp.read().decode("gbk"))
+
+        results = []
+        for s in data:
+            name = s.get("name", "")
+            code = s.get("code", "")
+            try:
+                chg = float(s.get("changepercent", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+
+            # 涨停板阈值：主板10%，双创20%，北交所30%
+            if chg < 9.5:
+                continue
+            if "ST" in name or "N" in name:
+                continue
+
+            results.append({
+                "代码": code,
+                "名称": name,
+                "涨幅": chg,
+                "最新价": s.get("trade", ""),
+                "成交量": s.get("volume", ""),
+                "成交额": s.get("amount", ""),
+                "换手率": s.get("turnoverratio", ""),
+                "市盈率": s.get("per", ""),
+                "市净率": s.get("pb", ""),
+                "市值": s.get("mktcap", ""),
+            })
+
+        return {"涨停板数量": len(results), "列表": results[:top_n]}
+
+    except Exception as e:
+        return {"error": f"涨停板查询失败: {str(e)}"}
+
+
+# ============================================================
+#  工具9：概念板块热度扫描（Phantom Hunter 用）
+# ============================================================
+
+def get_concept_ranking(top_n: int = 20) -> dict:
+    """获取同花顺概念板块，按当日涨幅排序"""
+    try:
+        # 获取所有概念板块
+        df = ak.stock_board_concept_name_ths()
+        concepts = []
+        for _, row in df.iterrows():
+            try:
+                detail = ak.stock_board_concept_cons_ths(symbol=row["name"])
+                # 提取概念板块当日的涨跌幅等指标
+                concepts.append({
+                    "概念名称": row["name"],
+                    "代码": row["code"],
+                })
+            except Exception:
+                continue
+
+        if not concepts:
+            return {"error": "概念板块数据获取失败"}
+
+        return {"概念总数": len(concepts), "列表": concepts[:top_n]}
+
+    except Exception as e:
+        return {"error": f"概念板块查询失败: {str(e)}"}
+
+
+# ============================================================
+#  工具10：龙虎榜（Phantom Hunter 用）
+# ============================================================
+
+# 知名游资及关联营业部（持续更新）
+YOUZI_DB = {
+    "炒股养家": {"席位": ["华鑫证券上海分公司","华鑫证券上海宛平南路","华鑫证券上海松江"],"风格":"格局锁仓,不轻易卖,偏好科技"},
+    "方新侠":   {"席位": ["中信证券上海分公司","中信证券上海溧阳路"],"风格":"打板猛,次日高开出货,一日游为主"},
+    "上塘路":   {"席位": ["中信证券杭州上塘路","中信证券杭州延安路"],"风格":"跟风助攻,快进快出"},
+    "作手新一": {"席位": ["国泰君安南京太平南路","国泰君安上海分公司"],"风格":"题材挖掘,持股周期适中"},
+    "赵老哥":   {"席位": ["中国银河证券上海杨浦区","中国银河证券北京"],"风格":"消息驱动,打板不恋战"},
+    "小鳄鱼":   {"席位": ["东方证券上海浦东新区","东方证券上海静安区"],"风格":"趋势接力,偏好新能源"},
+    "章盟主":   {"席位": ["国泰君安上海分公司","海通证券上海"],"风格":"锁仓+低吸,偏好白马"},
+}
+
+def identify_youzi(branch_name: str) -> list:
+    """识别营业部对应哪些游资"""
+    matched = []
+    for name, info in YOUZI_DB.items():
+        for seat in info["席位"]:
+            if seat[:6] in branch_name or branch_name[:4] in seat:
+                matched.append({"游资": name, "风格": info["风格"]})
+                break
+    return matched
+
+
+def get_dragon_tiger_list(date: str = "") -> dict:
+    """获取今日龙虎榜数据，识别游资席位"""
+    try:
+        df = ak.stock_lhb_ggtj_sina()
+        # 取最近30条
+        df = df.head(30)
+
+        results = []
+        for _, row in df.iterrows():
+            results.append({
+                "代码": row["股票代码"],
+                "名称": row["股票名称"],
+                "上榜次数": row.get("上榜次数", ""),
+                "买入总额": str(row.get("累积买入额", "")),
+                "卖出总额": str(row.get("累积卖出额", "")),
+                "净买入额": str(row.get("净买入额", "")),
+            })
+
+        return {"龙虎榜数量": len(results), "列表": results}
+
+    except Exception as e:
+        return {"error": f"龙虎榜查询失败: {str(e)}"}
+
+
+def get_dragon_tiger_detail(symbol: str) -> dict:
+    """获取个股龙虎榜统计（上榜次数/买卖总额/机构追踪）"""
+    try:
+        # 从龙虎榜个股统计中查
+        df = ak.stock_lhb_ggtj_sina()
+        stock_row = df[df["股票代码"] == symbol]
+
+        if stock_row.empty:
+            # 尝试从机构追踪中查
+            df2 = ak.stock_lhb_jgzz_sina()
+            stock_row2 = df2[df2["股票代码"] == symbol]
+            if stock_row2.empty:
+                return {"error": f"{symbol} 近期未上龙虎榜"}
+
+            r = stock_row2.iloc[0]
+            return {
+                "代码": symbol,
+                "名称": str(r.get("股票名称", "")),
+                "累积买入额": str(r.get("累积买入额", "")),
+                "累积卖出额": str(r.get("累积卖出额", "")),
+                "净买入额": str(r.get("净买入额", "")),
+                "买入次数": str(r.get("买入次数", "")),
+                "卖出次数": str(r.get("卖出次数", "")),
+            }
+
+        r = stock_row.iloc[0]
+        buy_total = str(r.get("累积买入额", ""))
+        sell_total = str(r.get("累积卖出额", ""))
+        net = str(r.get("净买入额", ""))
+
+        # 结合机构席位数据
+        try:
+            detail = ak.stock_lhb_jgmx_sina()
+            stock_detail = detail[detail["股票代码"] == symbol]
+            buy_amt = stock_detail["买方席位买入额"].sum() if not stock_detail.empty else 0
+            sell_amt = stock_detail["卖方席位卖出额"].sum() if not stock_detail.empty else 0
+        except Exception:
+            buy_amt, sell_amt = 0, 0
+
+        return {
+            "代码": symbol,
+            "名称": str(r.get("股票名称", "")),
+            "上榜次数": str(r.get("上榜次数", "")),
+            "累积买入额": buy_total,
+            "累积卖出额": sell_total,
+            "净买入额": net,
+            "买方席位合计": str(buy_amt),
+            "卖方席位合计": str(sell_amt),
+            "资金方向": "净流入" if float(net or 0) > 0 else "净流出",
+        }
+
+    except Exception as e:
+        return {"error": f"个股龙虎榜查询失败: {str(e)}"}
