@@ -27,8 +27,10 @@ st.markdown("""
   .stTabs button[aria-selected="true"] { border-bottom: 2px solid #cc3333 !important; }
   .stDataFrame, .stTable { background: #1a1a1a !important; }
   .report-block { background: #1a1a1a; border-left: 3px solid #cc3333; padding: 20px;
-                  font-family: Consolas,monospace; font-size: 13px; line-height: 1.7;
-                  white-space: pre-wrap; border-radius: 4px; }
+                  border-radius: 4px; }
+  .report-block pre { background: transparent; color: #ddd; font-family: Consolas,monospace;
+                      font-size: 13px; line-height: 1.7; white-space: pre-wrap;
+                      margin: 0; padding: 0; border: none; }
   .card { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 20px; }
   .card .title { font-size: 13px; color: #888; }
   .card .value { font-size: 28px; font-weight: 700; color: #cc3333; }
@@ -156,7 +158,7 @@ elif page == "Analysis":
             with st.spinner(f"Analyzing {sym}... (data collection may take 20-40s)"):
                 try:
                     reply = run_agent(f"分析{sym}的财报和估值")
-                    st.markdown(f'<div class="report-block">{reply}</div>', unsafe_allow_html=True)
+                    st.html(f'<div class="report-block"><pre>{reply}</pre></div>')
                 except Exception as e:
                     st.error(f"Error: {e}")
                     st.info("Check that API Key is set in Settings page and restart the app.")
@@ -165,7 +167,83 @@ elif page == "Analysis":
 # ========== Settings ==========
 elif page == "Settings":
     st.header("Settings")
-    tab1,tab2,tab3 = st.tabs(["LLM Provider","Tools","System"])
+    tab0,tab1,tab2,tab3 = st.tabs(["Strategy","LLM Provider","Tools","System"])
+    with tab0:
+        import json as _json
+        strat_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", "strategies.json")
+        if os.path.exists(strat_file):
+            with open(strat_file, encoding="utf-8") as f: strategies = _json.load(f)
+        else:
+            strategies = {"default":{"name":"Default"}}
+
+        strategy_names = list(strategies.keys())
+        cur_strat = os.getenv("FINBRAIN_STRATEGY","default")
+        cur_idx = strategy_names.index(cur_strat) if cur_strat in strategy_names else 0
+
+        selected = st.selectbox("Active Strategy", strategy_names, index=cur_idx,
+                                format_func=lambda k: strategies[k].get("name",k))
+        st.caption(strategies[selected].get("description",""))
+
+        if selected != cur_strat and st.button("Activate Strategy", type="primary"):
+            os.environ["FINBRAIN_STRATEGY"] = selected
+            # 写入 .env
+            env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", ".env")
+            lines = []
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    for line in f:
+                        if not line.startswith("FINBRAIN_STRATEGY="):
+                            lines.append(line.rstrip())
+            lines.append(f"FINBRAIN_STRATEGY={selected}")
+            with open(env_path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            st.success(f"Strategy switched to: {strategies[selected]['name']}. Restart to apply.")
+            st.info("Run: streamlit run frontend/app.py")
+
+        st.divider()
+        st.subheader("Add / Edit Strategy")
+
+        with st.form("strategy_form"):
+            new_key = st.text_input("Strategy Key (英文ID)", placeholder="my_strategy")
+            new_name = st.text_input("Strategy Name", placeholder="My Custom Strategy")
+            new_desc = st.text_input("Description", placeholder="Brief description")
+            new_trigger_a = st.text_input("Analysis Triggers (comma separated)", value="分析,报告")
+            new_trigger_p = st.text_input("Phantom Triggers (comma separated)", value="妖股,涨停")
+            new_collector = st.text_area("Data Collector Prompt", height=120,
+                                         placeholder="数据搜集专员的system prompt...")
+            new_analyst = st.text_area("Analyst Prompt", height=200,
+                                       placeholder="分析师的system prompt...")
+            new_phantom = st.text_area("Phantom Hunter Prompt", height=120,
+                                       placeholder="妖股猎人的system prompt...")
+
+            c_save, c_del = st.columns(2)
+            with c_save:
+                if st.form_submit_button("Save Strategy", type="primary"):
+                    if not new_key or not new_name:
+                        st.error("Strategy Key and Name are required")
+                    else:
+                        strategies[new_key] = {
+                            "name": new_name,
+                            "description": new_desc,
+                            "triggers": {
+                                "analysis": [t.strip() for t in new_trigger_a.split(",") if t.strip()],
+                                "phantom": [t.strip() for t in new_trigger_p.split(",") if t.strip()]
+                            },
+                            "data_collector": new_collector,
+                            "analyst": new_analyst,
+                            "phantom": new_phantom
+                        }
+                        with open(strat_file, "w", encoding="utf-8") as f:
+                            _json.dump(strategies, f, ensure_ascii=False, indent=2)
+                        st.success(f"Strategy '{new_key}' saved. Restart to use.")
+            with c_del:
+                if selected != "default" and st.form_submit_button("Delete Selected"):
+                    del strategies[selected]
+                    with open(strat_file, "w", encoding="utf-8") as f:
+                        _json.dump(strategies, f, ensure_ascii=False, indent=2)
+                    os.environ["FINBRAIN_STRATEGY"] = "default"
+                    st.success(f"Deleted '{selected}'. Reset to default. Restart.")
+
     with tab1:
         # 读取当前配置
         cur_provider = os.getenv("LLM_PROVIDER","deepseek")

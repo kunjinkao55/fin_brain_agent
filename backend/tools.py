@@ -547,6 +547,119 @@ def format_report(analysis: dict) -> str:
             for r in risks:
                 lines.append(f"    - {r}")
 
+        # ---- 业绩驱动力 ----
+        driver = analysis.get("业绩驱动力", "")
+        if driver:
+            lines.append("")
+            lines.append(f"  [业绩驱动力] {driver}")
+
+        # ---- 关键信号 ----
+        signals = analysis.get("关键信号", [])
+        if signals:
+            lines.append("")
+            lines.append("  [关键信号]")
+            for s in signals:
+                name = s.get("信号", "")
+                data = s.get("数据", "")
+                note = s.get("解读", "")
+                lines.append(f"    {name}: {data}")
+                if note:
+                    lines.append(f"      -> {note}")
+
+        # ---- 估值水位 ----
+        val_level = analysis.get("估值水位", {})
+        if val_level:
+            pe = val_level.get("PE", "-")
+            pb = val_level.get("PB", "-")
+            mkt = val_level.get("市值", "-")
+            ytd = val_level.get("年内涨幅", "-")
+            judge = val_level.get("判断", "-")
+            lines.append("")
+            lines.append(f"  [估值水位] PE:{pe} PB:{pb} 市值:{mkt} 年内涨幅:{ytd} -> {judge}")
+
+        # ---- 对比分析 ----
+        compare = analysis.get("对比分析", {})
+        if compare:
+            lines.append("")
+            lines.append("  " + "=" * 58)
+            lines.append(f"  [板块对比] {compare.get('板块', '')}")
+            lines.append("  " + "=" * 58)
+
+            # 财报对比表
+            fin_table = compare.get("财报对比表", {})
+            if fin_table:
+                indicators = fin_table.get("指标列表", [])
+                stocks = fin_table.get("股票数据", [])
+                if indicators and stocks:
+                    lines.append("")
+                    lines.append("  [财报核心数据对比]")
+                    # 表头
+                    header_cols = ["指标"] + [s.get("名称", "?") for s in stocks]
+                    col_widths = [max(12, max(len(str(s.get(h, ""))) for s in stocks)) + 2 for h in indicators]
+                    col_widths.insert(0, max(len(h) for h in header_cols) + 2)
+
+                    def _align(v, w, right=False):
+                        s = str(v) if v is not None else "-"
+                        return f"{s:>{w}}" if right else f"{s:<{w}}"
+
+                    header_line = "  " + "".join(_align(h, w) for h, w in zip(header_cols, col_widths))
+                    lines.append(header_line)
+                    lines.append("  " + "".join("-" * w for w in col_widths))
+
+                    for idx in indicators:
+                        row = [_align(idx, col_widths[0])]
+                        for j, s in enumerate(stocks):
+                            row.append(_align(s.get(idx, "-"), col_widths[j+1], True))
+                        lines.append("  " + "".join(row))
+
+            # 估值对比表
+            val_table = compare.get("估值对比表", {})
+            if val_table:
+                v_indicators = val_table.get("指标列表", [])
+                v_stocks = val_table.get("股票数据", [])
+                if v_indicators and v_stocks:
+                    lines.append("")
+                    lines.append("  [估值对比]")
+                    v_header = ["指标"] + [s.get("名称", "?") for s in v_stocks]
+                    v_widths = [max(12, max(len(str(s.get(h, ""))) for s in v_stocks)) + 2 for h in v_indicators]
+                    v_widths.insert(0, max(len(h) for h in v_header) + 2)
+
+                    lines.append("  " + "".join(_align(h, w) for h, w in zip(v_header, v_widths)))
+                    lines.append("  " + "".join("-" * w for w in v_widths))
+                    for idx in v_indicators:
+                        row = [_align(idx, v_widths[0])]
+                        for j, s in enumerate(v_stocks):
+                            row.append(_align(s.get(idx, "-"), v_widths[j+1], True))
+                        lines.append("  " + "".join(row))
+
+            # 差异解读
+            diffs = compare.get("差异解读", [])
+            if diffs:
+                lines.append("")
+                lines.append("  [差异解读]")
+                for d in diffs:
+                    lines.append(f"    {d}")
+
+            # 一句话总结
+            summary = compare.get("一句话总结", {})
+            if summary:
+                lines.append("")
+                for name, pos in summary.items():
+                    lines.append(f"    {name}: {pos}")
+
+            rank = compare.get("综合排名", "")
+            if rank:
+                lines.append("")
+                lines.append(f"  [综合排名] {rank}")
+
+        # ---- 观察指标 ----
+        watch = analysis.get("观察指标", [])
+        if watch:
+            lines.append("")
+            lines.append("  [观察指标]")
+            for w in watch:
+                lines.append(f"    - {w}")
+
         # ---- 建议 ----
         advice = analysis.get("操作建议", "")
         stop_loss = analysis.get("止损", "")
