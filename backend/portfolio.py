@@ -2,7 +2,7 @@
 FinBrain 模拟盘模块 — JSON持久化。支持市价/限价/百分比仓位/一键重置。
 """
 
-import json, os
+import json, os, threading
 from datetime import datetime
 
 PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
@@ -15,6 +15,7 @@ LOT_SIZE = 100  # A股整手
 class Portfolio:
     def __init__(self):
         self.file = PORTFOLIO_FILE
+        self._lock = threading.Lock()
         if os.path.exists(self.file):
             self._load()
         else:
@@ -36,10 +37,11 @@ class Portfolio:
         self.history = data.get("history", [])
 
     def _save(self):
-        with open(self.file, "w") as f:
-            json.dump({"cash": self.cash, "initial_cash": self.initial_cash,
-                       "positions": self.positions, "history": self.history},
-                      f, ensure_ascii=False, indent=2)
+        with self._lock:
+            with open(self.file, "w") as f:
+                json.dump({"cash": self.cash, "initial_cash": self.initial_cash,
+                           "positions": self.positions, "history": self.history},
+                          f, ensure_ascii=False, indent=2)
 
     # ------- 行情获取 -------
     def _get_price(self, symbol: str) -> dict:
