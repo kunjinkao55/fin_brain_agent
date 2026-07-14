@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/app.py',encoding='utf-8'\\).read\\(\\)\\); print\\('Frontend OK'\\)\")",
+      "Bash(python -c \"from backend.tools import fetch_stock_price; import time; t0=time.time\\(\\); r1=fetch_stock_price\\('300502'\\); t1=time.time\\(\\); r2=fetch_stock_price\\('300502'\\); t2=time.time\\(\\); print\\(f'First: {\\(t1-t0\\)*1000:.0f}ms, Cached: {\\(t2-t1\\)*1000:.0f}ms, Same: {r1.get\\(\\\\\"price\\\\\"\\)==r2.get\\(\\\\\"price\\\\\"\\)}'\\)\")",
+      "Bash(python -c \"from backend.agent import build_graph; g=build_graph\\(\\); print\\('Agent OK'\\)\")",
+      "Bash(python -c \"from backend.tools import get_industry_info; r=get_industry_info\\('300502'\\); print\\('Industry cached' if 'error' not in r else r['error']\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('frontend/app.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}

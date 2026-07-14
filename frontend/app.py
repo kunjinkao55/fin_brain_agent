@@ -6,9 +6,36 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import streamlit as st
-import json
+import json, time
+from langchain_core.callbacks import BaseCallbackHandler
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="FinBrain", layout="wide")
+
+# ---- 工具调用追踪器 ----
+class ToolCallTracker(BaseCallbackHandler):
+    """拦截 LangChain tool call 事件，记录到列表"""
+    def __init__(self):
+        self.records = []
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        tool_name = serialized.get("name", "unknown")
+        self.records.append({
+            "tool": tool_name,
+            "input": str(input_str)[:120],
+            "time": time.strftime("%H:%M:%S"),
+            "status": "running",
+        })
+
+    def on_tool_end(self, output, **kwargs):
+        if self.records:
+            self.records[-1]["status"] = "done"
+            self.records[-1]["output_preview"] = str(output)[:80]
+
+    def on_tool_error(self, error, **kwargs):
+        if self.records:
+            self.records[-1]["status"] = "error"
+            self.records[-1]["error"] = str(error)[:80]
 
 # ========== 暗色主题 ==========
 st.markdown("""
@@ -47,13 +74,22 @@ with st.sidebar:
     st.markdown("### FinBrain")
     st.caption("AI-Powered Investment Research")
     st.divider()
-    page = st.radio("", ["Chat", "Portfolio", "Analysis", "Settings"], label_visibility="collapsed")
+    page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Settings"], label_visibility="collapsed")
     st.divider()
+    # 会话持久化（LangGraph SqliteSaver + Streamlit session_state）
+    import uuid
+    if "thread_id" not in st.session_state:
+        st.session_state.thread_id = str(uuid.uuid4())
+
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     if "mode" not in st.session_state:
         st.session_state.mode = "Chat"
-    st.button("Clear Chat", on_click=lambda: st.session_state.chat_history.clear())
+
+    st.button("Clear", on_click=lambda: [
+        st.session_state.chat_history.clear(),
+        st.session_state.pop("thread_id", None)
+    ])
     st.divider()
     st.caption("2026 FinBrain v0.2")
 
@@ -68,21 +104,115 @@ def _to_lc(h):
     from langchain_core.messages import HumanMessage, AIMessage
     return [HumanMessage(content=m["content"]) if m["role"]=="user" else AIMessage(content=m["content"]) for m in h]
 
-def run_agent(user_input: str) -> str:
+def run_agent(user_input: str) -> tuple[str, list]:
+    """返回 (回复文本, 工具调用记录列表)"""
     agents = get_agents()
     req_type = agents["classify"](user_input)
     msgs = _to_lc(st.session_state.chat_history) + [{"role": "user", "content": user_input}]
+    tracker = ToolCallTracker()
+    cfg = {
+        "configurable": {"thread_id": st.session_state.thread_id},
+        "callbacks": [tracker],
+    }
+
     if req_type == "phantom":
         st.session_state.mode = "Phantom Hunter"
-        return agents["phantom"].invoke({"messages": msgs})["messages"][-1].content
+        reply = agents["phantom"].invoke({"messages": msgs}, config=cfg)["messages"][-1].content
     elif req_type == "analysis":
         st.session_state.mode = "Deep Analysis"
         r = agents["graph"].invoke({"messages": msgs, "user_question": user_input,
-                                     "collected_data":"", "analysis":"", "report":""})
-        return r.get("report") or r["messages"][-1].content
+                                     "collected_data":"", "analysis":"", "report":"",
+                                     "processing_log": []}, config=cfg)
+        reply = r.get("report") or r["messages"][-1].content
+        # 提取流水线日志
+        proc_log = r.get("processing_log", [])
+        if proc_log:
+            with st.expander("Pipeline: Data -> Analysis -> Report", expanded=False):
+                for step in proc_log:
+                    phase = step.get("phase","?")
+                    summary = step.get("summary","")
+                    detail = step.get("detail","")
+                    st.caption(f"[{phase}] {summary}")
+                    if detail:
+                        with st.expander(f"  {phase} detail", expanded=False):
+                            st.text(detail[:1000])
     else:
         st.session_state.mode = "Chat"
-        return agents["chat"].invoke({"messages": msgs})["messages"][-1].content
+        reply = agents["chat"].invoke({"messages": msgs}, config=cfg)["messages"][-1].content
+
+    return reply, tracker.records
+
+
+# ========== Market ==========
+if page == "Market":
+    st.header("Market Monitor")
+
+    # ---- 刷新 ----
+    if st.button("Refresh Data", type="primary"):
+        st.rerun()
+
+    # ---- 涨跌全景 ----
+    from backend.tools import get_market_breadth
+    breadth = get_market_breadth()
+    if "error" not in breadth:
+        a = breadth["全A"]
+        up_pct = a["上涨"] / a["总计"] * 100 if a["总计"] else 0
+        dn_pct = a["下跌"] / a["总计"] * 100 if a["总计"] else 0
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(f'<div class="metric-box"><div class="label">Up</div><div class="value">{a["上涨"]}</div><div class="sub">{up_pct:.0f}%</div></div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown(f'<div class="metric-box"><div class="label">Down</div><div class="value">{a["下跌"]}</div><div class="sub">{dn_pct:.0f}%</div></div>', unsafe_allow_html=True)
+        with c3:
+            st.markdown(f'<div class="metric-box"><div class="label">Flat</div><div class="value">{a["平盘"]}</div></div>', unsafe_allow_html=True)
+        with c4:
+            st.markdown(f'<div class="metric-box"><div class="label">Breadth</div><div class="value">{breadth["上涨比例"]}</div></div>', unsafe_allow_html=True)
+    st.divider()
+
+    # ---- 全板块资金流对比图（主位，所有板块在同一坐标系） ----
+    from backend.tools import get_sector_fund_flow
+    sector_data = get_sector_fund_flow(100)  # 全部板块
+    all_sectors = sector_data.get("列表", [])
+
+    if all_sectors:
+        names = [s["板块"] for s in all_sectors]
+        nets = [s["净额(亿)"] for s in all_sectors]
+        abs_nets = [abs(n) for n in nets]  # 绝对值
+        colors = ["#cc3333" if n >= 0 else "#2e7d32" for n in nets]
+
+        fig = go.Figure(data=[go.Bar(
+            x=abs_nets, y=names, orientation='h',
+            marker_color=colors,
+            text=[f"{n:+.2f}亿" for n in nets],
+            textposition='outside',
+            textfont=dict(color='#ddd', size=9),
+        )])
+        fig.update_layout(
+            title=f"Sector Fund Flow ({len(all_sectors)} sectors)",
+            height=max(600, len(names) * 20),
+            margin=dict(l=10, r=60, t=40, b=10),
+            paper_bgcolor="#111", plot_bgcolor="#111",
+            font=dict(color="#ddd"),
+            xaxis=dict(title="|Net Flow| (亿)  Red=Inflow  Green=Outflow", showgrid=True, gridcolor="#333"),
+            yaxis=dict(showgrid=False),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 下方表格
+        with st.expander(f"Sector Fund Flow Details ({len(all_sectors)} sectors)", expanded=False):
+            lines = [f"{'Sector':<12} {'Chg':>8} {'In(亿)':>10} {'Out(亿)':>10} {'Net(亿)':>10}"]
+            lines.append("-" * 55)
+            for s in all_sectors:
+                net = s["净额(亿)"]
+                color = "#cc3333" if net >= 0 else "#2e7d32"
+                lines.append(
+                    f"<span style='color:{color}'>{s['板块']:<12} {s['涨跌幅']:>8} "
+                    f"{s['流入(亿)']:>10.2f} {s['流出(亿)']:>10.2f} {net:>+10.2f}</span>"
+                )
+            st.markdown("<pre style='font-size:12px'>" + "\n".join(lines) + "</pre>",
+                        unsafe_allow_html=True)
+    else:
+        st.warning("No sector data available for this date")
 
 
 # ========== Chat ==========
@@ -93,13 +223,25 @@ if page == "Chat":
             st.text(msg["content"])
     if prompt := st.chat_input("Ask FinBrain..."):
         with st.chat_message("user"): st.text(prompt)
+
         with st.chat_message("assistant"):
             with st.spinner(""):
                 try:
-                    reply = run_agent(prompt)
+                    reply, tool_logs = run_agent(prompt)
+                    # 处理流水线展示
+                    pipeline = tool_logs or []
+                    if pipeline:
+                        with st.expander(f"Pipeline: Data({len(pipeline)} tools) -> Analysis -> Report", expanded=False):
+                            st.caption("Phase 1: Data Collection")
+                            for log in pipeline:
+                                icon = {"running":"...","done":"OK","error":"ERR"}.get(log["status"],"?")
+                                st.caption(f"  [{icon}] {log['tool']}({log['input'][:60]})")
+                            st.caption(f"Phase 2: Analysis & Scoring")
+                            st.caption(f"Phase 3: Report Formatting (output {len(reply)} chars)")
                     st.text(reply)
                 except Exception as e:
                     reply = f"[Error] {e}"; st.text(reply)
+
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
 
@@ -157,7 +299,7 @@ elif page == "Analysis":
         else:
             with st.spinner(f"Analyzing {sym}... (data collection may take 20-40s)"):
                 try:
-                    reply = run_agent(f"分析{sym}的财报和估值")
+                    reply, _ = run_agent(f"分析{sym}的财报和估值")
                     st.html(f'<div class="report-block"><pre>{reply}</pre></div>')
                 except Exception as e:
                     st.error(f"Error: {e}")

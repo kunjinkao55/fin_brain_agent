@@ -8,8 +8,27 @@ import urllib.parse
 import ssl
 import re
 import json
+import logging
 import pandas as pd
 import akshare as ak
+
+logger = logging.getLogger(__name__)
+
+# ---- SSL 配置 ----
+# 说明：新浪和东方财富的免费API服务器使用自签名/过期证书，
+# 在Windows 11 + Python 3.12环境下TLS握手会触发
+# `[SSL: UNEXPECTED_EOF_WHILE_READING]` 错误。
+# 这不是我们代码的问题，是服务器端证书链不完整。
+# 生产环境应使用付费数据源（Wind/Tushare Pro）替代。
+# 如果合规要求严格，可改为加载服务器证书到信任链。
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 # ============================================================
@@ -27,17 +46,19 @@ def fetch_stock_price(symbol: str) -> dict:
 
     url = f"https://hq.sinajs.cn/list={full_code}"
 
+    # 先查缓存
+    from backend import cache
+    cached = cache.get("stock_price", symbol)
+    if cached:
+        return cached
+
     try:
         req = urllib.request.Request(url)
         req.add_header("Referer", "https://finance.sina.com.cn")
         req.add_header("User-Agent",
-                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                       _USER_AGENT)
 
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
             text = resp.read().decode("gbk")
 
         match = re.search(r'"([^"]+)"', text)
@@ -48,7 +69,7 @@ def fetch_stock_price(symbol: str) -> dict:
         if len(fields) < 32:
             return {"error": f"返回数据字段不足: {len(fields)}"}
 
-        return {
+        result = {
             "name": fields[0],
             "open": fields[1],
             "yesterday_close": fields[2],
@@ -57,6 +78,8 @@ def fetch_stock_price(symbol: str) -> dict:
             "low": fields[5],
             "time": f"{fields[30]} {fields[31]}",
         }
+        cache.set("stock_price", symbol, result)
+        return result
 
     except urllib.error.URLError as e:
         return {"error": f"网络请求失败: {str(e)}"}
@@ -85,14 +108,11 @@ def fetch_stock_history(symbol: str, scale: int = 240, datalen: int = 30) -> dic
     try:
         req = urllib.request.Request(url)
         req.add_header("User-Agent",
-                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                       _USER_AGENT)
         req.add_header("Referer", "https://finance.sina.com.cn")
 
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
 
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
             text = resp.read().decode("utf-8")
             data = json.loads(text)
 
@@ -121,12 +141,13 @@ def fetch_stock_history(symbol: str, scale: int = 240, datalen: int = 30) -> dic
 
 def get_financial_statements(symbol: str) -> dict:
     """获取近三年三大报表（东方财富 datacenter API）"""
+    from backend import cache
+    cached = cache.get("financial_statements", symbol)
+    if cached:
+        return cached
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         headers = {"User-Agent":
-                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                   _USER_AGENT}
 
         base = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
 
@@ -144,7 +165,7 @@ def get_financial_statements(symbol: str) -> dict:
             }
             url = base + "?" + urllib.parse.urlencode(params)
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            with urllib.request.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 return data["result"]["data"]
 
@@ -180,13 +201,15 @@ def get_financial_statements(symbol: str) -> dict:
                 results.append(item)
             return results
 
-        return {
+        result = {
             "symbol": symbol,
             "balance":  pick(balance_data,  BALANCE_COLS),
             "profit":   pick(profit_data,   INCOME_COLS),
             "cashflow": pick(cashflow_data, CASHFLOW_COLS),
             "name": balance_data[0].get("SECURITY_NAME_ABBR", ""),
         }
+        cache.set("financial_statements", symbol, result)
+        return result
 
     except Exception as e:
         return {"error": f"获取财报失败: {str(e)}"}
@@ -198,12 +221,13 @@ def get_financial_statements(symbol: str) -> dict:
 
 def get_valuation(symbol: str) -> dict:
     """获取估值数据（ROE/毛利率/净利率/EPS等）"""
+    from backend import cache
+    cached = cache.get("valuation", symbol)
+    if cached:
+        return cached
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         headers = {"User-Agent":
-                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                   _USER_AGENT}
 
         base = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
         params = {
@@ -220,7 +244,7 @@ def get_valuation(symbol: str) -> dict:
         url = base + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers=headers)
 
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
         VALUATION_COLS = {
@@ -238,11 +262,13 @@ def get_valuation(symbol: str) -> dict:
                 item[cn_name] = row.get(eng_key, None)
             results.append(item)
 
-        return {
+        result = {
             "symbol": symbol,
             "data": results,
             "name": data["result"]["data"][0].get("SECURITY_NAME_ABBR", ""),
         }
+        cache.set("valuation", symbol, result)
+        return result
 
     except Exception as e:
         return {"error": f"获取估值失败: {str(e)}"}
@@ -254,12 +280,13 @@ def get_valuation(symbol: str) -> dict:
 
 def get_industry_info(symbol: str) -> dict:
     """获取个股所属行业 + 行业指数近期表现"""
+    from backend import cache
+    cached = cache.get("industry_info", symbol)
+    if cached:
+        return cached
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         headers = {"User-Agent":
-                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                   _USER_AGENT}
 
         base = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
         params = {
@@ -274,7 +301,7 @@ def get_industry_info(symbol: str) -> dict:
         url = base + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers=headers)
 
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
         row = data["result"]["data"][0]
@@ -301,13 +328,15 @@ def get_industry_info(symbol: str) -> dict:
             except Exception:
                 pass
 
-        return {
+        result = {
             "symbol": symbol,
             "name": row.get("SECURITY_NAME_ABBR", ""),
             "industry_name": industry_name,
             "industry_code": row.get("INDUSTRY_CODE", ""),
             "index_trend": index_data,
         }
+        cache.set("industry_info", symbol, result)
+        return result
 
     except Exception as e:
         return {"error": f"获取行业信息失败: {str(e)}"}
@@ -322,11 +351,8 @@ def screen_stocks(max_pe: float = 30, max_pb: float = 5,
     """全市场扫描，按PE升序返回低估值A股。
        参数: max_pe=市盈率上限, max_pb=市净率上限, min_mktcap=市值下限(亿)"""
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         headers = {"User-Agent":
-                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                   _USER_AGENT}
 
         # 新浪全市场行情接口（分4页覆盖沪深A股）
         all_stocks = []
@@ -337,7 +363,7 @@ def screen_stocks(max_pe: float = 30, max_pb: float = 5,
                    f"json_v2.php/Market_Center.getHQNodeData?"
                    f"page={page}&num=2000&sort=code&asc=1&node=hs_a")
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as resp:
                 data = json.loads(resp.read().decode("gbk"))
 
             for s in data:
@@ -699,18 +725,15 @@ def format_report(analysis: dict) -> str:
 def get_limit_up_pool(top_n: int = 30) -> dict:
     """获取今日A股涨停板股票池，按涨幅降序"""
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         headers = {"User-Agent":
-                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                   _USER_AGENT}
 
         url = ("http://vip.stock.finance.sina.com.cn/quotes_service/api/"
                "json_v2.php/Market_Center.getHQNodeData?"
                "page=1&num=200&sort=changepercent&asc=0&node=hs_a")
 
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
             data = json.loads(resp.read().decode("gbk"))
 
         results = []
@@ -775,6 +798,95 @@ def get_concept_ranking(top_n: int = 20) -> dict:
 
     except Exception as e:
         return {"error": f"概念板块查询失败: {str(e)}"}
+
+
+# ============================================================
+#  确定性评分引擎（替代 LLM 主观打分）
+# ============================================================
+
+def calculate_scores(financial_data: dict) -> dict:
+    """纯函数，根据财报数据计算6维评分。LLM 只管叙事，数字由这里保证一致。"""
+    scores = {}
+
+    # 从 valuation 数据中提取最新值
+    val_data = financial_data.get("valuation", {}).get("data", [])
+    latest = val_data[0] if val_data else {}
+
+    # --- 1. 盈利能力 (0-10) ---
+    roe = float(latest.get("ROE(%)", 0) or 0)
+    gm = float(latest.get("毛利率(%)", 0) or 0)
+    nm = float(latest.get("净利率(%)", 0) or 0)
+
+    if roe >= 50: pe_score = 10
+    elif roe >= 30: pe_score = 9
+    elif roe >= 20: pe_score = 7
+    elif roe >= 10: pe_score = 5
+    elif roe >= 5: pe_score = 3
+    else: pe_score = 1
+
+    if gm >= 40: pe_score = min(10, pe_score + 1)
+    if nm >= 20: pe_score = min(10, pe_score + 1)
+    scores["盈利能力"] = {"得分": pe_score, "依据": f"ROE {roe}%, 毛利率{gm}%, 净利率{nm}%"}
+
+    # --- 2. 成长性 (0-10) ---
+    profit_data = financial_data.get("profit", [])
+    if len(profit_data) >= 2:
+        rev_latest = profit_data[-1].get("营业总收入") or 0
+        rev_prev = profit_data[-2].get("营业总收入") or 1
+        rev_growth = (float(rev_latest) - float(rev_prev)) / float(rev_prev) * 100 if float(rev_prev) > 0 else 0
+
+        net_latest = profit_data[-1].get("净利润") or 0
+        net_prev = profit_data[-2].get("净利润") or 1
+        net_growth = (float(net_latest) - float(net_prev)) / float(net_prev) * 100 if float(net_prev) > 0 else 0
+
+        if rev_growth >= 100: g_score = 10
+        elif rev_growth >= 50: g_score = 9
+        elif rev_growth >= 30: g_score = 8
+        elif rev_growth >= 20: g_score = 5
+        elif rev_growth >= 0: g_score = 3
+        else: g_score = 0
+        scores["成长性"] = {"得分": g_score, "依据": f"营收增速{rev_growth:.0f}%, 净利润增速{net_growth:.0f}%"}
+    else:
+        scores["成长性"] = {"得分": 5, "依据": "数据不足，默认5分"}
+
+    # --- 3. 财务健康 (0-10) ---
+    debt = float(latest.get("资产负债率(%)", 50) or 50)
+    cf_data = financial_data.get("cashflow", [])
+    cf_score = 0
+    if cf_data:
+        cf_latest = cf_data[-1]
+        op_cf = float(cf_latest.get("经营现金流净额", 0) or 0)
+        net_profit = float(profit_data[-1].get("净利润", 1) or 1) if profit_data else 1
+        cf_ratio = op_cf / net_profit if net_profit > 0 else 0
+        if cf_ratio >= 0.8: cf_score = 2
+
+    if debt < 30: debt_score = 10
+    elif debt < 50: debt_score = 7
+    elif debt < 60: debt_score = 5
+    else: debt_score = 3
+    scores["财务健康"] = {"得分": min(10, debt_score + cf_score), "依据": f"资产负债率{debt}%, 经营现金流/净利润={cf_ratio:.2f}"}
+
+    # --- 4. 估值合理 (0-10) ---
+    price_info = financial_data.get("price", {})
+    pe = float(price_info.get("per", 0) or 0) if isinstance(price_info, dict) else 0
+    if pe <= 0: v_score = 5
+    elif pe < 15: v_score = 10
+    elif pe < 25: v_score = 7
+    elif pe < 40: v_score = 5
+    else: v_score = 3
+    scores["估值合理"] = {"得分": v_score, "依据": f"PE {pe:.0f}倍" if pe > 0 else "PE数据缺失"}
+
+    # --- 5. 行业前景 (0-10, 默认5，LLM可根据行业调整) ---
+    scores["行业前景"] = {"得分": 5, "依据": "待LLM根据行业信息微调(+-3)"}
+
+    # --- 6. 资金认可 (0-10) ---
+    fund_data = financial_data.get("fund_flow", {})
+    if "error" in str(fund_data):
+        scores["资金认可"] = {"得分": None, "依据": "数据缺失"}
+    else:
+        scores["资金认可"] = {"得分": 5, "依据": "待LLM根据主力净流入判断(+-5)"}
+
+    return scores
 
 
 # ============================================================
@@ -880,3 +992,148 @@ def get_dragon_tiger_detail(symbol: str) -> dict:
 
     except Exception as e:
         return {"error": f"个股龙虎榜查询失败: {str(e)}"}
+
+
+# ============================================================
+#  工具11：板块资金流向（Phantom Hunter / 市场感知用）
+# ============================================================
+
+def get_sector_fund_flow(top_n: int = 50, date: str = "") -> dict:
+    """获取全行业板块资金流向排名（同花顺），含净流入/流出额。date为空=当日"""
+    try:
+        import requests
+        from bs4 import BeautifulSoup as bs
+
+        headers = _get_ths_headers()
+        all_sectors = []
+        for page in range(1, 5):  # 最多4页，覆盖所有行业
+            url = (f"http://data.10jqka.com.cn/funds/hyzjl/"
+                   f"field/zdf/order/desc/page/{page}/ajax/1/free/1/")
+            resp = requests.get(url, headers=headers, timeout=10)
+            soup = bs(resp.text, "html.parser")
+            table = soup.find("table")
+            if not table:
+                break
+
+            for row in table.find_all("tr")[1:]:
+                cols = [td.text.strip() for td in row.find_all("td")]
+                if len(cols) < 6:
+                    continue
+                # cols: [排名, 板块名称, 板块指数, 涨跌幅, 流入(亿), 流出(亿)]
+                try:
+                    inflow = float(cols[4])
+                    outflow = float(cols[5])
+                    net = inflow - outflow
+                except (ValueError, IndexError):
+                    net = 0
+                    inflow = outflow = 0
+
+                all_sectors.append({
+                    "板块": cols[1],
+                    "涨跌幅": cols[3],
+                    "流入(亿)": round(inflow, 2),
+                    "流出(亿)": round(outflow, 2),
+                    "净额(亿)": round(net, 2),
+                    "方向": "流入" if net >= 0 else "流出",
+                })
+
+        all_sectors.sort(key=lambda x: x["净额(亿)"], reverse=True)
+        return {"板块数量": len(all_sectors), "列表": all_sectors[:top_n]}
+
+    except Exception as e:
+        return {"error": f"板块资金流查询失败: {str(e)}"}
+
+
+# ============================================================
+#  工具12：日内分时数据
+# ============================================================
+
+def get_intraday(symbol: str) -> dict:
+    """获取当日5分钟K线（48根/天），用于画分时图"""
+    if symbol.startswith(("60", "68")):
+        full_code = f"sh{symbol}"
+    elif symbol.startswith(("00", "30")):
+        full_code = f"sz{symbol}"
+    else:
+        return {"error": f"无法识别的股票代码: {symbol}"}
+
+    url = (
+        f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={full_code}&scale=5&ma=no&datalen=240"
+    )
+
+    try:
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", _USER_AGENT)
+        req.add_header("Referer", "https://finance.sina.com.cn")
+
+        with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        today = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
+        bars = [b for b in data if b["day"].startswith(today)]
+
+        if not bars:
+            return {"error": f"今日({today})暂无分时数据（可能未开盘或已收盘数据延迟）"}
+
+        return {
+            "symbol": symbol,
+            "date": today,
+            "bars": [{"time": b["day"][-8:], "open": float(b["open"]),
+                      "high": float(b["high"]), "low": float(b["low"]),
+                      "close": float(b["close"]), "volume": int(b["volume"])}
+                     for b in bars],
+            "count": len(bars),
+        }
+
+    except urllib.error.URLError as e:
+        return {"error": f"网络请求失败: {str(e)}"}
+    except Exception as e:
+        return {"error": f"分时查询异常: {str(e)}"}
+
+
+# ============================================================
+#  工具13：市场涨跌全景（Market Breadth）
+# ============================================================
+
+def get_market_breadth() -> dict:
+    """获取全A股/行业/概念的涨跌家数统计"""
+    try:
+        headers = {"User-Agent": _USER_AGENT}
+        ctx = _SSL_CTX
+
+        # 全A股: 从新浪拉2页数据统计涨跌
+        up_count = down_count = flat_count = 0
+        total = 0
+        for page in range(1, 3):
+            url = (f"http://vip.stock.finance.sina.com.cn/quotes_service/api/"
+                   f"json_v2.php/Market_Center.getHQNodeData?"
+                   f"page={page}&num=100&sort=code&asc=1&node=hs_a")
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                data = json.loads(resp.read().decode("gbk"))
+            if not data:
+                break
+            for s in data:
+                try:
+                    chg = float(s.get("changepercent", 0) or 0)
+                except (ValueError, TypeError):
+                    continue
+                if chg > 0:
+                    up_count += 1
+                elif chg < 0:
+                    down_count += 1
+                else:
+                    flat_count += 1
+                total += 1
+
+        if total == 0:
+            return {"error": "未获取到市场数据"}
+
+        return {
+            "全A": {"上涨": up_count, "下跌": down_count, "平盘": flat_count, "总计": total},
+            "上涨比例": f"{up_count/total*100:.1f}%",
+        }
+
+    except Exception as e:
+        return {"error": f"市场全景查询失败: {str(e)}"}
