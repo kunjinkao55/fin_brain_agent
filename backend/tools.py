@@ -4,6 +4,7 @@ FinBrain 数据工具层 — 纯函数，不依赖任何 Agent 框架。
 """
 
 import os
+import time
 import urllib.request
 import urllib.parse
 import ssl
@@ -39,6 +40,59 @@ _DATA_MODE = os.getenv("FINBRAIN_DATA_MODE", "local")
 _DATA_API = os.getenv("FINBRAIN_DATA_API", "http://localhost:8000")
 
 # 远程模式端点映射：函数名 → API 路径
+# Harness: 工具调用追踪（去重）
+_called_tools: dict[str, dict] = {}  # {symbol: {tool_name: {ts, result}}}
+import threading as _threading
+_call_lock = _threading.Lock()
+
+# 去重 TTL 与缓存一致（实时数据短，财报长）
+_DEDUP_TTL = {
+    "stock_price": 30, "stock_history": 300, "fund_flow": 300,
+    "intraday": 30, "financial_statements": 1800, "valuation": 1800,
+    "industry_info": 3600, "screen_stocks": 600, "limit_up_pool": 60,
+    "concept_ranking": 600, "dragon_tiger_list": 300, "dragon_tiger_detail": 300,
+}
+
+def _dedup_check(symbol: str, tool_name: str) -> dict | None:
+    """TTL 感知去重：在缓存有效期内不重复调用。实时数据(30s)可重调，财报(30min)不可。"""
+    with _call_lock:
+        if symbol in _called_tools and tool_name in _called_tools[symbol]:
+            entry = _called_tools[symbol][tool_name]
+            ttl = _DEDUP_TTL.get(tool_name, 60)
+            if time.time() - entry["ts"] < ttl:
+                return {"_dedup": True, "_cached": entry["result"],
+                        "info": f"{tool_name}({symbol}) TTL内({ttl}s)，跳过"}
+    return None
+
+def _dedup_record(symbol: str, tool_name: str, result: dict):
+    """记录工具调用结果（含时间戳）"""
+    with _call_lock:
+        if symbol not in _called_tools:
+            _called_tools[symbol] = {}
+        _called_tools[symbol][tool_name] = {"ts": time.time(), "result": result}
+
+def _clear_dedup():
+    """清空去重记录（每次新分析开始时调用）"""
+    with _call_lock:
+        _called_tools.clear()
+        _fail_counts.clear()
+
+
+# Harness: 失败计数器——同一工具连续失败3次→熔断
+_fail_counts: dict[str, int] = {}
+
+def _should_skip(tool_name: str) -> bool:
+    """连续失败3次→返回True，该工具本轮不再调用"""
+    return _fail_counts.get(tool_name, 0) >= 3
+
+def _record_failure(tool_name: str):
+    _fail_counts[tool_name] = _fail_counts.get(tool_name, 0) + 1
+
+def _record_success(tool_name: str):
+    if tool_name in _fail_counts:
+        _fail_counts[tool_name] = 0
+
+
 _REMOTE_ROUTES = {
     "fetch_stock_price":      ("api/data/stock_price",      ["symbol"]),
     "fetch_stock_history":    ("api/data/stock_history",    ["symbol", "scale", "datalen"]),
@@ -123,8 +177,14 @@ _USER_AGENT = (
 
 def fetch_stock_price(symbol: str) -> dict:
     """查询A股实时价格（数据源可配置）"""
+    if _should_skip("stock_price"):
+        return {"error": "stock_price 已连续失败3次，本轮跳过（熔断）"}
+    dup = _dedup_check(symbol, "stock_price")
+    if dup: return dup
     if _DATA_MODE == "remote":
-        return _remote_fetch("api/data/stock_price", {"symbol": symbol})
+        result = _remote_fetch("api/data/stock_price", {"symbol": symbol})
+        _dedup_record(symbol, "stock_price", result)
+        return result
     src = _get_source("stock_price")
     if src not in ("sina", "akshare"):
         return _source_error(src, "仅支持 sina/akshare")
