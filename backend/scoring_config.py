@@ -14,14 +14,20 @@ _CONFIG = None
 
 
 def _load_config() -> dict:
-    """加载评分配置，解析失败返回空dict（调用方用默认值兜底）"""
+    """加载评分配置，解析失败返回空dict。自动校验必填section。"""
     global _CONFIG
     if _CONFIG is not None:
         return _CONFIG
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
             _CONFIG = json.load(f)
-        logger.info("Loaded scoring config from %s", _CONFIG_PATH)
+        # Harness: 校验必填section
+        required = ["盈利能力", "成长性", "财务健康", "估值合理", "动态权重", "安全边际"]
+        missing = [s for s in required if s not in _CONFIG]
+        if missing:
+            logger.warning("scoring.json missing sections: %s. Using defaults for them.", missing)
+        else:
+            logger.info("Loaded scoring config from %s (%d sections)", _CONFIG_PATH, len(_CONFIG))
     except Exception as e:
         logger.warning("Failed to load scoring.json: %s. Using defaults.", e)
         _CONFIG = {}

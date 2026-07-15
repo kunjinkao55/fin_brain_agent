@@ -153,20 +153,14 @@ streamlit run frontend/app.py
 - **报告输出**：公司画像 + 竞争优势(核心资产+复制难度) + 投资逻辑链 + 评分卡(代码强制) + 情景估值(概率加权) + 投资决策(🟢BUY/🟡HOLD/🔴SELL) + 证伪条件 + 市场预期拆解
 - **数据时效**：报告顶部标注使用的最新财报版本
 
-### Harness 工程基座
-| 能力 | 实现 |
+### Harness 工程基座（12/13 守卫点激活）
+| 层级 | 能力 |
 |------|------|
-| 多 Agent 编排 | LangGraph StateGraph (Data→Analyst→Reporter) |
-| 状态持久化 | LangGraph SqliteSaver + thread_id 隔离 |
-| 上下文压缩 | 超阈值自动摘要，保留最近N条 |
-| 评分确定性 | Reporter 后处理强制覆盖 LLM 分数 |
-| 投资决策 | 代码计算，不依赖 LLM |
-| 多 LLM 切换 | .env 一行配置 (DeepSeek/Anthropic/OpenAI) |
-| 策略热加载 | JSON 驱动，Prompt/维度/触发词可运行时切换 |
-| 模拟盘 | 下单/持仓/盈亏，threading.Lock 并发安全 |
-| MCP 兼容 | MCP_server.py 可独立给 Claude Code 用 |
-| K线图表 | Plotly 蜡烛图(日/周/月K)+折线图(分时/五日)，均线叠加 |
-| Streamlit 前端 | 暗色主题，6页面(行情/聊天/持仓/分析/知识库/设置) |
+| 调用层 | 数据不足拦截、TTL 感知工具去重、交易时段判断、注定失败拦截(3次→熔断) |
+| 输出层 | 评分强制覆盖、估值水位 PE/PB 强制覆盖、Q1 现金流自动预警、输出格式校验+重试、对比范围限制、公司类型兜底、成长-估值匹配检查 |
+| 运维层 | 结构化日志+耗时追踪、LLM API 熔断(3次→停止)、配置校验(scoring.json)、e2e 自动测试(24项) |
+| 编排 | LangGraph StateGraph、SqliteSaver 持久化、上下文压缩、多 LLM 热切换 |
+| 前端 | Streamlit 暗色主题 6 页面、Plotly K线图(分时日K周K月K，午休裁剪) |
 
 ## 快速开始
 

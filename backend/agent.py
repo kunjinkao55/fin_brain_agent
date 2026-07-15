@@ -62,8 +62,15 @@ def _get_strategy():
 # ============================================================
 
 _LLM = None
+_llm_failures = 0
+_MAX_LLM_FAILURES = 3
+
 
 def _get_llm():
+    """获取 LLM 实例。连续失败 3 次→熔断。"""
+    global _llm_failures
+    if _llm_failures >= _MAX_LLM_FAILURES:
+        raise RuntimeError(f"LLM API 连续失败{_MAX_LLM_FAILURES}次，已熔断。请检查 API Key 和网络后重启。")
     global _LLM
     if _LLM is not None:
         return _LLM
@@ -630,7 +637,10 @@ def _get_collector():
     return _COLLECTOR_AGENT
 
 def data_collector_node(state: FinBrainState) -> dict:
-    """并行预取数据——跳过LLM串行调工具，直接并发拉取，结果结构化为JSON。"""
+    """并行预取数据——跳过LLM串行调工具，直接并发拉取。"""
+    # Harness: 清空去重记录
+    from backend.tools import _clear_dedup
+    _clear_dedup()
     import re, concurrent.futures
     from backend.tools import (get_financial_statements, get_valuation,
                                 fetch_stock_price, get_industry_info, calculate_scores)
@@ -674,10 +684,17 @@ def data_collector_node(state: FinBrainState) -> dict:
         results = list(ex.map(_fetch_one, symbols))
 
     elapsed = (__import__("time").time() - start) * 1000
+    # Harness: 结构化日志
+    errors = [r for r in results if "error" in r]
+    logger = __import__("logging").getLogger("FinBrain.Harness")
+    logger.info("DataCollector: %d stocks in %.0fms, %d errors", len(symbols), elapsed, len(errors))
+    if errors:
+        logger.warning("DataCollector errors: %s", [(e.get("代码","?"), e["error"][:80]) for e in errors])
+
     collected = json.dumps(results, ensure_ascii=False, indent=2)
     return {
         "collected_data": collected,
-        "processing_log": [{"phase": "Data", "summary": f"并行预取{len(symbols)}只股票 ({elapsed:.0f}ms)", "detail": collected[:3000]}]
+        "processing_log": [{"phase": "Data", "summary": f"预取{len(symbols)}只 ({elapsed:.0f}ms, {len(errors)}错)", "detail": collected[:3000]}]
     }
 
 def analyst_node(state: FinBrainState) -> dict:
@@ -722,10 +739,15 @@ def analyst_node(state: FinBrainState) -> dict:
         f"注意:高毛利在医药行业常见不等于强护城河;趋势看三年不只看一季;ROE异常低需解释。对比分析只包含用户指定的{stock_count}只股票，不要加其他公司。"
         f"输出纯JSON。{multi_note}"
     )
-    response = _get_llm().invoke([
-        SystemMessage(content=ANALYST_PROMPT),
-        HumanMessage(content=prompt),
-    ])
+    try:
+        response = _get_llm().invoke([
+            SystemMessage(content=ANALYST_PROMPT),
+            HumanMessage(content=prompt),
+        ])
+        _llm_failures = 0  # 成功→重置
+    except Exception:
+        _llm_failures += 1
+        raise
     prev_log = state.get("processing_log", [])
     prev_log.append({"phase": "Analysis", "summary": f"Scored ({len(response.content)} chars)", "detail": response.content[:3000]})
     return {"analysis": response.content, "processing_log": prev_log}
