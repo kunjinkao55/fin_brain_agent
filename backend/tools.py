@@ -1107,8 +1107,18 @@ def get_concept_ranking(top_n: int = 20) -> dict:
 # ============================================================
 
 def calculate_scores(financial_data: dict) -> dict:
-    """纯函数，根据财报数据计算6维评分。LLM 只管叙事，数字由这里保证一致。"""
+    """纯函数，根据财报数据计算6维评分。数据不足时该维度自动标N/A。"""
     scores = {}
+
+    # Harness: 数据不足拦截
+    val_data = financial_data.get("valuation", {}).get("data", [])
+    if not val_data and not financial_data.get("profit"):
+        return {"盈利能力": {"得分": None, "依据": "数据不足，无法计算"},
+                "成长性": {"得分": None, "依据": "数据不足，无法计算"},
+                "财务健康": {"得分": None, "依据": "数据不足，无法计算"},
+                "估值合理": {"得分": None, "依据": "数据不足，无法计算"},
+                "行业前景": {"得分": 5, "依据": "待LLM根据行业信息微调(+-3)"},
+                "资金认可": {"得分": 5, "依据": "待LLM根据主力净流入判断(+-5)"}}
 
     # 从 valuation 数据中提取值——优先年报（避免Q1单季度ROE偏低）
     val_data = financial_data.get("valuation", {}).get("data", [])
@@ -1501,6 +1511,15 @@ def get_sector_fund_flow(top_n: int = 50, date: str = "") -> dict:
 
 def get_intraday(symbol: str) -> dict:
     """获取当日5分钟K线（48根/天），用于画分时图"""
+    # Harness: 交易时段判断
+    from datetime import datetime
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return {"info": "非交易日（周末），无分时数据"}
+    t = now.hour * 60 + now.minute
+    if t < 9 * 60 + 15 or t > 15 * 60 + 5:
+        return {"info": f"非交易时段（当前{now.strftime('%H:%M')}），无分时数据。交易时间: 9:15-15:05"}
+
     if symbol.startswith(("60", "68")):
         full_code = f"sh{symbol}"
     elif symbol.startswith(("00", "30")):

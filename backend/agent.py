@@ -599,9 +599,9 @@ ANALYST_PROMPT = """[铁律 - 输出格式]
 0.5. 经营现金流必须检查: 最新季报的经营现金流净额是比利润更敏感的先行指标。利润增长但经营现金流为负→必须在风险中标注并解释原因(是备货占用?回款恶化?还是季节性因素?)
 1. 归母≠扣非: 用扣非净利润判断主业增长
 2. 现金流≠含金量: 重资产行业折旧推高OFC/NI，需降级评价
-3. 护城河要有深度: 不是贴标签，回答"为什么竞争对手不能复制"
-4. 估值要用情景: 悲观/基准/乐观三情景+概率加权，不要只给一个目标价
-5. 买入点来自估值模型: "合理价值×(1-安全边际)=买入区间"，不是猜数字
+3. 强制对比两种PE: 估值水位中已提供"PE"(静态,基于年报EPS)和"前瞻PE"(动态,基于最新季报年化)。两者差异>20%时，必须在估值判断中明确说明——"静态PE看起来偏贵，但动态PE显示实际上很便宜"。禁止只看静态PE下结论。
+4. 护城河要有深度: 不是贴标签，回答"为什么竞争对手不能复制"
+5. 估值要用情景: 悲观/基准/乐观三情景+概率加权，不要只给一个目标价
 6. 证伪条件要具体: 什么指标变化到什么程度意味着投资逻辑失效
 7. 市场预期差: 判断股价已包含什么预期，超预期才能赚钱
 
@@ -800,6 +800,27 @@ def reporter_node(state: FinBrainState) -> dict:
             HumanMessage(content=raw),
         ])
         return {"report": response.content}
+
+    # Harness: 输出格式校验——缺必填字段→重试一次
+    def _validate_item(item: dict) -> list[str]:
+        required = ["代码", "名称", "评分"]
+        return [f for f in required if f not in item]
+
+    items = data if isinstance(data, list) else [data]
+    missing_fields = []
+    for item in items:
+        if isinstance(item, dict):
+            missing_fields.extend(_validate_item(item))
+    if missing_fields:
+        retry_prompt = f"你的上次输出缺少必填字段: {missing_fields}。请重新输出完整的纯JSON。"
+        retry_response = _get_llm().invoke([
+            SystemMessage(content=ANALYST_PROMPT),
+            HumanMessage(content=raw + "\n\n" + retry_prompt),
+        ])
+        try:
+            data = json.loads(retry_response.content.strip())
+        except json.JSONDecodeError:
+            pass  # 重试失败，用原数据
 
     # 单只 or 多只: 代码生成评分卡
     from backend.tools import _format_compare_section, calculate_scores
