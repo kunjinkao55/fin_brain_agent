@@ -871,6 +871,55 @@ elif page == "Settings":
         st.code(f"Stock Price:  {cur_stock}\nFinancials:   {cur_fin}\nIndustry:     {cur_ind}\nFund Flow:    {cur_fund}\nWeb Search:   {cur_ws_provider} ({'已配置' if cur_ws_key else '未配置'})", language=None)
 
     with tab4:
+        st.subheader("Deployment Mode")
+        cur_data_mode = os.getenv("FINBRAIN_DATA_MODE", "local")
+        cur_llm_mode = os.getenv("FINBRAIN_LLM_MODE", "local")
+        cur_api_url = os.getenv("FINBRAIN_DATA_API", "http://localhost:8000")
+
+        dm = st.selectbox("Data Mode", ["local", "remote"],
+                          index=0 if cur_data_mode == "local" else 1,
+                          help="local=本地直连数据源 / remote=调远程 Data API")
+        lm = st.selectbox("LLM Mode", ["local", "remote_client"],
+                          index=0 if cur_llm_mode == "local" else 1,
+                          help="local=服务端调LLM / remote_client=客户端本地调LLM(Key不上传)")
+        api_url = st.text_input("Data API URL", value=cur_api_url,
+                                placeholder="http://your-server:8000",
+                                disabled=(dm == "local"))
+
+        status = "Local" if dm == "local" else f"Remote ({api_url})"
+        if dm == "remote":
+            try:
+                import urllib.request, json
+                r = urllib.request.urlopen(f"{api_url}/health", timeout=3)
+                h = json.loads(r.read())
+                status = f"Remote Connected ({api_url}) - v{h.get('version','?')}"
+            except Exception:
+                status = f"Remote Offline ({api_url})"
+
+        st.caption(f"Status: **{status}** | LLM: **{lm}**")
+        if dm == "remote_client":
+            st.info("远程LLM模式: Prompt由服务器组装, 推理在你本地执行。你的API Key不会上传。")
+
+        if st.button("Save Deployment Config", type="primary", key="save_deploy"):
+            env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", ".env")
+            lines = []
+            if os.path.exists(env_path):
+                with open(env_path, encoding="utf-8") as f:
+                    for line in f:
+                        if not any(line.startswith(p) for p in
+                                   ["FINBRAIN_DATA_MODE","FINBRAIN_LLM_MODE","FINBRAIN_DATA_API"]):
+                            lines.append(line.rstrip())
+            lines.append(f"FINBRAIN_DATA_MODE={dm}")
+            lines.append(f"FINBRAIN_LLM_MODE={lm}")
+            if api_url.strip(): lines.append(f"FINBRAIN_DATA_API={api_url.strip()}")
+            os.environ["FINBRAIN_DATA_MODE"] = dm
+            os.environ["FINBRAIN_LLM_MODE"] = lm
+            os.environ["FINBRAIN_DATA_API"] = api_url.strip()
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            st.success("Saved. Restart to apply.")
+
+        st.divider()
         c1,c2 = st.columns(2)
         with c1: st.number_input("Compress Trigger", value=int(os.getenv("COMPRESS_TRIGGER","12")), min_value=4, key="ct2")
         with c2: st.number_input("Compress Keep", value=int(os.getenv("COMPRESS_KEEP","6")), min_value=2, key="ck2")

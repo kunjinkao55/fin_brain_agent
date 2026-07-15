@@ -1,69 +1,114 @@
 """
-工具调用缓存 — 减少重复 API 请求，加速响应，降低 token 消耗。
+工具调用缓存 — 减少重复 API 请求。支持 local(内存) / redis(共享) 双模式。
 
-缓存策略（TTL）：
-- 实时行情: 30秒
-- K线数据:   5分钟
-- 财报/估值: 30分钟（日频更新）
-- 行业信息:  1小时
-- 资金流向:  5分钟
-- 龙虎榜:    5分钟
-
-线程安全：threading.Lock 保护共享 dict。
+线程安全：local 用 threading.Lock，redis 自带原子操作。
 """
 
-import time, threading
+import os, time, threading, json, logging
 
-_cache = {}
-_lock = threading.Lock()
+logger = logging.getLogger(__name__)
+
+_CACHE_MODE = os.getenv("FINBRAIN_CACHE_MODE", "local")
+_REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # TTL 配置（秒）
 TTL = {
-    "stock_price": 30,
-    "stock_history": 300,
-    "financial_statements": 1800,
-    "valuation": 1800,
-    "industry_info": 3600,
-    "fund_flow": 300,
-    "screen_stocks": 600,
-    "limit_up_pool": 60,
-    "concept_ranking": 600,
-    "dragon_tiger_list": 300,
-    "dragon_tiger_detail": 300,
-    "search_youzi": 3600,
+    "stock_price": 30,       "stock_history": 300,
+    "financial_statements": 1800, "valuation": 1800,
+    "industry_info": 3600,   "fund_flow": 300,
+    "screen_stocks": 600,    "limit_up_pool": 60,
+    "concept_ranking": 600,  "dragon_tiger_list": 300,
+    "dragon_tiger_detail": 300, "search_youzi": 3600,
     "calculate_score": 300,
 }
 
+# ---- Redis 后端 ----
+_redis = None
 
-def get(tool_name: str, key: str) -> dict | None:
-    """获取缓存结果。key 通常是股票代码或查询参数。返回 None 表示未命中。"""
-    cache_key = f"{tool_name}:{key}"
+def _get_redis():
+    global _redis
+    if _redis is not None:
+        return _redis
+    try:
+        import redis
+        _redis = redis.from_url(_REDIS_URL, decode_responses=True)
+        _redis.ping()
+        logger.info("Redis connected: %s", _REDIS_URL)
+    except Exception as e:
+        logger.warning("Redis unavailable (%s), falling back to local cache", e)
+        _redis = False
+    return _redis
+
+
+def get(tool_name: str, key: str):
+    cache_key = f"finbrain:{tool_name}:{key}"
+    ttl = TTL.get(tool_name, 60)
+
+    if _CACHE_MODE == "redis":
+        r = _get_redis()
+        if r:
+            try:
+                raw = r.get(cache_key)
+                if raw:
+                    return json.loads(raw)
+            except Exception:
+                pass
+        return None
+
+    # Local mode
     with _lock:
-        entry = _cache.get(cache_key)
-        if entry and time.time() - entry["ts"] < TTL.get(tool_name, 60):
+        entry = _local_cache.get(cache_key)
+        if entry and time.time() - entry["ts"] < ttl:
             return entry["data"]
     return None
 
 
-def set(tool_name: str, key: str, data: dict):
-    """写入缓存"""
-    cache_key = f"{tool_name}:{key}"
+def set(tool_name: str, key: str, data):
+    cache_key = f"finbrain:{tool_name}:{key}"
+    ttl = TTL.get(tool_name, 60)
+
+    if _CACHE_MODE == "redis":
+        r = _get_redis()
+        if r:
+            try:
+                r.setex(cache_key, ttl, json.dumps(data, ensure_ascii=False, default=str))
+                return
+            except Exception:
+                pass
+
+    # Local mode
     with _lock:
-        _cache[cache_key] = {"ts": time.time(), "data": data}
-        # 简单淘汰：超过1000条清最旧的
-        if len(_cache) > 1000:
-            oldest = min(_cache, key=lambda k: _cache[k]["ts"])
-            del _cache[oldest]
+        _local_cache[cache_key] = {"ts": time.time(), "data": data}
+        if len(_local_cache) > 1000:
+            oldest = min(_local_cache, key=lambda k: _local_cache[k]["ts"])
+            del _local_cache[oldest]
 
 
 def clear():
-    """清空全部缓存"""
+    if _CACHE_MODE == "redis":
+        r = _get_redis()
+        if r:
+            try:
+                for k in r.keys("finbrain:*"):
+                    r.delete(k)
+            except Exception:
+                pass
     with _lock:
-        _cache.clear()
+        _local_cache.clear()
 
 
-def stats() -> dict:
-    """缓存统计"""
+def stats():
+    if _CACHE_MODE == "redis":
+        r = _get_redis()
+        if r:
+            try:
+                return {"mode": "redis", "keys": r.dbsize()}
+            except Exception:
+                pass
     with _lock:
-        return {"entries": len(_cache),
-                "oldest_ts": min((e["ts"] for e in _cache.values()), default=0)}
+        return {"mode": "local", "entries": len(_local_cache)}
+
+
+# ---- Local 后端（保留） ----
+_local_cache = {}
+_lock = threading.Lock()
