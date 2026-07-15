@@ -41,7 +41,7 @@ def compute_investment_rating(
     根据公司类型动态赋权，计算综合评分 + 合理价值 + 安全边际 + 投资评级。
     全部代码计算，不依赖 LLM。
     """
-    weights = _WEIGHTS.get(company_type, _DEFAULT_WEIGHTS)
+    weights = get_weights(company_type)
 
     # --- 1. 提取各维度得分 ---
     def _safe_score(d, key):
@@ -63,7 +63,8 @@ def compute_investment_rating(
     weighted = round(weighted, 1)
 
     # --- 3. 合理价值估算 ---
-    ind_pe = _INDUSTRY_PE.get(industry, 18)
+    val_cfg = get_valuation()
+    ind_pe = val_cfg["industry_pe"].get(industry, val_cfg["default_ind_pe"])
     # 财务质量调整PE基准：ROE和负债率决定了企业应享有怎样的估值
     quality_mult = 1.0
     if roe > 35: quality_mult = 1.6       # 顶级盈利能力（茅台级）
@@ -81,7 +82,7 @@ def compute_investment_rating(
     fair_value = round(eps * fair_pe, 2) if eps > 0 else 0
 
     # --- 4. 安全边际 ---
-    base_margin = _SAFETY_MARGIN.get(company_type, 0.30)
+    base_margin = get_safety_margin(company_type)
     quality_adj = _quality_adjustment(roe, debt)
     safety_margin = base_margin + quality_adj
     safety_margin = max(0.15, min(0.55, safety_margin))  # 限制在15%-55%
@@ -120,7 +121,7 @@ def compute_investment_rating(
     return {
         "评级": rating,
         "加权总分": weighted,
-        "权重描述": weights.get("描述", _DEFAULT_WEIGHTS.get("描述", "")),
+        "权重描述": weights.get("描述", ""),
         "合理PE": round(fair_pe, 1),
         "合理价值": fair_value,
         "当前价格": stock_price,
