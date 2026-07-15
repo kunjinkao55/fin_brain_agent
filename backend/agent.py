@@ -246,15 +246,59 @@ def execute_analysis(action: str = "buy", symbol: str = "", pct: float = 5) -> s
 
 
 @tool
-def calculate_score(symbol: str, financial_data_json: str = "") -> str:
-    """确定性评分引擎。传入financial_statements+valuation的JSON拼接结果，
-    返回6维评分: 盈利能力/成长性/财务健康/估值合理/行业前景/资金认可。
-    _get_llm()拿到分数后只需微调行业前景(+-3)和资金认可(+-5)，其他维度不要改动。"""
+def calculate_score(symbol: str) -> str:
+    """确定性评分引擎。自动拉取财报+估值+行情+PE数据，计算6维评分。
+    你只需要传入股票代码，不需要手动拼接数据。"""
+    from backend.tools import (get_financial_statements, get_valuation,
+                                fetch_stock_price, get_industry_info, calculate_scores)
+    import urllib.request
+
+    # 自取数据（已缓存，重复调用零开销）
+    fin = get_financial_statements(symbol)
+    val = get_valuation(symbol)
+    price = fetch_stock_price(symbol)
+    ind = get_industry_info(symbol)
+
+    # PE/PB/市值：东财实时行情
+    pe_data = {}
     try:
-        data = json.loads(financial_data_json) if financial_data_json else {}
-    except (json.JSONDecodeError, TypeError):
-        data = {}
-    from backend.tools import calculate_scores
+        secid = f"1.{symbol}" if symbol.startswith(("60", "00")) else f"0.{symbol}"
+        pe_url = (f"http://push2.eastmoney.com/api/qt/stock/get?"
+                  f"secid={secid}&fields=f116,f117,f162,f167,f20")
+        from backend.tools import _SSL_CTX
+        req = urllib.request.Request(pe_url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com",
+        })
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as resp:
+            pe_json = json.loads(resp.read().decode("utf-8"))
+            d = pe_json.get("data", {}) or {}
+            pe_data = {"per": d.get("f162"), "pb": d.get("f167"),
+                        "mktcap": d.get("f20")}
+    except Exception:
+        pass  # PE数据获取失败不影响其他评分
+
+    # 组装为 calculate_scores 期望的结构
+    data = {}
+    if isinstance(fin, dict) and "profit" in fin:
+        data["profit"] = fin.get("profit", [])
+        data["cashflow"] = fin.get("cashflow", [])
+        data["balance"] = fin.get("balance", [])
+    if isinstance(val, dict):
+        data["valuation"] = val
+    # price 以 Sina 为准（有当前股价），pe_data 只补 PE/PB（如有）
+    if isinstance(price, dict):
+        price = dict(price)  # 不污染缓存
+        if pe_data.get("per") is not None:
+            price["per"] = pe_data["per"]
+        if pe_data.get("pb") is not None:
+            price["pb"] = pe_data["pb"]
+        if pe_data.get("mktcap") is not None:
+            price["mktcap"] = pe_data["mktcap"]
+    data["price"] = price
+    if isinstance(ind, dict):
+        data["industry"] = ind.get("行业", "")
+
     result = calculate_scores(data)
     result["代码"] = symbol
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -282,6 +326,33 @@ def search_youzi_kb(query: str) -> str:
     logger.info("[RAG Result] found=%d", len(results))
     if not results:
         return json.dumps({"info": "未找到匹配游资"}, ensure_ascii=False)
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@tool
+def search_knowledge(query: str, kb: str = "accounting") -> str:
+    """RAG检索多知识库。kb可选: accounting(会计准则/财务分析)/industry(行业研报)/trading(交易策略)。
+    输入财报分析相关问题(如'收入确认条件''商誉减值测试''关联交易识别')，返回相关知识片段。"""
+    from backend.accounting_rag import search_kb, seed_accounting_kb
+    try:
+        seed_accounting_kb()
+    except Exception:
+        pass
+    results = search_kb(query, kb, top_k=5)
+    if not results:
+        return json.dumps({"info": f"知识库 '{kb}' 中未找到相关内容"}, ensure_ascii=False)
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@tool
+def web_search(query: str) -> str:
+    """互联网搜索，用于交叉验证免费API数据。当API返回的PE/市值/EPS/ROE数据可疑时调用。
+    输入搜索词如'新易盛 300502 PE 2026'或'大唐发电 601991 最新市值'，返回搜索结果摘要。"""
+    from backend.web_search import search_financial
+    results = search_financial(query, max_results=5)
+    if not results or results[0].get("score", 0) == 0:
+        return json.dumps({"info": "Web Search 未配置或无结果。请在 Settings 配置 WEB_SEARCH_API_KEY。"},
+                          ensure_ascii=False)
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 
@@ -319,9 +390,16 @@ def dragon_tiger_detail(symbol: str) -> str:
     from backend.tools import get_dragon_tiger_detail
     return json.dumps(get_dragon_tiger_detail(symbol), ensure_ascii=False, indent=2)
 
+
+@tool
+def stock_streak(symbol: str) -> str:
+    """查询个股近10日连板情况。返回连板天数、涨停日期列表。输入股票代码如'300231'"""
+    from backend.tools import get_stock_streak
+    return json.dumps(get_stock_streak(symbol), ensure_ascii=False, indent=2)
+
 # ---- 妖股猎人工具集 ----
-_PHANTOM_TOOLS = [resolve_stock, search_youzi_kb, limit_up_pool, concept_ranking,
-                  dragon_tiger_list, dragon_tiger_detail,
+_PHANTOM_TOOLS = [resolve_stock, search_youzi_kb, search_knowledge, limit_up_pool, concept_ranking,
+                  dragon_tiger_list, dragon_tiger_detail, stock_streak,
                   stock_price, stock_history, fund_flow,
                   financial_statements, valuation, industry_info,
                   place_order, execute_analysis, show_portfolio, trade_history]
@@ -371,6 +449,46 @@ _FORMAT_MANDATORY = """
     "预期收益": "目标价位",
     "持仓周期": "预计时长"
   },
+  "公司画像": {
+    "主营业务": "产品/服务分项，各占收入比例",
+    "收入来源": ["产品A占x%", "产品B占y%"],
+    "公司类型": "价值型/成长型/周期型/困境反转型/事件驱动型",
+    "生命周期": "成长期/成熟期/周期底部/周期顶部/转型期",
+    "行业模板": "医药/制造/消费/科技/金融/能源"
+  },
+  "竞争优势": {
+    "核心资产": "企业最不可替代的资源或能力是什么",
+    "护城河来源": ["品牌", "网络效应", "成本优势", "技术专利", "数据", "渠道", "牌照"],
+    "复制难度": "低/中/高",
+    "持续时间": "<3年/3-5年/5年以上",
+    "竞争格局": "市占率趋势、新进入者威胁、替代品风险",
+    "毛利率归因": "高毛利是因为技术壁垒、定价权、还是周期高点?"
+  },
+  "投资逻辑链": "因为①...→导致②...→最终③...→市场目前④...→因此⑤...",
+  "催化剂": {
+    "正面": ["未来12个月可能推动股价的事件"],
+    "负面": ["未来12个月可能压制股价的事件"],
+    "强度": "强催化/中性/无催化"
+  },
+  "估值方法": "适用于该公司的估值方法(PE/PB/PEG/PS/DCF)及理由。不同行业不同方法，不要所有公司都用PE",
+  "市场预期拆解": {
+    "当前估值隐含的增长率": "当前PE=14倍，市场隐含未来利润增速约x%",
+    "市场主要担忧": ["担忧1", "担忧2"],
+    "可能的预期差": "如果实际增长>隐含增速→估值修复;如果<→继续下跌"
+  },
+  "情景估值": {
+    "悲观": {"价格": "xx元", "假设": "条件", "概率": "20%"},
+    "基准": {"价格": "xx元", "假设": "条件", "概率": "60%"},
+    "乐观": {"价格": "xx元", "假设": "条件", "概率": "20%"},
+    "概率加权价值": "xx元 (=悲观×概率+基准×概率+乐观×概率)"
+  },
+  "投资评级": {
+    "评级": "BUY/HOLD/SELL",
+    "合理价值": "xx元",
+    "安全边际": "x%",
+    "买入区间": "≤xx元"
+  },
+  "证伪条件": ["条件1: 什么具体指标变化到什么程度意味着投资逻辑失效", "条件2"],
   "对比分析": {
     "板块": "板块名称",
     "财报对比表": {
@@ -396,23 +514,100 @@ _FORMAT_MANDATORY = """
 // 只在分析>=2只同板块股票时填写\"对比分析\"字段，单只股票省略。
 """
 
-ANALYST_PROMPT = """[铁律] 你的全部输出必须是纯JSON。DataCollector已用calculate_score()预计算好了分数，你不需要自己打分。你只需要：(1)检查行业前景(+-3)和资金认可(+-5)是否合理并微调，(2)写亮点/风险/结论。其他四个维度的分数和依据不要改。
+ANALYST_PROMPT = """[铁律 - 输出格式]
+1. 纯JSON，不要markdown代码块```json```，输出必须以[或{开头
+2. 多只股票必须输出JSON数组 [{股票1},{股票2}]，每只独立完整
+3. 每只股票必须包含: 公司画像、竞争优势、投资逻辑链、评分、亮点、风险、业绩驱动力、关键信号、估值水位、催化剂、市场预期拆解、情景估值、投资评级、证伪条件、观察指标、操作建议、止损、结论。缺一不可
+
+[投资分析十步框架] 理解公司→判断价值→判断价格→给出决策。
+
+第1步 公司分类（这是什么类型的投资机会）:
+- 公司类型: 价值型(成熟稳定现金流)/成长型(高增速扩张)/周期型(行业周期驱动)/困境反转型(从低谷恢复)/事件驱动型(并购/重组/政策)
+- 生命周期: 成长期/成熟期/周期底部/周期顶部/转型期
+- 不同类型用不同分析重点: 价值股看现金流和估值; 成长股看行业空间和壁垒; 周期股看供需和拐点; 困境反转看修复信号
+
+第2步 商业模式（怎么赚钱）:
+- 主营业务拆分及收入占比
+- 客户结构: 集中还是分散? 复购特征?
+- 成本结构: 固定成本vs变动成本, 规模效应是否存在?
+- 定价权: 能否提价? 提价后销量是否下降?
+
+第3步 护城河（为什么竞争对手不能复制）:
+- 核心资产: 企业最不可替代的资源或能力
+- 壁垒来源: 品牌/网络效应/成本优势/技术专利/数据/渠道/牌照
+- 复制难度: 低(1-2年可复制)/中(3-5年)/高(5年以上)
+- 关键验证: 毛利率高是因为壁垒还是周期? 亏损是因为投入期还是模式失败?
+
+第4步 行业判断（现在处于什么位置）:
+- 行业空间和增速
+- 生命周期阶段和供需格局
+- 政策环境和竞争格局
+- 关键判断: 利润变化是周期驱动还是竞争驱动? CRO订单下滑是融资周期还是行业转移?
+
+第5步 财务验证（数据说了什么）:
+- 系统已计算盈利能力/成长性/财务健康/估值合理的分数
+- 你补充: 财务趋势解读(3年毛利率/净利率/ROE变化方向)、现金流质量(结合折旧和行业特征)、研发和资本开支效率
+- 重点关注: 利润是否真实转化为现金流? 应收和存货是否异常增长?
+
+第6步 成长逻辑（未来增长从哪来）:
+- 增长来源: 内生(产品升级/市场扩张/提价) vs 外延(并购) vs 周期恢复 vs 估值重定价
+- 增长质量: 扣非增速是否匹配营收增速? 增长是否需要大量资本开支?
+- 持续性: 增长驱动力能持续多久?
+
+第7步 市场预期（市场已经定价了什么）:
+- 当前PE隐含的增长率是多少?
+- 市场主要担忧什么?
+- 可能的预期差在哪里? (如果实际>预期→估值修复; 如果实际<预期→继续下跌)
+
+第8步 估值判断（合理价值是多少）:
+- 绝对估值: PE/PB/PS在历史分位
+- 相对估值: 与同行业可比公司对比
+- 情景估值: 悲观/基准/乐观三种情景，概率加权计算期望价值
+
+第9步 催化剂与风险（什么会推动股价）:
+- 未来12个月正面催化剂: 新品/政策/行业复苏/订单/业绩
+- 未来12个月负面风险: 竞争/政策/周期/经营
+- 催化剂强度: 强/中性/弱
+
+第10步 投资决策（现在是否值得行动）:
+- 投资评级: BUY(值得买入)/HOLD(持有观望)/SELL(建议回避)
+- 合理价值 vs 当前价格: 安全边际有多少?
+- 买入区间: 基于"合理价值×(1-安全边际要求)"计算，不是猜数字
+- 高质量公司安全边际20%，普通公司30%，周期股40%
+- 仓位建议和置信度
+
+[趋势判断要求]
+- 单一季度拐点不能证明趋势反转。至少需要连续2个季度同向变化+辅助指标验证
+- 毛利率/净利率/ROE的3年趋势比当前绝对值更重要
+
+[系统定位] 你是一个基本面研究Agent，不是实时行情终端。你的价值在于"看懂生意"而非"算准价格"。
+- PE/PB/市值/目标价由代码计算，标注"基于最新财报，非实时行情"。用户如需精确估值应查看交易软件。
+- 你的算力应该花在：三年毛利率趋势意味着什么？现金流为何与利润背离？行业周期处于什么位置？竞争对手能否复制？
+- 不要假装精确。估值数字是方向性的——判断"偏贵/合理/低估"比给出具体PE更重要。
 
 """ + _get_strategy()["analyst"] + _FORMAT_MANDATORY + """
 
-[多股票板块分类]
-1. 根据industry_info结果按行业分组
-2. 输出JSON数组，同板块>=2只时在最后一只附加"对比分析"字段
-3. 某板块只有1只时不加对比，跨板块不合并对比表
-4. 正确: [{"代码":"300502",...}, {"代码":"300308",...,"对比分析":{...}}, {"代码":"300750",...}]
-5. 错误: 单个对象、markdown、代码块```json```
+[分析质量标准]
+0. 对比输出仅限用户指定的股票: 对比分析表中不得出现用户问题中未提及的股票。
+0.5. 经营现金流必须检查: 最新季报的经营现金流净额是比利润更敏感的先行指标。利润增长但经营现金流为负→必须在风险中标注并解释原因(是备货占用?回款恶化?还是季节性因素?)
+1. 归母≠扣非: 用扣非净利润判断主业增长
+2. 现金流≠含金量: 重资产行业折旧推高OFC/NI，需降级评价
+3. 护城河要有深度: 不是贴标签，回答"为什么竞争对手不能复制"
+4. 估值要用情景: 悲观/基准/乐观三情景+概率加权，不要只给一个目标价
+5. 买入点来自估值模型: "合理价值×(1-安全边际)=买入区间"，不是猜数字
+6. 证伪条件要具体: 什么指标变化到什么程度意味着投资逻辑失效
+7. 市场预期差: 判断股价已包含什么预期，超预期才能赚钱
+
+[多股票输出示例 - 必须严格遵守]
+正确(2只): [{"代码":"601991","名称":"大唐发电","公司画像":{...},"竞争优势":{...},...,"对比分析":{...}}, {"代码":"600795","名称":"国电电力",...}]
+错误: {"代码":"601991",...,"对比分析":{...}}  ← 第二只股票的独立评分卡丢失！
 """
 
 # ============================================================
 #  节点函数
 # ============================================================
 
-_data_collector_tools = [resolve_stock, calculate_score, search_youzi_kb,
+_data_collector_tools = [resolve_stock, calculate_score, search_youzi_kb, web_search,
                          stock_price, stock_history, financial_statements, valuation,
                          industry_info, screen_stocks, fund_flow,
                          place_order, execute_analysis, show_portfolio, trade_history]
@@ -428,24 +623,97 @@ def _get_collector():
     return _COLLECTOR_AGENT
 
 def data_collector_node(state: FinBrainState) -> dict:
-    """调用工具搜集数据（带对话历史上下文）"""
-    collector = _get_collector()
-    # 把历史消息 + 当前问题一起传给子Agent，让它知道上下文
-    msgs = list(state.get("messages", []))
-    msgs.append(HumanMessage(content=state["user_question"]))
-    result = collector.invoke({"messages": msgs})
-    collected = result["messages"][-1].content
+    """并行预取数据——跳过LLM串行调工具，直接并发拉取，结果结构化为JSON。"""
+    import re, concurrent.futures
+    from backend.tools import (get_financial_statements, get_valuation,
+                                fetch_stock_price, get_industry_info, calculate_scores)
+    question = state["user_question"]
+    symbols = list(set(re.findall(r'(?<!\d)(\d{6})(?!\d)', question)))
+
+    if not symbols:
+        # 回退到LLM搜集（用户没给具体代码时）
+        collector = _get_collector()
+        msgs = list(state.get("messages", []))
+        msgs.append(HumanMessage(content=question))
+        result = collector.invoke({"messages": msgs}, {"configurable": {"thread_id": "dc_fallback"}})
+        collected = result["messages"][-1].content
+        return {
+            "collected_data": collected,
+            "processing_log": [{"phase": "Data", "summary": f"LLM Collected ({len(collected)} chars)", "detail": collected[:3000]}]
+        }
+
+    # 并发拉取所有股票数据
+    def _fetch_one(code):
+        try:
+            fin = get_financial_statements(code)
+            val = get_valuation(code)
+            price = fetch_stock_price(code)
+            ind = get_industry_info(code)
+            cs_data = {"profit": fin.get("profit",[]), "cashflow": fin.get("cashflow",[]),
+                       "balance": fin.get("balance",[]), "valuation": val,
+                       "price": dict(price) if isinstance(price, dict) else price,
+                       "industry": ind.get("行业","") if isinstance(ind, dict) else ""}
+            scores = calculate_scores(cs_data)
+            name = price.get("name", code) if isinstance(price, dict) else code
+            return {"代码": code, "名称": name, "行情": price, "行业": ind,
+                    "财报": {"利润表": fin.get("profit",[])[:4], "现金流": fin.get("cashflow",[])[:2]},
+                    "估值": val.get("data",[])[:2] if isinstance(val, dict) else [],
+                    "预计算分数": scores}
+        except Exception as e:
+            return {"代码": code, "error": str(e)}
+
+    start = __import__("time").time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(_fetch_one, symbols))
+
+    elapsed = (__import__("time").time() - start) * 1000
+    collected = json.dumps(results, ensure_ascii=False, indent=2)
     return {
         "collected_data": collected,
-        "processing_log": [{"phase": "Data", "summary": f"Collected ({len(collected)} chars)", "detail": collected[:3000]}]
+        "processing_log": [{"phase": "Data", "summary": f"并行预取{len(symbols)}只股票 ({elapsed:.0f}ms)", "detail": collected[:3000]}]
     }
 
 def analyst_node(state: FinBrainState) -> dict:
-    """分析数据，输出结构化JSON"""
+    """分析数据，LLM专注叙事。行业模板通过RAG注入。"""
+    import re
+    collected = state.get("collected_data", "")
+    symbols = re.findall(r'"代码":\s*"(\d{6})"', collected)
+    stock_count = max(len(symbols), 1)
+
+    # RAG: 按行业检索分析模板
+    from backend.accounting_rag import search_kb, seed_industry_kb, seed_accounting_kb, seed_trading_kb
+    try:
+        seed_accounting_kb()
+        seed_industry_kb()
+        seed_trading_kb()
+    except Exception:
+        pass  # 播种失败不影响
+    industry_names = list(set(re.findall(r'"行业":\s*"([^"]+)"', collected)))
+    industry_rag = ""
+    for ind_name in industry_names[:3]:
+        results = search_kb(f"{ind_name} 分析 估值 护城河", "industry", top_k=2)
+        if results:
+            snippets = [r["content"][:400] for r in results if r.get("content")]
+            if snippets:
+                industry_rag += f"\n[RAG行业模板-{ind_name}]\n" + "\n---\n".join(snippets) + "\n"
+
+    multi_note = ""
+    if stock_count >= 2:
+        multi_note = (
+            f"\n\n[!!!] 当前涉及{stock_count}只股票。你必须输出包含{stock_count}个对象的JSON数组。"
+            f"每只股票独立评分。不输出数组=分析作废。"
+        )
+
     prompt = (
         f"用户问题: {state['user_question']}\n\n"
-        f"=== 已搜集数据 ===\n{state['collected_data']}\n\n"
-        f"请按评分框架分析，输出JSON。"
+        f"=== 已搜集数据 ===\n{collected}\n"
+        f"{industry_rag}"
+        f"\n[任务] 基于以上数据和行业分析模板，撰写完整的分析报告JSON。"
+        f"必须包含：公司画像、竞争优势、投资逻辑链、估值方法(说明该公司适用什么估值方法及理由)、"
+        f"评分(系统计算)、情景估值(悲观/基准/乐观三情景+概率)、证伪条件(2-3个具体指标)、"
+        f"市场预期拆解(当前估值隐含什么预期)。"
+        f"注意:高毛利在医药行业常见不等于强护城河;趋势看三年不只看一季;ROE异常低需解释。对比分析只包含用户指定的{stock_count}只股票，不要加其他公司。"
+        f"输出纯JSON。{multi_note}"
     )
     response = _get_llm().invoke([
         SystemMessage(content=ANALYST_PROMPT),
@@ -470,21 +738,53 @@ def reporter_node(state: FinBrainState) -> dict:
     if not raw.strip():
         return {"report": "[无分析数据]"}
 
-    # 解析JSON
+    # 提取数据时效：从analysis JSON 中提取股票代码，直接拉财报获取最新报告期
+    stock_codes = list(set(re.findall(r'"代码":\s*"(\d{6})"', raw)))
+    data_periods = set()
+    if stock_codes:
+        from backend.tools import get_financial_statements
+        for code in stock_codes[:4]:  # 最多4只
+            try:
+                fin = get_financial_statements(code)
+                for report_list in ["profit", "cashflow", "balance"]:
+                    for row in fin.get(report_list, [])[:3]:
+                        d = row.get("date", "")
+                        p = row.get("报告期", "")
+                        if d:
+                            data_periods.add(f"{d} [{p}]" if p else d)
+            except Exception:
+                pass
+    period_note = "、".join(sorted(data_periods, reverse=True)[:8]) if data_periods else "未知"
+
+    # 解析JSON — 用 raw_decode 避免嵌套数组/对象的 regex 误匹配
     raw_stripped = raw.strip()
     data = None
-    for attempt in [raw_stripped,
-                    re.search(r'```(?:json)?\s*([\s\S]*?)```', raw_stripped),
-                    re.search(r'\[[\s\S]*\]', raw_stripped),
-                    re.search(r'\{[\s\S]*\}', raw_stripped)]:
-        try:
-            if isinstance(attempt, str):
-                data = json.loads(attempt)
-            elif attempt:
-                data = json.loads(attempt.group(1) if attempt.lastindex else attempt.group())
-            break
-        except (json.JSONDecodeError, AttributeError):
-            continue
+
+    # 方案1: 直接解析纯JSON
+    try:
+        data = json.loads(raw_stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # 方案2: 从 ```json 代码块提取
+    if data is None:
+        m = re.search(r'```(?:json)?\s*([\s\S]*?)```', raw_stripped)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+
+    # 方案3: raw_decode 从文本中提取第一个 JSON 值（正确处理嵌套）
+    if data is None:
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(raw_stripped):
+            if ch in '[{':
+                try:
+                    data, end = decoder.raw_decode(raw_stripped[i:])
+                    break
+                except json.JSONDecodeError:
+                    continue
 
     if data is None:
         # 解析失败，退回纯_get_llm()
@@ -495,13 +795,171 @@ def reporter_node(state: FinBrainState) -> dict:
         return {"report": response.content}
 
     # 单只 or 多只: 代码生成评分卡
+    from backend.tools import _format_compare_section, calculate_scores
+    from backend.tools import get_financial_statements, get_valuation, fetch_stock_price, get_industry_info
+
+    # === 强制修正评分 + 计算投资决策 ===
+    def _fix_and_decide(item: dict, sym: str):
+        """对单只股票: (a)覆盖评分 (b)代码计算投资评级"""
+        try:
+            fin = get_financial_statements(sym)
+            val = get_valuation(sym)
+            price = fetch_stock_price(sym)
+            ind = get_industry_info(sym)
+            cs_data = {}
+            if isinstance(fin, dict) and "profit" in fin:
+                cs_data["profit"] = fin.get("profit", [])
+                cs_data["cashflow"] = fin.get("cashflow", [])
+                cs_data["balance"] = fin.get("balance", [])
+            if isinstance(val, dict):
+                cs_data["valuation"] = val
+            if isinstance(price, dict):
+                cs_data["price"] = dict(price)
+            if isinstance(ind, dict):
+                cs_data["industry"] = ind.get("行业", "")
+            fixed = calculate_scores(cs_data)
+            for dim in ["盈利能力", "成长性", "财务健康", "估值合理"]:
+                if dim in fixed:
+                    item.setdefault("评分", {})[dim] = fixed[dim]
+
+            # --- 投资决策引擎 ---
+            from backend.scoring import compute_investment_rating
+            val_data = val.get("data", []) if isinstance(val, dict) else []
+            annuals = [v for v in val_data if (v.get("日期") or v.get("date") or "").endswith("-12-31")]
+            latest_val = annuals[0] if annuals else (val_data[0] if val_data else {})
+            # TTM EPS: 年报净利 - 去年Q1 + 最新Q1
+            profit_data = fin.get("profit", []) if isinstance(fin, dict) else []
+            annuals_prof = [p for p in profit_data if p.get("报告期") == "年报"]
+            q1s = [p for p in profit_data if p.get("报告期") == "一季报"]
+            ann_net = float(annuals_prof[0].get("归母净利润") or annuals_prof[0].get("扣非净利润") or 0) if annuals_prof else 0
+            ttm_net = ann_net
+            if len(q1s) >= 2:
+                ttm_net = ann_net + float(q1s[0].get("归母净利润") or q1s[0].get("扣非净利润") or 0) \
+                                   - float(q1s[1].get("归母净利润") or q1s[1].get("扣非净利润") or 0)
+            total_shares = float(latest_val.get("总股本", 0) or 0)
+            eps_ttm = ttm_net / total_shares if total_shares > 0 and ttm_net > 0 else 0
+            if eps_ttm <= 0:
+                eps_ttm = float(latest_val.get("每股收益", 0) or 0)  # 回退
+            eps = eps_ttm
+            roe = float(latest_val.get("ROE(%)", 0) or 0)
+            debt = float(latest_val.get("资产负债率(%)", 50) or 50)
+            stock_price = float(price.get("price", 0) or 0) if isinstance(price, dict) else 0
+            industry = ind.get("行业", "") if isinstance(ind, dict) else ""
+
+            # 公司类型：LLM写在公司画像里，代码兜底
+            profile = item.get("公司画像", {}) if isinstance(item, dict) else {}
+            ctype = profile.get("公司类型", "") if isinstance(profile, dict) else ""
+            if not ctype or ctype not in ["价值型","成长型","周期型","困境反转型","事件驱动型"]:
+                # 兜底：根据财务特征推断
+                if roe > 15 and debt < 40: ctype = "价值型"
+                elif eps <= 0: ctype = "困境反转型"
+                elif debt > 60: ctype = "周期型"
+                else: ctype = "成长型"
+
+            llm_scores = item.get("评分", {}) if isinstance(item, dict) else {}
+            decision = compute_investment_rating(
+                company_type=ctype,
+                financial_scores={
+                    "盈利能力": fixed.get("盈利能力", {}),
+                    "成长性": fixed.get("成长性", {}),
+                    "财务健康": fixed.get("财务健康", {}),
+                    "估值合理": fixed.get("估值合理", {}),
+                },
+                llm_scores={
+                    "行业前景": llm_scores.get("行业前景", {}),
+                    "资金认可": llm_scores.get("资金认可", {}),
+                },
+                eps=eps, stock_price=stock_price, industry=industry,
+                roe=roe, debt=debt,
+            )
+            # 覆盖LLM——代码说了算
+            # 估值水位强制覆盖（PE/PB/市值/前瞻PE — 代码统一，消除LLM矛盾）
+            score_pe = item.get("评分", {}).get("估值合理", {}).get("依据", "")
+            pe_match = re.search(r'PE\s*(\d+\.?\d*)', score_pe)
+            pb_match = re.search(r'PB\s*(\d+\.?\d*)', score_pe)
+            code_pe = float(pe_match.group(1)) if pe_match else pe_now
+            code_pb = float(pb_match.group(1)) if pb_match else 0
+            bps = float(latest_val.get("每股净资产", 0) or 0)
+            if code_pb <= 0 and bps > 0:
+                code_pb = stock_price / bps
+            mktcap = total_shares * stock_price / 1e8 if total_shares > 0 else 0
+            # 前瞻PE: 当前价 / (最新季报净利 × 4 / 总股本)
+            latest_q = profit_data[0] if profit_data else {}
+            latest_q_net = float(latest_q.get("归母净利润") or latest_q.get("扣非净利润") or 0)
+            fwd_eps = (latest_q_net * 4) / total_shares if total_shares > 0 else 0
+            fwd_pe = stock_price / fwd_eps if fwd_eps > 0 else 0
+
+            item["估值水位"] = {
+                "PE": f"{code_pe:.0f}",
+                "PB": f"{code_pb:.1f}",
+                "市值": f"{mktcap:.0f}亿" if mktcap > 0 else "数据缺失",
+                "前瞻PE": f"{fwd_pe:.1f}倍" if fwd_pe > 0 else "数据缺失",
+            }
+
+            # Q1 经营现金流预警（系统性检查，不依赖LLM注意）
+            q1_cf = None
+            cf_data = fin.get("cashflow", []) if isinstance(fin, dict) else []
+            for cf_row in cf_data[:2]:
+                if cf_row.get("报告期") == "一季报":
+                    q1_cf = float(cf_row.get("经营现金流净额", 0) or 0)
+                    break
+            if q1_cf is not None and q1_cf < 0:
+                q1_profit = float(profit_data[0].get("归母净利润") or profit_data[0].get("扣非净利润") or 1) if profit_data else 1
+                cf_warning = (f"Q1经营现金流{q1_cf/1e8:.1f}亿(净流出), "
+                              f"与净利润{q1_profit/1e8:.1f}亿严重背离。"
+                              f"可能原因:备货占用/回款恶化/季节性。需关注Q2是否改善。")
+                item["风险"] = (item.get("风险", []) if isinstance(item, list) else []) + [cf_warning]
+
+            # Web Search 机构共识（仅 web_search 启用时）
+            ws_key = os.getenv("WEB_SEARCH_API_KEY", "")
+            if ws_key:
+                try:
+                    from backend.web_search import search_institutional_consensus
+                    stock_name = item.get("名称", sym) if isinstance(item, dict) else sym
+                    consensus = search_institutional_consensus(sym, stock_name)
+                    if consensus["目标价"]["平均"]:
+                        item["机构共识"] = consensus
+                except Exception:
+                    pass  # 搜索失败不阻塞
+
+            item["投资评级"] = decision
+        except Exception:
+            pass  # 决策失败不阻塞报告
+
     if isinstance(data, list):
-        score_cards = [format_report(item) for item in data if isinstance(item, dict)]
-        score_text = "\n\n".join(score_cards)
+        for item in data:
+            if isinstance(item, dict):
+                sym = item.get("代码", "")
+                if sym:
+                    _fix_and_decide(item, sym)
     elif isinstance(data, dict):
+        sym = data.get("代码", "")
+        if sym:
+            _fix_and_decide(data, sym)
+
+    # === 渲染评分卡 ===
+    compare_text = ""
+    if isinstance(data, list):
+        cleaned = []
+        for item in data:
+            if isinstance(item, dict) and "对比分析" in item:
+                compare_text = _format_compare_section(item.pop("对比分析"))
+            cleaned.append(item)
+        score_cards = [format_report(it) for it in cleaned if isinstance(it, dict)]
+        score_text = "\n\n".join(score_cards)
+        if compare_text:
+            score_text += "\n\n" + compare_text
+    elif isinstance(data, dict):
+        if "对比分析" in data:
+            compare_text = _format_compare_section(data.pop("对比分析"))
         score_text = format_report(data)
+        if compare_text:
+            score_text += "\n\n" + compare_text
     else:
         score_text = str(data)
+
+    # 数据时效标注
+    header = f"数据时效: {period_note}\n{'=' * 64}\n\n"
 
     # _get_llm() 只在评分卡下面加一段叙述性结论
     narrative = _get_llm().invoke([
@@ -511,7 +969,7 @@ def reporter_node(state: FinBrainState) -> dict:
 
     prev_log = state.get("processing_log", [])
     prev_log.append({"phase": "Report", "summary": f"Formatted ({len(score_text)} chars)", "detail": score_text[:2000]})
-    return {"report": score_text + "\n\n" + narrative, "processing_log": prev_log}
+    return {"report": header + score_text + "\n\n" + narrative, "processing_log": prev_log}
 
 # ============================================================
 #  图构建
@@ -575,7 +1033,7 @@ def _dicts_to_messages(history: list) -> list:
             msgs.append(AIMessage(content=m["content"]))
     return msgs
 
-_CHAT_TOOLS = [resolve_stock, search_youzi_kb, stock_price, stock_history, intraday, sector_fund_flow, place_order, execute_analysis, show_portfolio, trade_history]
+_CHAT_TOOLS = [resolve_stock, search_youzi_kb, search_knowledge, stock_price, stock_history, intraday, sector_fund_flow, place_order, execute_analysis, show_portfolio, trade_history]
 _CHAT_AGENT = None
 
 def _get_chat_agent():

@@ -3,6 +3,7 @@ FinBrain 数据工具层 — 纯函数，不依赖任何 Agent 框架。
 可直接被 MCP Server、LangGraph Agent、或命令行脚本调用。
 """
 
+import os
 import urllib.request
 import urllib.parse
 import ssl
@@ -13,6 +14,51 @@ import pandas as pd
 import akshare as ak
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+#  数据源配置（从 .env 注入，默认免费源）
+# ============================================================
+
+_SOURCE_DEFAULTS = {
+    "stock_price":   "sina",           # 新浪实时行情
+    "financials":    "eastmoney",      # 东方财富 datacenter
+    "industry":      "eastmoney_ths",  # 东方财富+同花顺
+    "fund_flow":     "ths",            # 同花顺 10jqka
+}
+
+_SUPPORTED_SOURCES = {
+    "stock_price":   {"sina": "新浪财经", "akshare": "AkShare"},
+    "financials":    {"eastmoney": "东方财富 datacenter", "akshare": "AkShare"},
+    "industry":      {"eastmoney_ths": "东方财富+同花顺", "akshare": "AkShare"},
+    "fund_flow":     {"ths": "同花顺 10jqka", "akshare": "AkShare"},
+}
+
+
+def _get_source(key: str) -> str:
+    """读取数据源配置，含校验和友好报错。key 为 stock_price/financials/industry/fund_flow"""
+    env_key = f"DATA_SOURCE_{key.upper()}"
+    source = os.getenv(env_key, _SOURCE_DEFAULTS.get(key, "unknown"))
+    supported = _SUPPORTED_SOURCES.get(key, {})
+    if source not in supported:
+        known = ", ".join(f"{k}({v})" for k, v in supported.items())
+        logger.warning("Unsupported data source '%s' for '%s'. Supported: %s. Falling back to default.",
+                       source, key, known)
+        return _SOURCE_DEFAULTS.get(key, "unknown")
+    return source
+
+
+def _source_error(source: str, detail: str = "") -> dict:
+    """生成友好的数据源错误信息"""
+    name = "未知"
+    for group in _SUPPORTED_SOURCES.values():
+        if source in group:
+            name = group[source]
+            break
+    msg = f"数据源 [{source}] ({name}) 请求失败"
+    if detail:
+        msg += f": {detail}"
+    msg += "。可在 Settings > Data Sources 中切换数据源。"
+    return {"error": msg}
 
 # ---- SSL 配置 ----
 # 说明：新浪和东方财富的免费API服务器使用自签名/过期证书，
@@ -36,7 +82,11 @@ _USER_AGENT = (
 # ============================================================
 
 def fetch_stock_price(symbol: str) -> dict:
-    """通过新浪财经 API 查询A股实时价格"""
+    """查询A股实时价格（数据源可配置）"""
+    src = _get_source("stock_price")
+    if src not in ("sina", "akshare"):
+        return _source_error(src, "仅支持 sina/akshare")
+
     if symbol.startswith(("60", "68")):
         full_code = f"sh{symbol}"
     elif symbol.startswith(("00", "30")):
@@ -140,7 +190,7 @@ def fetch_stock_history(symbol: str, scale: int = 240, datalen: int = 30) -> dic
 # ============================================================
 
 def get_financial_statements(symbol: str) -> dict:
-    """获取近三年三大报表（东方财富 datacenter API）"""
+    """获取近2年财报（年报+季报，东财 datacenter API）"""
     from backend import cache
     cached = cache.get("financial_statements", symbol)
     if cached:
@@ -155,9 +205,9 @@ def get_financial_statements(symbol: str) -> dict:
             params = {
                 "reportName": report_name,
                 "columns": "ALL",
-                "filter": f'(SECURITY_CODE="{symbol}")(DATE_TYPE_CODE="001")',
+                "filter": f'(SECURITY_CODE="{symbol}")',
                 "pageNumber": "1",
-                "pageSize": "3",
+                "pageSize": "8",
                 "sortColumns": "REPORT_DATE",
                 "sortTypes": "-1",
                 "source": "SECURITIES",
@@ -182,7 +232,7 @@ def get_financial_statements(symbol: str) -> dict:
         }
         INCOME_COLS = {
             "TOTAL_OPERATE_INCOME": "营业总收入", "OPERATE_COST": "营业成本",
-            "PARENT_NETPROFIT": "净利润", "DEDUCT_PARENT_NETPROFIT": "扣非净利润",
+            "PARENT_NETPROFIT": "归母净利润", "DEDUCT_PARENT_NETPROFIT": "扣非净利润",
             "SALE_EXPENSE": "销售费用", "MANAGE_EXPENSE": "管理费用",
             "FINANCE_EXPENSE": "财务费用", "OPERATE_PROFIT": "营业利润",
             "INCOME_TAX": "所得税",
@@ -190,12 +240,18 @@ def get_financial_statements(symbol: str) -> dict:
         CASHFLOW_COLS = {
             "NETCASH_OPERATE": "经营现金流净额", "NETCASH_INVEST": "投资现金流净额",
             "NETCASH_FINANCE": "筹资现金流净额", "CONSTRUCT_LONG_ASSET": "购建固定资产支付现金",
+            "DEPRECIATION": "折旧摊销",
         }
+
+        # 财报类型标注
+        _REPORT_TYPE = {"001": "年报", "002": "半年报", "003": "一季报", "004": "三季报"}
 
         def pick(data, col_map):
             results = []
             for row in data:
-                item = {"date": row["REPORT_DATE"][:10]}
+                dt_code = row.get("DATE_TYPE_CODE", "")
+                period = _REPORT_TYPE.get(dt_code, dt_code)
+                item = {"date": row["REPORT_DATE"][:10], "报告期": period}
                 for eng_key, cn_name in col_map.items():
                     item[cn_name] = row.get(eng_key, None)
                 results.append(item)
@@ -494,6 +550,87 @@ def get_fund_flow(symbol: str) -> dict:
 #  工具7：格式化报告（Reporter 用，纯函数，不需要 LLM）
 # ============================================================
 
+def _align_col(v, w, right=False):
+    """对齐辅助：数字右对齐，文本左对齐"""
+    s = str(v) if v is not None else "-"
+    return f"{s:>{w}}" if right else f"{s:<{w}}"
+
+
+def _format_compare_section(compare: dict) -> str:
+    """将对比分析 dict 渲染为独立的对比表区块（不包含单股评分卡）。
+    供 reporter_node 提取多股票 JSON 中最后一支的"对比分析"字段时使用。
+    """
+    lines = []
+    lines.append("")
+    lines.append("  " + "=" * 58)
+    lines.append(f"  [板块对比] {compare.get('板块', '')}")
+    lines.append("  " + "=" * 58)
+
+    # 财报对比表
+    fin_table = compare.get("财报对比表", {})
+    if fin_table:
+        indicators = fin_table.get("指标列表", [])
+        stocks = fin_table.get("股票数据", [])
+        if indicators and stocks:
+            lines.append("")
+            lines.append("  [财报核心数据对比]")
+            header_cols = ["指标"] + [s.get("名称", "?") for s in stocks]
+            col_widths = [max(12, max(len(str(s.get(h, ""))) for s in stocks)) + 2 for h in indicators]
+            col_widths.insert(0, max(len(h) for h in header_cols) + 2)
+
+            header_line = "  " + "".join(_align_col(h, w) for h, w in zip(header_cols, col_widths))
+            lines.append(header_line)
+            lines.append("  " + "".join("-" * w for w in col_widths))
+
+            for idx in indicators:
+                row = [_align_col(idx, col_widths[0])]
+                for j, s in enumerate(stocks):
+                    row.append(_align_col(s.get(idx, "-"), col_widths[j+1], True))
+                lines.append("  " + "".join(row))
+
+    # 估值对比表
+    val_table = compare.get("估值对比表", {})
+    if val_table:
+        v_indicators = val_table.get("指标列表", [])
+        v_stocks = val_table.get("股票数据", [])
+        if v_indicators and v_stocks:
+            lines.append("")
+            lines.append("  [估值对比]")
+            v_header = ["指标"] + [s.get("名称", "?") for s in v_stocks]
+            v_widths = [max(12, max(len(str(s.get(h, ""))) for s in v_stocks)) + 2 for h in v_indicators]
+            v_widths.insert(0, max(len(h) for h in v_header) + 2)
+
+            lines.append("  " + "".join(_align_col(h, w) for h, w in zip(v_header, v_widths)))
+            lines.append("  " + "".join("-" * w for w in v_widths))
+            for idx in v_indicators:
+                row = [_align_col(idx, v_widths[0])]
+                for j, s in enumerate(v_stocks):
+                    row.append(_align_col(s.get(idx, "-"), v_widths[j+1], True))
+                lines.append("  " + "".join(row))
+
+    # 差异解读
+    diffs = compare.get("差异解读", [])
+    if diffs:
+        lines.append("")
+        lines.append("  [差异解读]")
+        for d in diffs:
+            lines.append(f"    {d}")
+
+    # 一句话总结
+    summary = compare.get("一句话总结", {})
+    if summary:
+        lines.append("")
+        for name, pos in summary.items():
+            lines.append(f"    {name}: {pos}")
+
+    rank = compare.get("综合排名", "")
+    if rank:
+        lines.append("")
+        lines.append(f"  [综合排名] {rank}")
+
+    return "\n".join(lines)
+
+
 def format_report(analysis: dict) -> str:
     """将 Analyst 的结构化 JSON 转换为对齐文本表格。
 
@@ -521,8 +658,69 @@ def format_report(analysis: dict) -> str:
         name = analysis.get("名称", "?")
 
         lines.append(f"=" * 64)
-        lines.append(f"  FinBrain 分析报告: {name} ({code})")
+        lines.append(f"  FinBrain 投资研究: {name} ({code})")
         lines.append(f"=" * 64)
+
+        # === 第一部分：投资结论先行 ===
+        # 投资逻辑链
+        logic_chain = analysis.get("投资逻辑链", "")
+        if logic_chain:
+            lines.append("")
+            lines.append(f"  [投资逻辑] {logic_chain}")
+
+        # 投资评级(代码强制)
+        rating = analysis.get("投资评级", {})
+        if rating:
+            lines.append("")
+            level = rating.get("评级", "?")
+            fair = rating.get("合理价值", "?")
+            margin = rating.get("安全边际要求", rating.get("安全边际", "?"))
+            buy_zone = rating.get("买入区间", "?")
+            gap = rating.get("估值差距", "")
+            weighted = rating.get("加权总分", "")
+            conf = rating.get("置信度", "")
+            level_icon = {"BUY": "🟢", "HOLD": "🟡", "SELL": "🔴"}.get(level, "⚪")
+            lines.append(f"  [投资决策] {level_icon} {level}  合理价值: {fair}  安全边际: {margin}")
+            if gap: lines.append(f"    估值差距: {gap}")
+            lines.append(f"    估值区间: {buy_zone}")
+            if weighted: lines.append(f"    加权总分: {weighted}/100  置信度: {conf}")
+            lines.append(f"    * 估值基于财报数据计算，非实时定价。不构成买卖建议。")
+
+        # 估值方法
+        val_method = analysis.get("估值方法", "")
+        if val_method:
+            lines.append("")
+            lines.append(f"  [估值方法] {val_method}")
+
+        # === 第二部分：公司画像和竞争优势 ===
+        profile = analysis.get("公司画像", {})
+        if profile:
+            lines.append("")
+            lines.append("  [公司画像]")
+            biz = profile.get("主营业务", "")
+            if biz: lines.append(f"    主营业务: {biz}")
+            ctype = profile.get("公司类型", "")
+            lifecycle = profile.get("生命周期", "")
+            if ctype or lifecycle:
+                lines.append(f"    类型: {ctype} | 生命周期: {lifecycle}" if ctype and lifecycle else
+                            f"    类型: {ctype or lifecycle}")
+
+        # ---- 竞争优势 ----
+        moat = analysis.get("竞争优势", {})
+        if moat:
+            lines.append("")
+            lines.append("  [竞争优势]")
+            core = moat.get("核心资产", "")
+            if core: lines.append(f"    核心资产: {core}")
+            moat_src = moat.get("护城河来源", moat.get("护城河类型", []))
+            if moat_src: lines.append(f"    壁垒来源: {', '.join(moat_src)}")
+            diff = moat.get("复制难度", "")
+            dur = moat.get("持续时间", moat.get("可持续性", ""))
+            if diff or dur: lines.append(f"    复制难度: {diff} | 持续时间: {dur}")
+            landscape = moat.get("竞争格局", "")
+            if landscape: lines.append(f"    竞争格局: {landscape}")
+            gm_attr = moat.get("毛利率归因", "")
+            if gm_attr: lines.append(f"    毛利率归因: {gm_attr}")
 
         # ---- 评分表格 ----
         scores = analysis.get("评分", {})
@@ -598,85 +796,51 @@ def format_report(analysis: dict) -> str:
             pe = val_level.get("PE", "-")
             pb = val_level.get("PB", "-")
             mkt = val_level.get("市值", "-")
-            ytd = val_level.get("年内涨幅", "-")
-            judge = val_level.get("判断", "-")
+            fwd_pe = val_level.get("前瞻PE", "")
+            parts = [f"PE:{pe}", f"PB:{pb}", f"市值:{mkt}"]
+            if fwd_pe: parts.append(f"前瞻PE:{fwd_pe}")
             lines.append("")
-            lines.append(f"  [估值水位] PE:{pe} PB:{pb} 市值:{mkt} 年内涨幅:{ytd} -> {judge}")
+            lines.append(f"  [估值水位] {' '.join(parts)}")
+        lines.append(f"    * 基于最新财报数据计算，非实时行情。日内股价波动会导致PE/PB/市值变化。请以交易软件实时数据为准。")
+
+        # ---- 机构共识 (Web Search) ----
+        consensus = analysis.get("机构共识", {})
+        if consensus:
+            tp = consensus.get("目标价", {})
+            net = consensus.get("净利润预测", {})
+            ratings = consensus.get("评级分布", {})
+            if tp.get("平均"):
+                lines.append("")
+                lines.append("  [机构共识]")
+                tp_str = f"目标价: 平均{tp['平均']}元"
+                if tp.get("最高"): tp_str += f" 最高{tp['最高']}元"
+                if tp.get("最低"): tp_str += f" 最低{tp['最低']}元"
+                if tp.get("机构数"): tp_str += f" ({tp['机构数']}家机构)"
+                lines.append(f"    {tp_str}")
+            if net.get("2026"):
+                lines.append(f"    2026净利润一致预期: {net['2026']}亿" +
+                            (f" ({net['机构数']}家机构)" if net.get("机构数") else ""))
+            if any(ratings.get(k) for k in ["买入","增持","中性","减持"]):
+                r_str = " ".join(f"{k}{ratings[k]}份" for k in ["买入","增持","中性","减持"] if ratings.get(k))
+                lines.append(f"    评级分布: {r_str}")
+
+        # ---- 情景估值 ----
+        scenarios = analysis.get("情景估值", {})
+        if scenarios:
+            lines.append("")
+            lines.append("  [情景估值]")
+            for scenario, info in [("悲观", "🔴"), ("基准", "🟡"), ("乐观", "🟢")]:
+                s = scenarios.get(scenario, {})
+                if s:
+                    price = s.get("价格", "?")
+                    prob = s.get("概率", "?")
+                    assumption = s.get("假设", "")
+                    lines.append(f"    {info} {scenario}({prob}): {price} — {assumption}")
 
         # ---- 对比分析 ----
         compare = analysis.get("对比分析", {})
         if compare:
-            lines.append("")
-            lines.append("  " + "=" * 58)
-            lines.append(f"  [板块对比] {compare.get('板块', '')}")
-            lines.append("  " + "=" * 58)
-
-            # 财报对比表
-            fin_table = compare.get("财报对比表", {})
-            if fin_table:
-                indicators = fin_table.get("指标列表", [])
-                stocks = fin_table.get("股票数据", [])
-                if indicators and stocks:
-                    lines.append("")
-                    lines.append("  [财报核心数据对比]")
-                    # 表头
-                    header_cols = ["指标"] + [s.get("名称", "?") for s in stocks]
-                    col_widths = [max(12, max(len(str(s.get(h, ""))) for s in stocks)) + 2 for h in indicators]
-                    col_widths.insert(0, max(len(h) for h in header_cols) + 2)
-
-                    def _align(v, w, right=False):
-                        s = str(v) if v is not None else "-"
-                        return f"{s:>{w}}" if right else f"{s:<{w}}"
-
-                    header_line = "  " + "".join(_align(h, w) for h, w in zip(header_cols, col_widths))
-                    lines.append(header_line)
-                    lines.append("  " + "".join("-" * w for w in col_widths))
-
-                    for idx in indicators:
-                        row = [_align(idx, col_widths[0])]
-                        for j, s in enumerate(stocks):
-                            row.append(_align(s.get(idx, "-"), col_widths[j+1], True))
-                        lines.append("  " + "".join(row))
-
-            # 估值对比表
-            val_table = compare.get("估值对比表", {})
-            if val_table:
-                v_indicators = val_table.get("指标列表", [])
-                v_stocks = val_table.get("股票数据", [])
-                if v_indicators and v_stocks:
-                    lines.append("")
-                    lines.append("  [估值对比]")
-                    v_header = ["指标"] + [s.get("名称", "?") for s in v_stocks]
-                    v_widths = [max(12, max(len(str(s.get(h, ""))) for s in v_stocks)) + 2 for h in v_indicators]
-                    v_widths.insert(0, max(len(h) for h in v_header) + 2)
-
-                    lines.append("  " + "".join(_align(h, w) for h, w in zip(v_header, v_widths)))
-                    lines.append("  " + "".join("-" * w for w in v_widths))
-                    for idx in v_indicators:
-                        row = [_align(idx, v_widths[0])]
-                        for j, s in enumerate(v_stocks):
-                            row.append(_align(s.get(idx, "-"), v_widths[j+1], True))
-                        lines.append("  " + "".join(row))
-
-            # 差异解读
-            diffs = compare.get("差异解读", [])
-            if diffs:
-                lines.append("")
-                lines.append("  [差异解读]")
-                for d in diffs:
-                    lines.append(f"    {d}")
-
-            # 一句话总结
-            summary = compare.get("一句话总结", {})
-            if summary:
-                lines.append("")
-                for name, pos in summary.items():
-                    lines.append(f"    {name}: {pos}")
-
-            rank = compare.get("综合排名", "")
-            if rank:
-                lines.append("")
-                lines.append(f"  [综合排名] {rank}")
+            lines.append(_format_compare_section(compare))
 
         # ---- 观察指标 ----
         watch = analysis.get("观察指标", [])
@@ -685,6 +849,46 @@ def format_report(analysis: dict) -> str:
             lines.append("  [观察指标]")
             for w in watch:
                 lines.append(f"    - {w}")
+
+        # ---- 催化剂 ----
+        catalyst = analysis.get("催化剂", {})
+        if catalyst:
+            lines.append("")
+            lines.append("  [催化剂]")
+            pos = catalyst.get("正面", [])
+            if pos:
+                lines.append("    正面:")
+                for p in pos: lines.append(f"      + {p}")
+            neg = catalyst.get("负面", [])
+            if neg:
+                lines.append("    负面:")
+                for n in neg: lines.append(f"      - {n}")
+            strength = catalyst.get("强度", "")
+            if strength: lines.append(f"    催化剂强度: {strength}")
+
+        # ---- 市场预期拆解 ----
+        mkt_exp = analysis.get("市场预期拆解", {})
+        if mkt_exp:
+            lines.append("")
+            lines.append("  [市场预期拆解]")
+            imp_growth = mkt_exp.get("当前估值隐含的增长率", "")
+            if imp_growth: lines.append(f"    估值隐含增长: {imp_growth}")
+            concerns = mkt_exp.get("市场主要担忧", [])
+            if concerns:
+                lines.append(f"    市场担忧: {'; '.join(concerns)}")
+            gap = mkt_exp.get("可能的预期差", "")
+            if gap: lines.append(f"    预期差: {gap}")
+        elif analysis.get("市场已定价", ""):
+            lines.append("")
+            lines.append(f"  [市场已定价] {analysis['市场已定价']}")
+
+        # ---- 证伪条件 ----
+        falsify = analysis.get("证伪条件", [])
+        if falsify:
+            lines.append("")
+            lines.append("  [证伪条件] 以下情况出现则投资逻辑失效:")
+            for f in falsify:
+                lines.append(f"    ❌ {f}")
 
         # ---- 建议 ----
         advice = analysis.get("操作建议", "")
@@ -745,8 +949,12 @@ def get_limit_up_pool(top_n: int = 30) -> dict:
             except (ValueError, TypeError):
                 continue
 
-            # 涨停板阈值：主板10%，双创20%，北交所30%
-            if chg < 9.5:
+            # 涨停板阈值：主板≥9.9%，双创≥19.9%，排除只触及未封死的
+            if chg >= 19.9:
+                pass  # 20cm涨停
+            elif 9.9 <= chg < 10.5:
+                pass  # 10cm涨停(含少量溢价)
+            else:
                 continue
             if "ST" in name or "N" in name:
                 continue
@@ -764,10 +972,56 @@ def get_limit_up_pool(top_n: int = 30) -> dict:
                 "市值": s.get("mktcap", ""),
             })
 
+        # 连板检测：对前10只（大概率是连板龙头）调 stock_history 验证
+        for r in results[:10]:
+            try:
+                hist = fetch_stock_history(r["代码"], scale=240, datalen=8)
+                streak = 1
+                for bar in reversed(hist.get("data", [])[:-1]):
+                    o, c = float(bar["open"]), float(bar["close"])
+                    if o > 0 and (c - o) / o * 100 >= 9.5:
+                        streak += 1
+                    else:
+                        break
+                r["连板"] = f"{streak}连板" if streak >= 2 else "首板"
+            except Exception:
+                r["连板"] = "首板"
+        for r in results[10:]:
+            r["连板"] = "未检测"
+
         return {"涨停板数量": len(results), "列表": results[:top_n]}
 
     except Exception as e:
         return {"error": f"涨停板查询失败: {str(e)}"}
+
+
+def get_stock_streak(symbol: str) -> dict:
+    """查询单只股票近10日连板情况。返回连板天数、涨停日期列表。"""
+    try:
+        hist = fetch_stock_history(symbol, scale=240, datalen=12)
+        if "error" in hist:
+            return {"error": hist["error"]}
+        data = hist.get("data", [])
+        if not data:
+            return {"连板天数": 0, "说明": "无数据"}
+
+        streak = 0
+        dates = []
+        for bar in reversed(data[:-1]):  # 最新的在最后，跳过今天（已经涨停）
+            o, c = float(bar["open"]), float(bar["close"])
+            if o > 0 and (c - o) / o * 100 >= 9.5:
+                streak += 1
+                dates.append(bar["day"])
+            else:
+                break
+        return {
+            "代码": symbol,
+            "连板天数": streak + 1,  # +1 = 今天
+            "涨停日期": [data[-1]["day"]] + dates if data else [],
+            "判断": f"{streak+1}连板" if streak >= 1 else "首板"
+        }
+    except Exception as e:
+        return {"error": f"连板查询失败: {str(e)}"}
 
 
 # ============================================================
@@ -808,14 +1062,51 @@ def calculate_scores(financial_data: dict) -> dict:
     """纯函数，根据财报数据计算6维评分。LLM 只管叙事，数字由这里保证一致。"""
     scores = {}
 
-    # 从 valuation 数据中提取最新值
+    # 从 valuation 数据中提取值——优先年报（避免Q1单季度ROE偏低）
     val_data = financial_data.get("valuation", {}).get("data", [])
-    latest = val_data[0] if val_data else {}
+    _annual_vals = [v for v in val_data if (v.get("日期") or v.get("date") or "").endswith("-12-31")]
+    latest = _annual_vals[0] if _annual_vals else (val_data[0] if val_data else {})
+    # 兜底：优先年报，其次遍历所有记录找到第一个有值的
+    def _find_val(key):
+        # 1) latest (年报优先)
+        v = latest.get(key)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv != 0:
+                    return fv
+            except (ValueError, TypeError):
+                pass
+        # 2) 从年报列表中找
+        for item in (_annual_vals or []):
+            if item is latest:
+                continue
+            v2 = item.get(key)
+            if v2 is not None:
+                try:
+                    fv2 = float(v2)
+                    if fv2 != 0:
+                        return fv2
+                except (ValueError, TypeError):
+                    pass
+        # 3) 从所有记录找
+        for item in (val_data or []):
+            if item is latest or item in (_annual_vals or []):
+                continue
+            v3 = item.get(key)
+            if v3 is not None:
+                try:
+                    fv3 = float(v3)
+                    if fv3 != 0:
+                        return fv3
+                except (ValueError, TypeError):
+                    pass
+        return 0.0
 
     # --- 1. 盈利能力 (0-10) ---
-    roe = float(latest.get("ROE(%)", 0) or 0)
-    gm = float(latest.get("毛利率(%)", 0) or 0)
-    nm = float(latest.get("净利率(%)", 0) or 0)
+    roe = _find_val("ROE(%)")
+    gm = _find_val("毛利率(%)")
+    nm = _find_val("净利率(%)")
 
     if roe >= 50: pe_score = 10
     elif roe >= 30: pe_score = 9
@@ -828,53 +1119,165 @@ def calculate_scores(financial_data: dict) -> dict:
     if nm >= 20: pe_score = min(10, pe_score + 1)
     scores["盈利能力"] = {"得分": pe_score, "依据": f"ROE {roe}%, 毛利率{gm}%, 净利率{nm}%"}
 
-    # --- 2. 成长性 (0-10) ---
+    # --- 2. 成长性 (0-10) —— 年报底色 + 季报势头，扣非净利润优先 ---
     profit_data = financial_data.get("profit", [])
-    if len(profit_data) >= 2:
-        rev_latest = profit_data[-1].get("营业总收入") or 0
-        rev_prev = profit_data[-2].get("营业总收入") or 1
-        rev_growth = (float(rev_latest) - float(rev_prev)) / float(rev_prev) * 100 if float(rev_prev) > 0 else 0
+    annuals = [p for p in profit_data if p.get("报告期") == "年报"]
+    g_score = 5  # 默认中性
+    basis_parts = []
 
-        net_latest = profit_data[-1].get("净利润") or 0
-        net_prev = profit_data[-2].get("净利润") or 1
-        net_growth = (float(net_latest) - float(net_prev)) / float(net_prev) * 100 if float(net_prev) > 0 else 0
+    if len(annuals) >= 2:
+        # === 年报YoY：长期趋势（底色）===
+        a_cur, a_prev = annuals[0], annuals[1]
+        a_rev_cur = float(a_cur.get("营业总收入") or 0)
+        a_rev_prev = float(a_prev.get("营业总收入") or 1)
+        a_rev_g = (a_rev_cur - a_rev_prev) / a_rev_prev * 100 if a_rev_prev > 0 else 0
 
-        if rev_growth >= 100: g_score = 10
-        elif rev_growth >= 50: g_score = 9
-        elif rev_growth >= 30: g_score = 8
-        elif rev_growth >= 20: g_score = 5
-        elif rev_growth >= 0: g_score = 3
-        else: g_score = 0
-        scores["成长性"] = {"得分": g_score, "依据": f"营收增速{rev_growth:.0f}%, 净利润增速{net_growth:.0f}%"}
+        a_net_cur = float(a_cur.get("扣非净利润") or a_cur.get("归母净利润") or 0)
+        a_net_prev = float(a_prev.get("扣非净利润") or a_prev.get("归母净利润") or 1)
+        a_net_g = (a_net_cur - a_net_prev) / a_net_prev * 100 if a_net_prev > 0 else 0
+        metric = "扣非" if a_cur.get("扣非净利润") else "归母"
+        basis_parts.append(f"年报:营收{a_rev_g:+.0f}%,{metric}净利润{a_net_g:+.0f}%")
+
+        # 年报得分基线：营收权重40% + 扣非净利润权重60%
+        def _growth_score(rev_g, net_g):
+            """营收和利润加权打分"""
+            def _score(val):
+                if val >= 100: return 10
+                if val >= 50: return 9
+                if val >= 30: return 8
+                if val >= 20: return 6
+                if val >= 10: return 5
+                if val >= 0: return 3
+                return 0
+            return int(_score(rev_g) * 0.4 + _score(net_g) * 0.6)
+        g_score = _growth_score(a_rev_g, a_net_g)
+
+        # === 季报YoY：最新动向（势头）===
+        latest = profit_data[0]
+        latest_period = latest.get("报告期", "")
+        if latest_period != "年报":
+            q_same = [p for p in profit_data if p.get("报告期") == latest_period]
+            if len(q_same) >= 2:
+                q_cur, q_prev = q_same[0], q_same[1]
+                q_net_cur = float(q_cur.get("扣非净利润") or q_cur.get("归母净利润") or 0)
+                q_net_prev = float(q_prev.get("扣非净利润") or q_prev.get("归母净利润") or 1)
+                q_net_g = (q_net_cur - q_net_prev) / q_net_prev * 100 if q_net_prev > 0 else 0
+                basis_parts.append(f"{latest_period}:{metric}净利润{q_net_g:+.0f}%")
+
+                # 势头修正：年报增速 vs 季报增速 → 四个象限
+                if a_net_g > 0 and q_net_g > 0:
+                    if q_net_g >= a_net_g:
+                        g_score = min(10, g_score + 2)  # 加速
+                        basis_parts.append("趋势:加速↑")
+                    elif q_net_g >= a_net_g * 0.5:
+                        basis_parts.append("趋势:延续→")  # 延续
+                    else:
+                        g_score = max(0, g_score - 1)  # 放缓
+                        basis_parts.append("趋势:放缓↓")
+                elif a_net_g > 0 and q_net_g < 0:
+                    g_score = max(0, g_score - 3)  # 年报增但季报跌→拐点恶化
+                    basis_parts.append("趋势:拐点恶化⚠️")
+                elif a_net_g < 0 and q_net_g > 0:
+                    g_score = min(10, g_score + 3)  # 年报跌但季报增→拐点改善
+                    basis_parts.append("趋势:拐点改善↑")
+                # else: both negative, no change
+        else:
+            basis_parts.append("季报:暂无")
+    elif len(profit_data) >= 2:
+        # 回退：无年报时用同类型对比
+        latest_period = profit_data[0].get("报告期", "")
+        same_type = [p for p in profit_data if p.get("报告期") == latest_period]
+        if len(same_type) >= 2:
+            cur, prev = same_type[0], same_type[1]
+            rev_g = (float(cur.get("营业总收入") or 0) - float(prev.get("营业总收入") or 1)) / float(prev.get("营业总收入") or 1) * 100
+            net_g = (float(cur.get("扣非净利润") or cur.get("归母净利润") or 0) - float(prev.get("扣非净利润") or prev.get("归母净利润") or 1)) / float(prev.get("扣非净利润") or prev.get("归母净利润") or 1) * 100
+            basis_parts.append(f"{latest_period}:营收{rev_g:+.0f}%,净利润{net_g:+.0f}%")
+            if rev_g >= 30: g_score = 8
+            elif rev_g >= 0: g_score = 3
+            else: g_score = 0
     else:
-        scores["成长性"] = {"得分": 5, "依据": "数据不足，默认5分"}
+        basis_parts.append("数据不足")
 
-    # --- 3. 财务健康 (0-10) ---
-    debt = float(latest.get("资产负债率(%)", 50) or 50)
+    scores["成长性"] = {"得分": g_score, "依据": "; ".join(basis_parts)}
+
+    # --- 3. 财务健康 (0-10) —— 折旧修正 ---
+    debt = _find_val("资产负债率(%)") or 50
     cf_data = financial_data.get("cashflow", [])
+    dep = 0  # 折旧摊销（重资产行业现金流修正因子）
     cf_score = 0
+    cf_ratio = 0
     if cf_data:
-        cf_latest = cf_data[-1]
+        cf_latest = cf_data[0]  # 降序排列，[0]最新
         op_cf = float(cf_latest.get("经营现金流净额", 0) or 0)
-        net_profit = float(profit_data[-1].get("净利润", 1) or 1) if profit_data else 1
+        dep = float(cf_latest.get("折旧摊销", 0) or 0)
+        net_profit = float(profit_data[0].get("扣非净利润") or profit_data[0].get("归母净利润") or 1) if profit_data else 1
+        # 扣非净利润（排除资产处置等非经常项目）用于现金流质量判断
         cf_ratio = op_cf / net_profit if net_profit > 0 else 0
-        if cf_ratio >= 0.8: cf_score = 2
+        # 折旧修正：重资产行业OFC/NI天然偏高，折旧占比>30%净利润时降低加分门槛
+        dep_ratio = dep / net_profit if net_profit > 0 else 0
+        if dep_ratio > 0.5:      # 重资产行业：OFC/NI>2才算好
+            if cf_ratio >= 2.0: cf_score = 2
+            elif cf_ratio >= 1.0: cf_score = 1
+        else:                     # 轻资产行业：OFC/NI>0.8即好
+            if cf_ratio >= 0.8: cf_score = 2
 
     if debt < 30: debt_score = 10
     elif debt < 50: debt_score = 7
     elif debt < 60: debt_score = 5
     else: debt_score = 3
-    scores["财务健康"] = {"得分": min(10, debt_score + cf_score), "依据": f"资产负债率{debt}%, 经营现金流/净利润={cf_ratio:.2f}"}
+    dep_note = f", 折旧/净利润={dep_ratio:.1f}(重资产修正)" if dep > 0 and net_profit > 0 else ""
+    scores["财务健康"] = {"得分": min(10, debt_score + cf_score), "依据": f"资产负债率{debt}%, 经营现金流/扣非净利润={cf_ratio:.2f}{dep_note}"}
 
-    # --- 4. 估值合理 (0-10) ---
+    # --- 4. 估值合理 (0-10) —— 行业PE锚定 ---
+    _INDUSTRY_PE = {
+        "电力": 15, "银行": 7, "保险": 12, "券商": 18, "地产": 10,
+        "钢铁": 12, "化工": 18, "煤炭": 10, "石油": 12, "有色": 22,
+        "白酒": 28, "食品": 25, "家电": 15, "汽车": 18, "医药": 30,
+        "电子": 30, "半导体": 40, "计算机": 35, "通信": 22, "传媒": 20,
+        "新能源": 25, "军工": 40, "机械": 22, "建材": 15, "建筑": 10,
+        "交运": 15, "公用事业": 18, "环保": 20, "商贸": 18, "纺织": 18,
+    }
     price_info = financial_data.get("price", {})
     pe = float(price_info.get("per", 0) or 0) if isinstance(price_info, dict) else 0
-    if pe <= 0: v_score = 5
-    elif pe < 15: v_score = 10
-    elif pe < 25: v_score = 7
-    elif pe < 40: v_score = 5
-    else: v_score = 3
-    scores["估值合理"] = {"得分": v_score, "依据": f"PE {pe:.0f}倍" if pe > 0 else "PE数据缺失"}
+    # PE未从外部获取时，自算 = 股价 / TTM_EPS（滚动12个月）
+    if pe <= 0:
+        stock_price = float(price_info.get("price", 0) or 0) if isinstance(price_info, dict) else 0
+        # TTM净利润: 最新年报净利 - 去年Q1净利 + 最新Q1净利
+        q1s = [p for p in profit_data if p.get("报告期") == "一季报"]
+        ann_net = float(annuals[0].get("归母净利润") or annuals[0].get("扣非净利润") or 0) if annuals else 0
+        if len(q1s) >= 2:
+            ttm_net = ann_net + float(q1s[0].get("归母净利润") or q1s[0].get("扣非净利润") or 0) \
+                               - float(q1s[1].get("归母净利润") or q1s[1].get("扣非净利润") or 0)
+        else:
+            ttm_net = ann_net
+        total_shares = _find_val("总股本")
+        eps_ttm = ttm_net / total_shares if total_shares > 0 and ttm_net > 0 else 0
+        if eps_ttm <= 0:
+            eps_ttm = _find_val("每股收益")  # 回退到年报EPS
+        if stock_price > 0 and eps_ttm > 0:
+            pe = stock_price / eps_ttm
+    pb = float(price_info.get("pb", 0) or 0) if isinstance(price_info, dict) else 0
+    # PB未获取时自算 = 股价 / 每股净资产
+    if pb <= 0:
+        stock_price2 = float(price_info.get("price", 0) or 0) if isinstance(price_info, dict) else 0
+        bps = _find_val("每股净资产")
+        if stock_price2 > 0 and bps > 0:
+            pb = stock_price2 / bps
+
+    industry = financial_data.get("industry", "")
+    ind_pe = _INDUSTRY_PE.get(industry, 18)
+    if pe <= 0:
+        v_score = 5
+    else:
+        ratio = pe / ind_pe if ind_pe > 0 else 1
+        if ratio < 0.6: v_score = 10
+        elif ratio < 0.9: v_score = 8
+        elif ratio < 1.2: v_score = 6
+        elif ratio < 1.6: v_score = 4
+        else: v_score = 2
+    ind_note = f", 行业PE基准{ind_pe}倍" if industry else ""
+    pb_note = f", PB {pb:.1f}倍" if pb > 0 else ""
+    scores["估值合理"] = {"得分": v_score, "依据": f"PE {pe:.0f}倍{pb_note}{ind_note}"}
 
     # --- 5. 行业前景 (0-10, 默认5，LLM可根据行业调整) ---
     scores["行业前景"] = {"得分": 5, "依据": "待LLM根据行业信息微调(+-3)"}
