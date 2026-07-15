@@ -34,6 +34,46 @@ _SUPPORTED_SOURCES = {
 }
 
 
+# ---- 数据模式：local(本地直连) / remote(调API) ----
+_DATA_MODE = os.getenv("FINBRAIN_DATA_MODE", "local")
+_DATA_API = os.getenv("FINBRAIN_DATA_API", "http://localhost:8000")
+
+# 远程模式端点映射：函数名 → API 路径
+_REMOTE_ROUTES = {
+    "fetch_stock_price":      ("api/data/stock_price",      ["symbol"]),
+    "fetch_stock_history":    ("api/data/stock_history",    ["symbol", "scale", "datalen"]),
+    "get_financial_statements":("api/data/financials",      ["symbol"]),
+    "get_valuation":          ("api/data/valuation",         ["symbol"]),
+    "get_industry_info":      ("api/data/industry",          ["symbol"]),
+    "get_fund_flow":          ("api/data/fund_flow",         ["symbol"]),
+    "get_limit_up_pool":      ("api/market/limit_up",        ["top_n"]),
+    "get_market_breadth":     ("api/market/breadth",         []),
+    "get_sector_fund_flow":   ("api/market/sector_fund_flow",["top_n"]),
+    "get_intraday":           ("api/data/intraday",           ["symbol"]),
+    "get_concept_ranking":    ("api/market/concept_ranking",  ["top_n"]),
+    "get_dragon_tiger_list":  ("api/market/dragon_tiger_list",["date"]),
+    "get_dragon_tiger_detail":("api/market/dragon_tiger_detail",["symbol"]),
+    "get_stock_streak":       ("api/data/stock_streak",       ["symbol"]),
+    "screen_stocks":          ("api/market/screen_stocks",    ["max_pe","max_pb","min_mktcap","top_n"]),
+}
+
+
+def _remote_fetch(endpoint: str, params: dict = None) -> dict:
+    """远程模式：调 Data API 获取数据"""
+    import urllib.request as _ur
+    url = f"{_DATA_API.rstrip('/')}/{endpoint.lstrip('/')}"
+    if params:
+        import urllib.parse as _up
+        qs = _up.urlencode({k: v for k, v in params.items() if v is not None})
+        url = f"{url}?{qs}"
+    try:
+        req = _ur.Request(url, headers={"User-Agent": "FinBrain/2.0"})
+        with _ur.urlopen(req, timeout=15, context=_SSL_CTX) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"error": f"Data API 不可用 ({url}): {str(e)}。请检查 FINBRAIN_DATA_API 配置或切回 local 模式。"}
+
+
 def _get_source(key: str) -> str:
     """读取数据源配置，含校验和友好报错。key 为 stock_price/financials/industry/fund_flow"""
     env_key = f"DATA_SOURCE_{key.upper()}"
@@ -83,6 +123,8 @@ _USER_AGENT = (
 
 def fetch_stock_price(symbol: str) -> dict:
     """查询A股实时价格（数据源可配置）"""
+    if _DATA_MODE == "remote":
+        return _remote_fetch("api/data/stock_price", {"symbol": symbol})
     src = _get_source("stock_price")
     if src not in ("sina", "akshare"):
         return _source_error(src, "仅支持 sina/akshare")
@@ -143,6 +185,8 @@ def fetch_stock_price(symbol: str) -> dict:
 
 def fetch_stock_history(symbol: str, scale: int = 240, datalen: int = 30) -> dict:
     """通过新浪API查询A股历史K线数据"""
+    if _DATA_MODE == "remote":
+        return _remote_fetch("api/data/stock_history", {"symbol": symbol, "scale": scale, "datalen": datalen})
     if symbol.startswith(("60", "68")):
         full_code = f"sh{symbol}"
     elif symbol.startswith(("00", "30")):
@@ -191,6 +235,8 @@ def fetch_stock_history(symbol: str, scale: int = 240, datalen: int = 30) -> dic
 
 def get_financial_statements(symbol: str) -> dict:
     """获取近2年财报（年报+季报，东财 datacenter API）"""
+    if _DATA_MODE == "remote":
+        return _remote_fetch("api/data/financials", {"symbol": symbol})
     from backend import cache
     cached = cache.get("financial_statements", symbol)
     if cached:
@@ -277,6 +323,8 @@ def get_financial_statements(symbol: str) -> dict:
 
 def get_valuation(symbol: str) -> dict:
     """获取估值数据（ROE/毛利率/净利率/EPS等）"""
+    if _DATA_MODE == "remote":
+        return _remote_fetch("api/data/valuation", {"symbol": symbol})
     from backend import cache
     cached = cache.get("valuation", symbol)
     if cached:
