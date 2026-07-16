@@ -141,18 +141,19 @@ def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list]:
         r = agents["graph"].invoke({"messages": msgs, "user_question": user_input,
                                      "collected_data":"", "analysis":"", "report":"",
                                      "processing_log": []}, config=cfg)
-        reply = r.get("report") or r["messages"][-1].content
+        reply = r.get("report")
+        if not reply:
+            # 回退：用 analysis JSON 格式化
+            raw = r.get("analysis","")
+            if raw.strip():
+                reply = f"[流水线未生成报告，以下是原始分析摘要]\n\n{raw[:2000]}"
+            else:
+                reply = "[流水线执行失败，请重试或切换到闲聊模式]"
         proc_log = r.get("processing_log", [])
         if proc_log and stream_placeholder is None:
             with st.expander("Pipeline: Data -> Analysis -> Report", expanded=False):
                 for step in proc_log:
-                    phase = step.get("phase","?")
-                    summary = step.get("summary","")
-                    detail = step.get("detail","")
-                    st.caption(f"[{phase}] {summary}")
-                    if detail:
-                        with st.expander(f"  {phase} detail", expanded=False):
-                            st.text(detail[:1000])
+                    st.caption(f"[{step.get('phase','?')}] {step.get('summary','')}")
     else:
         reply = agents["chat"].invoke({"messages": msgs}, config=cfg)["messages"][-1].content
 
@@ -299,6 +300,8 @@ if page == "Chat":
     <div id="chat-bottom-bar">
     """, unsafe_allow_html=True)
 
+    # 显式模式标签 + 表单
+    st.caption(f"当前模式: **{cur['icon']} {cur['label']}**")
     ci, cm = st.columns([7.8, 1.6])
     with ci:
         with st.form("chat_form", clear_on_submit=True):
@@ -308,13 +311,11 @@ if page == "Chat":
                 _chat_send()
                 st.rerun()
     with cm:
-        popover_label = f"{cur['icon']} {cur['label']}"
+        popover_label = "切换"
         with st.popover(popover_label, use_container_width=True):
-            st.caption("选择模式")
             for mode, meta in _MODE_META.items():
                 bt = "primary" if current_mode == mode else "secondary"
-                if st.button(f"{meta['icon']} {meta['label']}",
-                             use_container_width=True, type=bt, key=f"pop_mode_{mode}"):
+                if st.button(f"{meta['icon']} {meta['label']}", use_container_width=True, type=bt, key=f"pop_mode_{mode}"):
                     st.session_state.mode = mode
                     st.rerun()
 

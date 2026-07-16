@@ -405,8 +405,23 @@ def stock_streak(symbol: str) -> str:
     from backend.tools import get_stock_streak
     return json.dumps(get_stock_streak(symbol), ensure_ascii=False, indent=2)
 
+
+@tool
+def recent_announcements(symbol: str) -> str:
+    """查询个股最近20条公告。识别定增/重组/业绩预告/减持等重大事件。
+    输入股票代码如'601991'，返回公告标题+日期+关键数字（募资额/发行股数）。"""
+    from backend.tools import get_recent_announcements
+    r = get_recent_announcements(symbol, 20)
+    # 压缩输出：只保留标题含关键字的公告
+    keywords = ["发行","增发","重组","收购","业绩","减持","分红","担保","债券"]
+    filtered = [a for a in r.get("列表",[]) if any(kw in a.get("标题","") for kw in keywords)]
+    if not filtered:
+        filtered = r.get("列表",[])[:5]  # 回退：返回最近5条
+    r["列表"] = filtered
+    return json.dumps(r, ensure_ascii=False, indent=2)
+
 # ---- 妖股猎人工具集 ----
-_PHANTOM_TOOLS = [resolve_stock, search_youzi_kb, search_knowledge, limit_up_pool, concept_ranking,
+_PHANTOM_TOOLS = [resolve_stock, search_youzi_kb, search_knowledge, recent_announcements, limit_up_pool, concept_ranking,
                   dragon_tiger_list, dragon_tiger_detail, stock_streak,
                   stock_price, stock_history, fund_flow,
                   financial_statements, valuation, industry_info,
@@ -991,6 +1006,56 @@ def reporter_node(state: FinBrainState) -> dict:
                 decision["评级"] = "BUY"
                 item["偏见修正"] = f"营收增速{rev_growth:.0f}%+PE仅{pe_val:.0f}倍→高增长低估值，强制上调至BUY"
 
+            # 硬检查：公告中是否有定增——强制注入风险。同时注入公告数据供报告渲染。
+            try:
+                from backend.tools import get_recent_announcements as _gra
+                ann = _gra(sym, 20)
+                titles_all = " ".join([a.get("标题","") for a in ann.get("列表",[])])
+                import re as _re
+                if _re.search(r'(发行A股|非公开发行|定向增发|募集资金|发行股份)', titles_all):
+                    item["风险"] = (item.get("风险", []) if isinstance(item.get("风险"), list) else []) + [
+                        "定增摊薄风险: 近期公告显示公司有定增预案(向特定对象发行A股股票)，增发完成后EPS将摊薄。当前前瞻PE基于旧股本计算，实际估值可能偏高。目标价需按摊薄比例下调。"
+                    ]
+                # 重要性分级过滤
+                RED_KW = ["发行","增发","定增","配股","可转债","募资","收购","重组","出售资产","合并","股权转让","控制权","实际控制人变更","业绩预告","业绩快报","减持","股东变动","重大合同","对外投资"]
+                YELLOW_KW = ["债券","超短期融资券","公司债","中期票据","分红","利润分配","分红预案","董事长变更","总经理变更","董事辞职","限制性股票","股票期权","担保"]
+                GREEN_KW = ["关联交易","对外担保","股东大会","会议决议"]
+                def _classify(title):
+                    for kw in RED_KW:
+                        if kw in title: return "🔴"
+                    for kw in YELLOW_KW:
+                        if kw in title: return "🟡"
+                    for kw in GREEN_KW:
+                        if kw in title: return "🟢"
+                    return None
+                def _title_hints(title):
+                    # 给LLM的关键提示
+                    hints = {"定向增发":"→定增，直接稀释EPS",
+                             "配股":"→配股，稀释EPS",
+                             "可转债":"→可转债，潜在稀释",
+                             "收购":"→资产收购，改变业务结构",
+                             "出售资产":"→出售资产，可能影响收入",
+                             "合并":"→合并重组，基本面重大变化",
+                             "股权转让":"→股权转让，控制权可能变更",
+                             "实际控制人变更":"→实际控制人变更，治理结构变化",
+                             "业绩预告":"→业绩预告，直接影响盈利预测",
+                             "重大合同":"→重大合同，影响未来现金流"}
+                    for kw, hint in hints.items():
+                        if kw in title: return hint
+                    return ""
+                filtered = []
+                for a in ann.get("列表", []):
+                    level = _classify(a.get("标题",""))
+                    if level:
+                        a["级别"] = level
+                        a["提示"] = _title_hints(a.get("标题",""))
+                        filtered.append(a)
+                if not filtered:
+                    filtered = ann.get("列表",[])[:5]
+                item["公告"] = {"列表": filtered}
+            except Exception:
+                pass
+
             item["投资评级"] = decision
         except Exception:
             pass  # 决策失败不阻塞报告
@@ -1102,7 +1167,7 @@ def _dicts_to_messages(history: list) -> list:
             msgs.append(AIMessage(content=m["content"]))
     return msgs
 
-_CHAT_TOOLS = [resolve_stock, search_youzi_kb, search_knowledge, stock_price, stock_history, intraday, sector_fund_flow, place_order, execute_analysis, show_portfolio, trade_history]
+_CHAT_TOOLS = [resolve_stock, search_youzi_kb, search_knowledge, recent_announcements, stock_price, stock_history, intraday, sector_fund_flow, place_order, execute_analysis, show_portfolio, trade_history]
 _CHAT_AGENT = None
 
 def _get_chat_agent():
@@ -1114,8 +1179,8 @@ def _get_chat_agent():
     return _CHAT_AGENT
 
 CHAT_PROMPT = """你是 FinBrain，一个A股投研助手。可以闲聊、答疑问、解释概念。
-你手头有 stock_price 和 stock_history 工具，可以查股价和K线。
-如果用户问财报/估值/行业/资金流向等深度数据，建议"切换到分析模式"。"""
+你有 stock_price/stock_history 查行情，recent_announcements 查公告（分析前先查公告——看有没有定增/减持/业绩预告）。
+如果用户问财报/估值/行业等深度数据，建议"切换到分析模式"。"""
 
 # ============================================================
 #  路由判断
