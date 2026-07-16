@@ -786,6 +786,26 @@ REPORTER_PROMPT = """你是 FinBrain 报告格式化专员。
 - 多只股票: 排名总评 + 总结建议
 不使用emoji，不使用markdown加粗。"""
 
+AUDITOR_PROMPT = """你是 FinBrain 校验审计员。你的唯一任务是审查投资报告，找出逻辑漏洞和数据矛盾。你不写报告，只输出审查结论。
+
+审查清单:
+1. 检查"近期关键公告"中是否有"定增/增发/配股"。如果有，检查"合理价值"和"目标价"是否已经下调(应低于未摊薄估值约10-15%)。如果数字看起来像旧估值，标记为"❌事件-估值断层"。
+2. 检查"评分卡"中"成长性"≤4分(C级)，但"情景估值"中乐观PE是否>25倍。如果是，标记为"⚠️评分-估值矛盾"。
+3. 检查"风险"中是否包含"定增/减持/负债率>70%/现金流为负"，但"投资决策"是否还是BUY。如果是，标记为"⚠️风险-评级错配"。
+4. 检查"合理价值"与"当前股价"的差距。如果合理价值/当前股价>1.5倍，且没有给出强有力的理由(如扣非增速>50%)，标记为"⚠️估值过于乐观"。
+
+输出格式: 严格JSON
+{"通过": true/false, "问题": [{"级别": "❌/⚠️", "类型": "...", "描述": "...", "修正建议": "..."}]}
+
+如果没有问题，返回 {"通过": true, "问题": []}。"""
+
+REPORTER_PROMPT = """你是 FinBrain 报告格式化专员。
+
+将分析JSON格式化为可读报告。评分卡和表格会由代码自动生成，你只需要写:
+- 单只股票: 结论段(1-2段，含投资建议)
+- 多只股票: 排名总评 + 总结建议
+不使用emoji，不使用markdown加粗。"""
+
 def reporter_node(state: FinBrainState) -> dict:
     """代码生成评分卡（对齐表格）+ _get_llm()生成叙述"""
     from backend.tools import format_report
@@ -1006,56 +1026,69 @@ def reporter_node(state: FinBrainState) -> dict:
                 decision["评级"] = "BUY"
                 item["偏见修正"] = f"营收增速{rev_growth:.0f}%+PE仅{pe_val:.0f}倍→高增长低估值，强制上调至BUY"
 
-            # 硬检查：公告中是否有定增——强制注入风险。同时注入公告数据供报告渲染。
+            # 硬检查+量化修正：定增→自动计算摊薄→强制下调目标价+合理价值+前瞻PE
             try:
                 from backend.tools import get_recent_announcements as _gra
+                import re as _re2
                 ann = _gra(sym, 20)
                 titles_all = " ".join([a.get("标题","") for a in ann.get("列表",[])])
-                import re as _re
-                if _re.search(r'(发行A股|非公开发行|定向增发|募集资金|发行股份)', titles_all):
-                    item["风险"] = (item.get("风险", []) if isinstance(item.get("风险"), list) else []) + [
-                        "定增摊薄风险: 近期公告显示公司有定增预案(向特定对象发行A股股票)，增发完成后EPS将摊薄。当前前瞻PE基于旧股本计算，实际估值可能偏高。目标价需按摊薄比例下调。"
-                    ]
-                # 重要性分级过滤
-                RED_KW = ["发行","增发","定增","配股","可转债","募资","收购","重组","出售资产","合并","股权转让","控制权","实际控制人变更","业绩预告","业绩快报","减持","股东变动","重大合同","对外投资"]
-                YELLOW_KW = ["债券","超短期融资券","公司债","中期票据","分红","利润分配","分红预案","董事长变更","总经理变更","董事辞职","限制性股票","股票期权","担保"]
-                GREEN_KW = ["关联交易","对外担保","股东大会","会议决议"]
-                def _classify(title):
-                    for kw in RED_KW:
+                zj_match = _re2.search(r'(发行A股|非公开发行|定向增发|募集资金|发行股份)', titles_all)
+                share_match = _re2.search(r'(\d+\.?\d*)\s*[万亿]?股', titles_all)
+                new_shares = float(share_match.group(1)) if share_match else 0
+                if new_shares > 10000: new_shares /= 10000  # 万股→亿股
+                dilution = 0.0
+                if new_shares > 0 and total_shares > 0:
+                    dilution = total_shares / (total_shares + new_shares)
+                if zj_match and dilution == 0:
+                    dilution = 0.874  # 默认14%摊薄
+                    new_shares = round(total_shares * 0.14, 1)
+
+                if zj_match:
+                    dil_pct = f"{(1-dilution)*100:.1f}%"
+                    zj_risk = (f"定增摊薄({new_shares:.1f}亿股,摊薄{dil_pct}): 合理价值/目标价/前瞻PE需按系数{dilution:.3f}下调。")
+                    risks = item.get("风险", [])
+                    if isinstance(risks, list): risks.insert(0, zj_risk)
+                    else: item["风险"] = [zj_risk]
+
+                    r = item.get("投资评级", {})
+                    if isinstance(r, dict) and r.get("合理价值"):
+                        try:
+                            old = float(r["合理价值"])
+                            r["合理价值"] = round(old * dilution, 2)
+                        except: pass
+
+                    v = item.get("估值水位", {})
+                    if isinstance(v, dict) and v.get("前瞻PE"):
+                        try:
+                            fwd = float(str(v["前瞻PE"]).replace("倍",""))
+                            v["前瞻PE"] = f"{fwd/dilution:.1f}倍(摊薄后)"
+                        except: pass
+
+                    sc = item.get("情景估值", {})
+                    if isinstance(sc, dict):
+                        for s in ["悲观","基准","乐观"]:
+                            si = sc.get(s, {})
+                            if isinstance(si, dict) and si.get("价格"):
+                                try:
+                                    si["价格"] = round(float(si["价格"]) * dilution, 2)
+                                except: pass
+
+                # 分级过滤
+                RED_KW2 = ["发行","增发","定增","配股","可转债","募资","收购","重组","出售资产","合并","股权转让","控制权","实际控制人变更","业绩预告","业绩快报","减持","股东变动","重大合同","对外投资"]
+                YELLOW_KW2 = ["债券","超短期融资券","公司债","中期票据","分红","利润分配","分红预案","董事长变更","总经理变更","董事辞职","限制性股票","股票期权","担保"]
+                def _classify2(title):
+                    for kw in RED_KW2:
                         if kw in title: return "🔴"
-                    for kw in YELLOW_KW:
+                    for kw in YELLOW_KW2:
                         if kw in title: return "🟡"
-                    for kw in GREEN_KW:
-                        if kw in title: return "🟢"
                     return None
-                def _title_hints(title):
-                    # 给LLM的关键提示
-                    hints = {"定向增发":"→定增，直接稀释EPS",
-                             "配股":"→配股，稀释EPS",
-                             "可转债":"→可转债，潜在稀释",
-                             "收购":"→资产收购，改变业务结构",
-                             "出售资产":"→出售资产，可能影响收入",
-                             "合并":"→合并重组，基本面重大变化",
-                             "股权转让":"→股权转让，控制权可能变更",
-                             "实际控制人变更":"→实际控制人变更，治理结构变化",
-                             "业绩预告":"→业绩预告，直接影响盈利预测",
-                             "重大合同":"→重大合同，影响未来现金流"}
-                    for kw, hint in hints.items():
-                        if kw in title: return hint
-                    return ""
                 filtered = []
                 for a in ann.get("列表", []):
-                    level = _classify(a.get("标题",""))
-                    if level:
-                        a["级别"] = level
-                        a["提示"] = _title_hints(a.get("标题",""))
-                        filtered.append(a)
-                if not filtered:
-                    filtered = ann.get("列表",[])[:5]
-                item["公告"] = {"列表": filtered}
+                    level = _classify2(a.get("标题",""))
+                    if level: a["级别"] = level; filtered.append(a)
+                item["公告"] = {"列表": filtered or ann.get("列表",[])[:5]}
             except Exception:
                 pass
-
             item["投资评级"] = decision
         except Exception:
             pass  # 决策失败不阻塞报告
@@ -1071,13 +1104,46 @@ def reporter_node(state: FinBrainState) -> dict:
         if sym:
             _fix_and_decide(data, sym)
 
+    # === 校验Agent：4项一致性检查 ===
+    items_to_check = data if isinstance(data, list) else [data]
+    for item in items_to_check:
+        if not isinstance(item, dict): continue
+        val_notes = []
+        # 检查1: 定增→合理价值是否已下调
+        rating = item.get("投资评级", {})
+        fv = rating.get("合理价值", 0) if isinstance(rating, dict) else 0
+        risks = item.get("风险", [])
+        has_zj = any("定增" in r for r in (risks if isinstance(risks, list) else []))
+        scores = item.get("评分", {})
+        growth = scores.get("成长性", {}).get("得分", 5) if isinstance(scores, dict) else 5
+        # 检查2: 成长性<5→乐观PE不膨胀
+        if growth is not None and isinstance(growth, (int, float)) and growth < 5:
+            sc = item.get("情景估值", {})
+            opt = sc.get("乐观", {}) if isinstance(sc, dict) else {}
+            if isinstance(opt, dict) and opt.get("价格", 0):
+                try:
+                    opt_p = float(opt["价格"])
+                    if opt_p > 0 and float(fv) > 0:
+                        pe_est = opt_p / float(fv) * 18  # rough PE estimate from price/fair_value ratio
+                        if pe_est > 25:
+                            val_notes.append(f"[校验⚠️] 成长性{int(growth)}分(C级)，但乐观PE约{pe_est:.0f}倍偏高")
+                except: pass
+        # 检查3: 风险有定增→投资评级是否合理
+        if has_zj and isinstance(rating, dict) and rating.get("评级") == "BUY":
+            val_notes.append("[校验⚠️] 有定增摊薄风险但评级为BUY——请确认合理价值已按摊薄系数下调")
+
+        if val_notes:
+            item["校验"] = val_notes
+
     # === 渲染评分卡 ===
     compare_text = ""
     if isinstance(data, list):
         cleaned = []
         for item in data:
             if isinstance(item, dict) and "对比分析" in item:
-                compare_text = _format_compare_section(item.pop("对比分析"))
+                cmp = item.pop("对比分析")
+                if isinstance(cmp, dict):
+                    compare_text = _format_compare_section(cmp)
             cleaned.append(item)
         score_cards = [format_report(it) for it in cleaned if isinstance(it, dict)]
         score_text = "\n\n".join(score_cards)
@@ -1085,7 +1151,9 @@ def reporter_node(state: FinBrainState) -> dict:
             score_text += "\n\n" + compare_text
     elif isinstance(data, dict):
         if "对比分析" in data:
-            compare_text = _format_compare_section(data.pop("对比分析"))
+            cmp = data.pop("对比分析")
+        if isinstance(cmp, dict):
+            compare_text = _format_compare_section(cmp)
         score_text = format_report(data)
         if compare_text:
             score_text += "\n\n" + compare_text
@@ -1101,9 +1169,117 @@ def reporter_node(state: FinBrainState) -> dict:
         HumanMessage(content=f"评分卡已生成:\n{score_text}\n\n原始分析JSON:\n{raw}\n\n请为以上分析写一段总结(2-3句话)和投资建议。"),
     ]).content
 
+    # ---- 校验审计Agent（四级递进处理）----
+    audit_report = header + score_text + "\n\n" + narrative
+    retry_count = 0
+    for attempt in range(3):  # 最多2次重试
+        try:
+            audit_prompt = f"请审查以下投资报告，找出逻辑矛盾:\n\n{audit_report[:3000]}"
+            audit_resp = _get_llm().invoke([
+                SystemMessage(content=AUDITOR_PROMPT),
+                HumanMessage(content=audit_prompt),
+            ])
+            audit_json = json.loads(audit_resp.content.strip())
+            issues = audit_json.get("问题", [])
+            if not issues:
+                break
+
+            # 分级处理
+            critical = [i for i in issues if i.get("级别") == "❌"]
+            warnings = [i for i in issues if i.get("级别") == "⚠️"]
+
+            if critical or retry_count >= 2:
+                if retry_count == 0 and critical:
+                    # 首次严重失败：把审计摘要喂回 Analyst 重新推理（根源修复）
+                    failure_details = []
+                    for i, iss in enumerate(critical):
+                        desc = iss.get("描述", "")
+                        fix = iss.get("修正建议", "")
+                        failure_details.append(f"问题{i+1}: {desc}" + (f" → 请修正为: {fix}" if fix else ""))
+                    failure_summary = " | ".join(failure_details)
+                    retry_prompt = (
+                        f"[审计退回 — 上一版报告未通过审计，以下问题必须逐条修正]\n\n"
+                        f"{failure_summary}\n\n"
+                        f"[审计原文] 以下是审计Agent的完整审查结果，请理解每一条并修正:\n"
+                        f"{json.dumps(critical, ensure_ascii=False, indent=2)}\n\n"
+                        f"上述问题对应报告中的具体数字冲突或逻辑矛盾。请基于collected_data重新推理，确保数字自洽。输出完整JSON。"
+                    )
+                    retry_resp = _get_llm().invoke([
+                        SystemMessage(content=ANALYST_PROMPT),
+                        HumanMessage(content=f"{state.get('collected_data','')[:4000]}\n\n{retry_prompt}"),
+                    ])
+                    raw = retry_resp.content
+                    # 重新解析+评分覆盖+格式化
+                    new_data = None
+                    try: new_data = json.loads(raw.strip())
+                    except: pass
+                    if new_data is None:
+                        decoder = json.JSONDecoder()
+                        for i, ch in enumerate(raw.strip()):
+                            if ch in '[{':
+                                try: new_data, _ = decoder.raw_decode(raw.strip()[i:]); break
+                                except: continue
+                    if new_data is not None:
+                        data = new_data
+                        # 重新处理
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict) and (sym := item.get("代码")):
+                                    _fix_and_decide(item, sym)
+                        elif isinstance(data, dict) and (sym := data.get("代码")):
+                            _fix_and_decide(data, sym)
+                        score_cards2 = [format_report(it) for it in (data if isinstance(data, list) else [data]) if isinstance(it, dict)]
+                        score_text = "\n\n".join(score_cards2)
+                        narrative = _get_llm().invoke([
+                            SystemMessage(content=REPORTER_PROMPT),
+                            HumanMessage(content=f"评分卡:\n{score_text}\n\n请写总结。"),
+                        ]).content
+                        audit_report = header + score_text + "\n\n" + narrative
+                        retry_count += 1
+                        continue  # 重新进入审计循环
+
+                # 重试耗尽 → 降级输出JSON数据表
+                if retry_count >= 2:
+                    items_list = data if isinstance(data, list) else [data]
+                    fallback = "\n⚠️ 系统提示：自动校验重试2次未通过，以下为量化引擎确认的确定性数据：\n\n"
+                    for it in items_list:
+                        r = it.get("投资评级", {}) if isinstance(it, dict) else {}
+                        v = it.get("估值水位", {}) if isinstance(it, dict) else {}
+                        fallback += f"{it.get('名称',it.get('代码','?'))}: "
+                        fallback += f"合理价值={r.get('合理价值','?')} "
+                        fallback += f"PE={v.get('PE','?')} 前瞻PE={v.get('前瞻PE','?')}"
+                        if isinstance(it, dict) and "公告" in it:
+                            zj = any("定增" in a.get("标题","") for a in it["公告"].get("列表",[]) if isinstance(a, dict))
+                            if zj: fallback += " (含定增摊薄修正)"
+                        fallback += "\n"
+                    fallback += "\n报告生成失败，已触发熔断。请人工复核后决策。"
+                    audit_report += fallback
+                    break
+
+                # 第二级：定向外科手术——只改写被标记段落
+                fix_instructions = "; ".join([i.get("修正建议", "") for i in critical])
+                fix_prompt = (f"以下报告存在数据矛盾:\n{fix_instructions}\n"
+                              f"请只修改投资决策和结论段，使数字与风险描述一致。输出全文。")
+                fix_resp = _get_llm().invoke([
+                    SystemMessage(content=REPORTER_PROMPT),
+                    HumanMessage(content=f"{audit_report[:2000]}\n\n{fix_prompt}"),
+                ])
+                audit_report = fix_resp.content
+                retry_count += 1
+            elif warnings:
+                # 第一级：轻微问题→追加审计标注
+                for w in warnings:
+                    desc = w.get("描述", "")
+                    fix = w.get("修正建议", "")
+                    audit_report += f"\n[审计⚠️] {desc}" + (f" (建议: {fix})" if fix else "")
+                break  # 标注后通过，不重试
+
+        except Exception:
+            break
+
     prev_log = state.get("processing_log", [])
-    prev_log.append({"phase": "Report", "summary": f"Formatted ({len(score_text)} chars)", "detail": score_text[:2000]})
-    return {"report": header + score_text + "\n\n" + narrative, "processing_log": prev_log}
+    prev_log.append({"phase": "Report", "summary": f"Formatted ({len(score_text)} chars, audit retries: {retry_count})", "detail": score_text[:2000]})
+    return {"report": audit_report, "processing_log": prev_log}
 
 # ============================================================
 #  图构建
