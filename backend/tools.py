@@ -958,6 +958,28 @@ def format_report(analysis: dict) -> str:
             for w in watch:
                 lines.append(f"    - {w}")
 
+        # ---- 近期公告 ----
+        announcements = analysis.get("公告", {}).get("列表", []) if isinstance(analysis.get("公告"), dict) else []
+        if announcements:
+            lines.append("")
+            lines.append("  [近期关键公告]")
+            reds = [a for a in announcements if a.get("级别") == "🔴"]
+            yellows = [a for a in announcements if a.get("级别") == "🟡"]
+            # 🔴 最高优先级
+            for a in reds[:8]:
+                hint = a.get("提示", "")
+                lines.append(f"    🔴 {a.get('日期','')} {a.get('标题','')[:70]}")
+                if hint: lines.append(f"       {hint}")
+            # 🟡 中优先级
+            if yellows:
+                lines.append(f"    🟡 中优先级 ({len(yellows)}条)")
+                for a in yellows[:3]:
+                    lines.append(f"       {a.get('日期','')} {a.get('标题','')[:60]}")
+            # 🟢 summary
+            greens = [a for a in announcements if a.get("级别") == "🟢"]
+            if greens:
+                lines.append(f"    🟢 日常公告 ({len(greens)}条: 关联交易/担保/股东大会等，已过滤)")
+
         # ---- 催化剂 ----
         catalyst = analysis.get("催化剂", {})
         if catalyst:
