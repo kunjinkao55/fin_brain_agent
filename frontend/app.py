@@ -725,10 +725,6 @@ elif page == "Settings":
             with open(env_path, "w") as f:
                 f.write("\n".join(lines) + "\n")
             st.success(f"Saved: {provider}/{model}. Restart to apply.")
-                f.write(f"COMPRESS_TRIGGER={os.getenv('COMPRESS_TRIGGER','12')}\n")
-                f.write(f"COMPRESS_KEEP={os.getenv('COMPRESS_KEEP','6')}\n")
-            st.success(f"Saved. Key stored in configs/.env. Restart to apply new key.")
-            st.info("Key change requires restart: `streamlit run frontend/app.py`")
 
     with tab2:
         st.caption("10 tools active")
