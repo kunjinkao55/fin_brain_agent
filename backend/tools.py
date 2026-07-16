@@ -962,6 +962,17 @@ def format_report(analysis: dict) -> str:
             for w in watch:
                 lines.append(f"    - {w}")
 
+        # ---- 定增信息（代码修正痕迹，供审计参考）----
+        zj_info = analysis.get("定增信息", {})
+        if isinstance(zj_info, dict) and zj_info.get("摊薄调整系数"):
+            lines.append("")
+            lines.append(f"  [定增信息] 代码已自动修正: 发行{zj_info.get('发行股数','?')}, "
+                         f"摊薄{zj_info.get('摊薄比例','?')}, "
+                         f"调整系数{zj_info.get('摊薄调整系数','?')}")
+            if zj_info.get("募资金额"):
+                lines[-1] += f", 募资{zj_info['募资金额']}"
+            lines[-1] += f" — {zj_info.get('说明','')}"
+
         # ---- 近期公告 ----
         announcements = analysis.get("公告", {}).get("列表", []) if isinstance(analysis.get("公告"), dict) else []
         if announcements:
