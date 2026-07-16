@@ -1034,9 +1034,12 @@ def format_report(analysis: dict) -> str:
         # ---- 建议 ----
         advice = analysis.get("操作建议", "")
         stop_loss = analysis.get("止损", "")
+        exec_state = analysis.get("执行状态", "")
         if advice:
             lines.append("")
             lines.append(f"  [操作建议] {advice}")
+        if exec_state:
+            lines.append(f"  {exec_state}")
         if stop_loss:
             lines.append(f"  [止损]     {stop_loss}")
 
