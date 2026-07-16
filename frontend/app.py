@@ -691,26 +691,40 @@ elif page == "Settings":
     with tab1:
         # 读取当前配置
         cur_provider = os.getenv("LLM_PROVIDER","deepseek")
+        cur_model = os.getenv("LLM_MODEL", "")
         cur_key = os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","") or os.getenv("ANTHROPIC_API_KEY","")
 
         provider = st.selectbox("Provider", ["deepseek","openai","anthropic"],
                                 index=["deepseek","openai","anthropic"].index(cur_provider) if cur_provider in ["deepseek","openai","anthropic"] else 0)
+        # 模型默认值按 provider
+        model_defaults = {"deepseek":"deepseek-chat","openai":"gpt-4o","anthropic":"claude-sonnet-5"}
+        model = st.text_input("Model", value=cur_model or model_defaults.get(provider,""), placeholder=model_defaults.get(provider,""), key="settings_model")
         api_key = st.text_input("API Key", type="password", value=cur_key, placeholder="sk-...", key="settings_apikey")
-        base_url = st.text_input("Base URL (optional)", value="https://api.deepseek.com" if provider=="deepseek" else "", key="settings_url")
-        model = st.text_input("Model", value="deepseek-chat" if provider=="deepseek" else "gpt-4o", key="settings_model")
+        base_url = st.text_input("Base URL (optional)", value=os.getenv("LLM_BASE_URL","https://api.deepseek.com" if provider=="deepseek" else ""), key="settings_url")
 
         if st.button("Apply & Save", type="primary"):
             os.environ["LLM_PROVIDER"] = provider
+            os.environ["LLM_MODEL"] = model
             if api_key:
                 os.environ[f"{provider.upper()}_API_KEY"] = api_key
             if base_url:
                 os.environ["LLM_BASE_URL"] = base_url
-            # 写入 configs/.env 持久化
+            # 写入 .env
             env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", ".env")
+            lines = []
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    for line in f:
+                        if not any(line.startswith(p) for p in ["LLM_PROVIDER","LLM_MODEL","LLM_BASE_URL",
+                                "DEEPSEEK_API_KEY","OPENAI_API_KEY","ANTHROPIC_API_KEY"]):
+                            lines.append(line.rstrip())
+            lines.append(f"LLM_PROVIDER={provider}")
+            lines.append(f"LLM_MODEL={model}")
+            if api_key: lines.append(f"{provider.upper()}_API_KEY={api_key}")
+            if base_url: lines.append(f"LLM_BASE_URL={base_url}")
             with open(env_path, "w") as f:
-                f.write(f"LLM_PROVIDER={provider}\n")
-                if api_key:
-                    f.write(f"{provider.upper()}_API_KEY={api_key}\n")
+                f.write("\n".join(lines) + "\n")
+            st.success(f"Saved: {provider}/{model}. Restart to apply.")
                 f.write(f"COMPRESS_TRIGGER={os.getenv('COMPRESS_TRIGGER','12')}\n")
                 f.write(f"COMPRESS_KEEP={os.getenv('COMPRESS_KEEP','6')}\n")
             st.success(f"Saved. Key stored in configs/.env. Restart to apply new key.")

@@ -79,20 +79,20 @@ def _get_llm():
     if provider == "deepseek":
         from langchain_openai import ChatOpenAI
         _LLM = ChatOpenAI(
-            model="deepseek-chat", temperature=0, max_tokens=4096,
+            model=os.getenv("LLM_MODEL","deepseek-chat"), temperature=0, max_tokens=4096,
             api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com", streaming=True,
+            base_url=os.getenv("LLM_BASE_URL","https://api.deepseek.com"), streaming=True,
         )
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
         _LLM = ChatOpenAI(
-            model="gpt-4o", temperature=0, max_tokens=4096,
+            model=os.getenv("LLM_MODEL","gpt-4o"), temperature=0, max_tokens=4096,
             api_key=os.getenv("OPENAI_API_KEY"), streaming=True,
         )
     else:
         from langchain_anthropic import ChatAnthropic
         _LLM = ChatAnthropic(
-            model="claude-sonnet-5", temperature=0, max_tokens=4096, streaming=True,
+            model=os.getenv("LLM_MODEL","claude-sonnet-5"), temperature=0, max_tokens=4096, streaming=True,
         )
     return _LLM
 
