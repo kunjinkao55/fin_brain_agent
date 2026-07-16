@@ -957,8 +957,11 @@ def format_report(analysis: dict) -> str:
                 if s:
                     price = s.get("价格", "?")
                     prob = s.get("概率", "?")
-                    assumption = s.get("假设", "")
-                    lines.append(f"    {info} {scenario}({prob}): {price} — {assumption}")
+                    assumption = str(s.get("假设", "")).strip()
+                    if assumption and not assumption.startswith("—"):
+                        lines.append(f"    {info} {scenario}({prob}): {price} — {assumption}")
+                    else:
+                        lines.append(f"    {info} {scenario}({prob}): {price}元")
 
         # ---- 对比分析 ----
         compare = analysis.get("对比分析", {})
