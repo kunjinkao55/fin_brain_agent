@@ -1020,6 +1020,13 @@ def format_report(analysis: dict) -> str:
             for f in falsify:
                 lines.append(f"    ❌ {f}")
 
+        # ---- 校验Agent ----
+        val_notes = analysis.get("校验", [])
+        if val_notes:
+            lines.append("")
+            for v in val_notes:
+                lines.append(f"  {v}")
+
         # ---- 建议 ----
         advice = analysis.get("操作建议", "")
         stop_loss = analysis.get("止损", "")
