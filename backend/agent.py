@@ -1150,10 +1150,16 @@ def reporter_node(state: FinBrainState) -> dict:
                         si = sc.get(s, {})
                         if isinstance(si, dict) and si.get("价格"):
                             try:
-                                si["价格"] = round(float(si["价格"]) * dilution, 2)
+                                raw_p = str(si["价格"]).replace("元","").replace(" ","").strip()
+                                si["价格"] = round(float(raw_p) * dilution, 2)
                             except: pass
                     if isinstance(sc.get("概率加权价值"), (int, float)):
                         sc["概率加权价值"] = round(sc["概率加权价值"] * dilution, 2)
+                    elif isinstance(sc.get("概率加权价值"), str):
+                        try:
+                            raw = sc["概率加权价值"].replace("元","").strip()
+                            sc["概率加权价值"] = round(float(raw) * dilution, 2)
+                        except: pass
 
                 # 注入结构化定增信息
                 zj_info = {
@@ -1187,6 +1193,36 @@ def reporter_node(state: FinBrainState) -> dict:
                             new_buy_zone = round(current_fv * (1 - margin_ratio), 2)
                             r2["买入区间"] = f"≤{new_buy_zone:.2f}元" if new_buy_zone > 0 else "无法计算"
                     except: pass
+
+            # === 价格状态机：根据当前价vs买入价自动判定执行策略 ===
+            try:
+                r3 = item.get("投资评级", {}) if isinstance(item, dict) else {}
+                advice = str(item.get("操作建议", "")) if isinstance(item, dict) else ""
+                # 多种模式提取买入目标价：≤X元 / 回落至X元 / X元以下 / 买入区间
+                buy_target = None
+                for pat in [r'[≤<=]\s*([\d.]+)\s*元', r'回落至\s*([\d.]+)\s*元',
+                            r'([\d.]+)\s*元以下', r'([\d.]+)\s*元建仓']:
+                    m = re.search(pat, advice)
+                    if m: buy_target = float(m.group(1)); break
+                # 回退：从买入区间提取
+                if buy_target is None and isinstance(r3, dict):
+                    bz = str(r3.get("买入区间", ""))
+                    m = re.search(r'([\d.]+)', bz)
+                    if m: buy_target = float(m.group(1))
+                sp = float(r3.get("当前价格", stock_price)) if isinstance(r3, dict) and r3.get("当前价格") else stock_price
+                if buy_target and sp > 0:
+                    gap_pct = (sp - buy_target) / buy_target * 100
+                    if sp <= buy_target:
+                        state_note = f"[执行状态] 当前价{sp:.2f}元已进入≤{buy_target:.2f}元建仓区→建议立即执行首笔建仓。"
+                    elif gap_pct <= 3:
+                        state_note = f"[执行状态] 当前价{sp:.2f}元略高于{buy_target:.2f}元建仓价(差距{gap_pct:.1f}%)→建议挂单等待回落至{buy_target:.2f}元后成交。"
+                    elif gap_pct <= 8:
+                        state_note = f"[执行状态] 当前价{sp:.2f}元距建仓价{buy_target:.2f}元差{gap_pct:.0f}%→暂不建仓，等待回调。"
+                    else:
+                        state_note = f"[执行状态] 当前价{sp:.2f}元显著高于建仓价{buy_target:.2f}元(差距{gap_pct:.0f}%)→价格偏高，暂不建议建仓。"
+                    if isinstance(item, dict):
+                        item["执行状态"] = state_note
+            except: pass
         except Exception:
             pass  # 决策失败不阻塞报告
 
