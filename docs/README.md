@@ -175,6 +175,7 @@ pip install chromadb pdfplumber python-docx plotly streamlit py-mini-racer
 # 配置 configs/.env
 LLM_PROVIDER=deepseek
 DEEPSEEK_API_KEY=sk-your-key
+FINBRAIN_DATA_TIER=FREE            # FREE | PREMIUM | INSTITUTIONAL
 
 # CLI
 python run.py
@@ -192,9 +193,11 @@ finbrain/
 │   ├── .env                       # LLM配置+API Key
 │   └── strategies.json            # 3套策略(默认/纯价值/趋势动量)
 ├── backend/
-│   ├── agent.py                   # LangGraph Agent + Prompt (~800行)
-│   ├── tools.py                   # 13个数据工具+评分+格式化 (~1200行)
-│   ├── scoring.py                 # 投资决策引擎(动态权重+评级) (~160行)
+│   ├── agent.py                   # LangGraph Agent + Prompt (~1500行)
+│   ├── tools.py                   # 14个数据工具+评分+格式化 (~1600行)
+│   ├── scoring.py                 # 投资决策引擎(动态权重+成长溢价) (~170行)
+│   ├── scoring_config.py          # 评分配置加载器 (~140行)
+│   ├── datasource_tier.py         # 数据源分层系统(可插拔高级插槽) (~150行)
 │   ├── accounting_rag.py          # 多知识库RAG (会计准则+研报+策略) (~400行)
 │   ├── rag.py                     # 游资知识库RAG (~130行)
 │   ├── cache.py                   # TTL分层缓存 (~60行)
@@ -220,7 +223,8 @@ finbrain/
 | 前端 | Streamlit + Plotly |
 | 数据源 | 新浪 + 东方财富 datacenter + 同花顺 10jqka |
 | 鉴权绕过 | SSL证书绕过 + py_mini_racer JS引擎 |
-| 代码量 | ~3500行 Python |
+| **数据源分层** | **FREE(行情+财报) / PREMIUM(+管理层+机构持仓) / INSTITUTIONAL(+ESG+另类数据)，环境变量切换** |
+| 代码量 | ~4000行 Python |
 
 ## 已知局限
 
