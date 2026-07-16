@@ -1519,17 +1519,21 @@ def get_dragon_tiger_detail(symbol: str) -> dict:
 #  工具11：板块资金流向（Phantom Hunter / 市场感知用）
 # ============================================================
 
-def get_sector_fund_flow(top_n: int = 50, date: str = "") -> dict:
-    """获取全行业板块资金流向排名（同花顺），含净流入/流出额。date为空=当日"""
+def get_sector_fund_flow(top_n: int = 50, date: str = "", fund_type: str = "total") -> dict:
+    """获取全行业板块资金流向排名（同花顺）。
+    fund_type: 'total'=全市场资金(主力+散户) / 'main'=主力资金(超大单+大单)"""
     try:
         import requests
         from bs4 import BeautifulSoup as bs
 
         headers = _get_ths_headers()
+        # URL 路径: hyzjl = 全市场 / hyzjl/field/zljlr = 主力净流入
+        path = "hyzjl" if fund_type == "total" else "hyzjl/field/zljlr"
+        label = "全市场资金" if fund_type == "total" else "主力资金"
         all_sectors = []
-        for page in range(1, 5):  # 最多4页，覆盖所有行业
-            url = (f"http://data.10jqka.com.cn/funds/hyzjl/"
-                   f"field/zdf/order/desc/page/{page}/ajax/1/free/1/")
+        for page in range(1, 5):
+            url = (f"http://data.10jqka.com.cn/funds/{path}/"
+                   f"order/desc/page/{page}/ajax/1/free/1/")
             resp = requests.get(url, headers=headers, timeout=10)
             soup = bs(resp.text, "html.parser")
             table = soup.find("table")
@@ -1559,7 +1563,7 @@ def get_sector_fund_flow(top_n: int = 50, date: str = "") -> dict:
                 })
 
         all_sectors.sort(key=lambda x: x["净额(亿)"], reverse=True)
-        return {"板块数量": len(all_sectors), "列表": all_sectors[:top_n]}
+        return {"板块数量": len(all_sectors), "列表": all_sectors[:top_n], "资金类型": label}
 
     except Exception as e:
         return {"error": f"板块资金流查询失败: {str(e)}"}

@@ -104,26 +104,36 @@ def _to_lc(h):
     from langchain_core.messages import HumanMessage, AIMessage
     return [HumanMessage(content=m["content"]) if m["role"]=="user" else AIMessage(content=m["content"]) for m in h]
 
-def run_agent(user_input: str) -> tuple[str, list]:
+class StreamHandler(BaseCallbackHandler):
+    """捕获LLM流式输出的每个token，更新Streamlit占位符"""
+    def __init__(self, placeholder):
+        self.placeholder = placeholder
+        self.tokens = ""
+    def on_llm_new_token(self, token, **kwargs):
+        self.tokens += token
+        self.placeholder.text(self.tokens)
+
+
+def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list]:
     """返回 (回复文本, 工具调用记录列表)。
-    路由优先级：显式模式 > 自动分类兜底（Chat模式下仍会识别"分析/妖股"等触发词）
+    如果 stream_placeholder 不为空，流式输出到该占位符。
     """
     agents = get_agents()
     msgs = _to_lc(st.session_state.chat_history) + [{"role": "user", "content": user_input}]
     tracker = ToolCallTracker()
+    callbacks = [tracker]
+    if stream_placeholder is not None:
+        callbacks.append(StreamHandler(stream_placeholder))
     cfg = {
         "configurable": {"thread_id": st.session_state.thread_id},
-        "callbacks": [tracker],
+        "callbacks": callbacks,
     }
 
     mode = st.session_state.get("mode", "Chat")
-    # Chat 模式下保留自动分类：识别分析/妖股触发词自动升级
     if mode == "Chat":
         auto = agents["classify"](user_input)
-        if auto == "analysis":
-            mode = "Deep Analysis"
-        elif auto == "phantom":
-            mode = "Phantom Hunter"
+        if auto == "analysis": mode = "Deep Analysis"
+        elif auto == "phantom": mode = "Phantom Hunter"
 
     if mode == "Phantom Hunter":
         reply = agents["phantom"].invoke({"messages": msgs}, config=cfg)["messages"][-1].content
@@ -133,7 +143,7 @@ def run_agent(user_input: str) -> tuple[str, list]:
                                      "processing_log": []}, config=cfg)
         reply = r.get("report") or r["messages"][-1].content
         proc_log = r.get("processing_log", [])
-        if proc_log:
+        if proc_log and stream_placeholder is None:
             with st.expander("Pipeline: Data -> Analysis -> Report", expanded=False):
                 for step in proc_log:
                     phase = step.get("phase","?")
@@ -178,72 +188,64 @@ if page == "Market":
             st.markdown(f'<div class="metric-box"><div class="label">Breadth</div><div class="value">{breadth["上涨比例"]}</div></div>', unsafe_allow_html=True)
     st.divider()
 
-    # ---- 全板块资金流对比图 (缓存5分钟) ----
+    # ---- 板块资金流对比图 (缓存5分钟) ----
     @st.cache_data(ttl=300)
-    def _cached_sector_flow():
+    def _cached_sector_total():
         from backend.tools import get_sector_fund_flow
-        return get_sector_fund_flow(100)
-    sector_data = _cached_sector_flow()
-    all_sectors = sector_data.get("列表", [])
+        return get_sector_fund_flow(100, fund_type="total")
+    @st.cache_data(ttl=300)
+    def _cached_sector_main():
+        from backend.tools import get_sector_fund_flow
+        return get_sector_fund_flow(100, fund_type="main")
 
-    if all_sectors:
-        sort_by = st.radio("Sort", ["Net Flow", "Change %"], horizontal=True, key="sector_sort")
+    sector_data = _cached_sector_total()
+    # 主力资金仅个股页面有，行业页面只有全市场——暂时只用全市场数据
+    chart_mode = "全市场"  # 未来: 接入个股主力数据后可切换
 
-        if sort_by == "Change %":
+    def _draw_sector_chart(data, title_prefix, key_suffix):
+        all_sectors = data.get("列表", [])
+        if not all_sectors:
+            st.warning("暂无数据")
+            return
+        sort_by = st.radio("排序", ["净流入额", "涨跌幅"], horizontal=True, key=f"sector_sort_{key_suffix}")
+        if sort_by == "涨跌幅":
             all_sectors.sort(key=lambda s: float(str(s.get("涨跌幅", "0%")).replace("%","").replace("+","") or 0), reverse=True)
         else:
             all_sectors.sort(key=lambda s: abs(s["净额(亿)"]), reverse=True)
-
         names = [s["板块"] for s in all_sectors]
         nets = [s["净额(亿)"] for s in all_sectors]
         changes = [float(str(s.get("涨跌幅", "0%")).replace("%","").replace("+","") or 0) for s in all_sectors]
-        abs_nets = [abs(n) for n in nets]
         colors = ["#cc3333" if n >= 0 else "#2e7d32" for n in nets]
-
-        if sort_by == "Change %":
-            bar_values = changes
-            x_title = "Change %"
+        if sort_by == "涨跌幅":
+            bar_values, x_title = changes, "涨跌幅 (%)"
         else:
-            bar_values = abs_nets
-            x_title = "|Net Flow| (B)  Red=Inflow  Green=Outflow"
-
-        bar_text = [f"{n:+.2f}B  {c:+.2f}%" for n, c in zip(nets, changes)]
-
-        fig = go.Figure(data=[go.Bar(
-            x=bar_values, y=names, orientation='h',
-            marker_color=colors,
-            text=bar_text,
-            textposition='outside',
-            textfont=dict(color='#ddd', size=9),
-        )])
+            bar_values, x_title = [abs(n) for n in nets], "|净流入| (亿)"
+        bar_text = [f"{n:+.2f}亿  {c:+.2f}%" for n, c in zip(nets, changes)]
+        fig = go.Figure(data=[go.Bar(x=bar_values, y=names, orientation='h', marker_color=colors,
+                                      text=bar_text, textposition='outside', textfont=dict(color='#ddd', size=9))])
+        fund_label = data.get("资金类型", "")
         fig.update_layout(
-            title=f"Sector Fund Flow ({len(all_sectors)} sectors)",
-            height=max(600, len(names) * 20),
-            margin=dict(l=10, r=100, t=40, b=10),
-            paper_bgcolor="#111", plot_bgcolor="#111",
-            font=dict(color="#ddd"),
-            xaxis=dict(title=x_title, showgrid=True, gridcolor="#333"),
-            yaxis=dict(showgrid=False),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            title=f"{title_prefix}{fund_label} ({len(all_sectors)} sectors)", height=max(600, len(names)*20),
+            margin=dict(l=10, r=100, t=40, b=10), paper_bgcolor="#111", plot_bgcolor="#111",
+            font=dict(color="#ddd"), xaxis=dict(title=x_title, showgrid=True, gridcolor="#333"), yaxis=dict(showgrid=False))
+        st.plotly_chart(fig, use_container_width=True, key=f"kline_{key_suffix}")
 
-        # 下方表格
-        with st.expander(f"Sector Fund Flow Details ({len(all_sectors)} sectors)", expanded=False):
-            lines = [f"{'Sector':<12} {'Chg':>8} {'In(亿)':>10} {'Out(亿)':>10} {'Net(亿)':>10}"]
-            lines.append("-" * 55)
-            for s in all_sectors:
-                net = s["净额(亿)"]
-                color = "#cc3333" if net >= 0 else "#2e7d32"
-                lines.append(
-                    f"<span style='color:{color}'>{s['板块']:<12} {s['涨跌幅']:>8} "
-                    f"{s['流入(亿)']:>10.2f} {s['流出(亿)']:>10.2f} {net:>+10.2f}</span>"
-                )
-            st.markdown("<pre style='font-size:12px'>" + "\n".join(lines) + "</pre>",
-                        unsafe_allow_html=True)
-    else:
-        st.warning("No sector data available for this date")
+    _draw_sector_chart(sector_data, "", "total")
 
-
+    # 下方表格
+    all_sec = sector_data.get("列表", [])
+    with st.expander(f"Sector Fund Flow Details ({len(all_sec)} sectors)", expanded=False):
+        lines = [f"{'Sector':<12} {'Chg':>8} {'In(亿)':>10} {'Out(亿)':>10} {'Net(亿)':>10}"]
+        lines.append("-" * 55)
+        for s in all_sec:
+            net = s["净额(亿)"]
+            color = "#cc3333" if net >= 0 else "#2e7d32"
+            lines.append(
+                f"<span style='color:{color}'>{s['板块']:<12} {s['涨跌幅']:>8} "
+                f"{s['流入(亿)']:>10.2f} {s['流出(亿)']:>10.2f} {net:>+10.2f}</span>"
+            )
+        st.markdown("<pre style='font-size:12px'>" + "\n".join(lines) + "</pre>",
+                    unsafe_allow_html=True)
 # ========== Chat ==========
 if page == "Chat":
     st.header("AI Chat")
@@ -341,21 +343,13 @@ if page == "Chat":
         with st.chat_message("user"): st.text(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner(""):
-                try:
-                    reply, tool_logs = run_agent(prompt)
-                    pipeline = tool_logs or []
-                    if pipeline:
-                        with st.expander(f"Pipeline: Data({len(pipeline)} tools) -> Analysis -> Report", expanded=False):
-                            st.caption("Phase 1: Data Collection")
-                            for log in pipeline:
-                                icon = {"running":"...","done":"OK","error":"ERR"}.get(log["status"],"?")
-                                st.caption(f"  [{icon}] {log['tool']}({log['input'][:60]})")
-                            st.caption(f"Phase 2: Analysis & Scoring")
-                            st.caption(f"Phase 3: Report Formatting (output {len(reply)} chars)")
-                    st.text(reply)
-                except Exception as e:
-                    reply = f"[Error] {e}"; st.text(reply)
+            stream_box = st.empty()
+            try:
+                reply, tool_logs = run_agent(prompt, stream_placeholder=stream_box)
+                stream_box.text(reply)  # 确保最终内容完整
+            except Exception as e:
+                reply = f"[Error] {e}"
+                stream_box.text(reply)
 
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
