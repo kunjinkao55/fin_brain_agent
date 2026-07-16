@@ -800,6 +800,15 @@ def format_report(analysis: dict) -> str:
             lines.append("")
             lines.append(f"  [估值方法] {val_method}")
 
+        # 估值明细（代码计算链，透明化）
+        val_chain = rating.get("估值明细", {}) if isinstance(rating, dict) else {}
+        if val_chain and val_chain.get("公式"):
+            lines.append(f"  [估值明细] {val_chain['公式']}")
+            lines.append(f"    行业PE中枢={val_chain.get('行业PE中枢','?')} | "
+                         f"财务质量乘数={val_chain.get('财务质量乘数','?')} | "
+                         f"成长溢价={val_chain.get('成长溢价','?')} | "
+                         f"EPS(TTM)={val_chain.get('EPS(TTM)','?')}元")
+
         # === 第二部分：公司画像和竞争优势 ===
         profile = analysis.get("公司画像", {})
         if profile:
@@ -1440,7 +1449,18 @@ def calculate_scores(financial_data: dict) -> dict:
     elif debt < 60: debt_score = 5
     else: debt_score = 3
     dep_note = f", 折旧/净利润={dep_ratio:.1f}(重资产修正)" if dep > 0 and net_profit > 0 else ""
-    scores["财务健康"] = {"得分": min(10, debt_score + cf_score), "依据": f"资产负债率{debt}%, 经营现金流/扣非净利润={cf_ratio:.2f}{dep_note}"}
+    # 现金流色彩标签（0-3级，供Reporter强制注入风险段落）
+    if cf_ratio >= 0.8:   cf_label, cf_emoji, cf_severity = "优秀", "🟢", 0
+    elif cf_ratio >= 0.5: cf_label, cf_emoji, cf_severity = "正常", "🟡", 1
+    elif cf_ratio >= 0.3: cf_label, cf_emoji, cf_severity = "警惕", "🟠", 2
+    else:                 cf_label, cf_emoji, cf_severity = "警报", "🔴", 3
+
+    scores["财务健康"] = {
+        "得分": min(10, debt_score + cf_score),
+        "依据": f"资产负债率{debt}%, 经营现金流/扣非净利润={cf_ratio:.2f}{dep_note}",
+        "现金流标签": f"{cf_emoji}{cf_label}(覆盖率{cf_ratio:.2f})",
+        "现金流严重度": cf_severity,
+    }
 
     # --- 4. 估值合理 (0-10) —— 行业PE锚定 ---
     _INDUSTRY_PE = {

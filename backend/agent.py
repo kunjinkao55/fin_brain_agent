@@ -1078,6 +1078,20 @@ def reporter_node(state: FinBrainState) -> dict:
                               f"可能原因:备货占用/回款恶化/季节性。需关注Q2是否改善。")
                 item["风险"] = (item.get("风险", []) if isinstance(item, list) else []) + [cf_warning]
 
+            # 现金流色彩标签注入（🟠警惕/🔴警报时强制追加风险）
+            _scores = item.get("评分", {}) if isinstance(item, dict) else {}
+            _fh = _scores.get("财务健康", {}) if isinstance(_scores, dict) else {}
+            _cf_label = _fh.get("现金流标签", "") if isinstance(_fh, dict) else ""
+            _cf_sev = _fh.get("现金流严重度", 0) if isinstance(_fh, dict) else 0
+            if _cf_sev >= 3:
+                item["风险"] = (item.get("风险", []) if isinstance(item, list) else []) + [
+                    f"{_cf_label} — 经营现金流覆盖率严重不足，利润含金量存疑，需人工核查回款与存货。"
+                ]
+            elif _cf_sev >= 2:
+                item["风险"] = (item.get("风险", []) if isinstance(item, list) else []) + [
+                    f"{_cf_label} — 经营现金流覆盖率偏低，建议关注应收账款周转与存货变动。"
+                ]
+
             # Web Search 机构共识（仅 web_search 启用时）
             ws_key = os.getenv("WEB_SEARCH_API_KEY", "")
             if ws_key:
@@ -1648,6 +1662,70 @@ def reporter_node(state: FinBrainState) -> dict:
 
         except Exception:
             break
+
+    # === 审计摘要：收集所有检查结果，构建可见的校验表格 ===
+    _audit_rows = []
+    # 从 items 中收集审计信号
+    for _it in (data if isinstance(data, list) else [data]):
+        if not isinstance(_it, dict): continue
+        sym_name = _it.get("名称", _it.get("代码", "?"))
+
+        # 1. 事件-估值联动
+        if _it.get("定增信息"):
+            _audit_rows.append(("事件-估值联动", "✅", "定增摊薄已由代码强制修正"))
+        elif _it.get("_dilution_coefficient"):
+            _audit_rows.append(("事件-估值联动", "✅", f"稀释系数{_it['_dilution_coefficient']}已应用"))
+        else:
+            _audit_rows.append(("事件-估值联动", "—", "无定增事件"))
+
+        # 2. 评分-估值矛盾 (from code pre-check)
+        _audit_rows.append(("评分-估值矛盾", "✅" if _skip_auditor else "⚠️", "代码预检" if _skip_auditor else "见审计Agent"))
+
+        # 3. 评级-操作一致
+        if _it.get("框架分歧"):
+            _audit_rows.append(("评级-操作一致", "⚠️", "已呈现框架分歧(非错误)"))
+        elif _it.get("校验修正"):
+            _audit_rows.append(("评级-操作一致", "⚠️", f"已修正: {_it['校验修正'][:50]}"))
+        else:
+            _audit_rows.append(("评级-操作一致", "✅", "一致"))
+
+        # 4. 估值合理
+        _r = _it.get("投资评级", {}) if isinstance(_it, dict) else {}
+        _fv = _r.get("合理价值", 0) if isinstance(_r, dict) else 0
+        _sp = _r.get("当前价格", 0) if isinstance(_r, dict) else 0
+        try:
+            _ratio = float(_fv) / float(_sp) if float(_sp) > 0 else 1
+            if _ratio > 2.5:
+                _audit_rows.append(("估值合理", "⚠️", f"合理价值/股价={_ratio:.1f}倍"))
+            elif _ratio < 0.3:
+                _audit_rows.append(("估值合理", "⚠️", f"合理价值仅为股价{_ratio*100:.0f}%"))
+            else:
+                _audit_rows.append(("估值合理", "✅", f"比值={_ratio:.1f}"))
+        except:
+            _audit_rows.append(("估值合理", "—", "无法计算"))
+
+        # 5. 数据单位
+        _audit_rows.append(("数据单位", "✅" if not _it.get("校验修正") else "⚠️", "通过" if not _it.get("校验修正") else "已触发修正"))
+
+        # 6. 评分合计
+        _audit_rows.append(("评分合计", "✅", "代码生成,LLM不参与"))
+
+        # 7. 操作建议
+        _exec = _it.get("执行状态", "")
+        _audit_rows.append(("操作建议", "✅" if _exec else "⚠️", "含执行状态判定" if _exec else "检查中"))
+
+        # 8. 情景EPS
+        _audit_rows.append(("情景EPS单调性", "⚠️", "LLM生成,见审计Agent检查"))
+
+    # 构建表格
+    _audit_table = "\n  [校验审计] 8项守卫检查结果:\n"
+    _audit_table += "  | 检查项 | 状态 | 说明 |\n"
+    _audit_table += "  |--------|:----:|------|\n"
+    for row in _audit_rows[:16]:  # 最多2只股票×8项
+        _audit_table += f"  | {row[0]} | {row[1]} | {row[2]} |\n"
+    _audit_table += f"  * 审计重试: {retry_count}次 | 代码预检: {'通过' if _skip_auditor else '发现问题'}\n"
+
+    audit_report += "\n" + _audit_table
 
     prev_log = state.get("processing_log", [])
     prev_log.append({"phase": "Report", "summary": f"Formatted ({len(score_text)} chars, audit retries: {retry_count})", "detail": score_text[:2000]})

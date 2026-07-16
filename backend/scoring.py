@@ -124,12 +124,24 @@ def compute_investment_rating(
     elif weighted >= 55: confidence = "B (中)"
     else: confidence = "C (低)"
 
+    # 估值计算链（透明化：让使用者看到合理价值是怎么算出来的）
+    _eps_display = round(eps, 2) if eps else 0
+    valuation_chain = {
+        "EPS(TTM)": _eps_display,
+        "行业PE中枢": ind_pe,
+        "财务质量乘数": round(quality_mult, 2),
+        "成长溢价": round(growth_pe_mult, 2),
+        "最终PE": round(fair_pe, 1),
+        "公式": f"{_eps_display} × {ind_pe} × {quality_mult} × {growth_pe_mult} = {fair_value}",
+    }
+
     return {
         "评级": rating,
         "加权总分": weighted,
         "权重描述": weights.get("描述", ""),
         "合理PE": round(fair_pe, 1),
         "合理价值": fair_value,
+        "估值明细": valuation_chain,
         "当前价格": stock_price,
         "估值差距": f"{gap_pct:+.1f}%",
         "安全边际要求": f"{safety_margin:.0%}",
