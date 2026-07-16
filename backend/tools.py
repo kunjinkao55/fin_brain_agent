@@ -1103,6 +1103,25 @@ def get_limit_up_pool(top_n: int = 30) -> dict:
         return {"error": f"涨停板查询失败: {str(e)}"}
 
 
+def get_recent_announcements(symbol: str, count: int = 5) -> dict:
+    """获取个股最近 N 条公告（东财），用于分析报告前补充最新事件"""
+    try:
+        url = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+        params = f'sr=-1&page_size={count}&page_index=1&ann_type=A&client_source=web&stock_list={symbol}'
+        req = urllib.request.Request(f'{url}?{params}',
+            headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        items = data.get("data", {}).get("list", [])
+        results = [{"日期": it.get("notice_date","")[:10],
+                     "标题": it.get("title","").replace("<em>","").replace("</em>",""),
+                     "类型": it.get("ann_type_name","")}
+                    for it in items[:count]]
+        return {"公告数量": len(results), "列表": results}
+    except Exception as e:
+        return {"error": f"公告查询失败: {str(e)}"}
+
+
 def get_stock_streak(symbol: str) -> dict:
     """查询单只股票近10日连板情况。返回连板天数、涨停日期列表。"""
     try:
