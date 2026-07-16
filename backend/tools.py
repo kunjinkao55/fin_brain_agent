@@ -1104,7 +1104,7 @@ def get_limit_up_pool(top_n: int = 30) -> dict:
 
 
 def get_recent_announcements(symbol: str, count: int = 5) -> dict:
-    """获取个股最近 N 条公告（东财），用于分析报告前补充最新事件"""
+    """获取个股最近 N 条公告（东财）。对定增/发行类公告自动抓取摘要中的关键数字。"""
     try:
         url = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
         params = f'sr=-1&page_size={count}&page_index=1&ann_type=A&client_source=web&stock_list={symbol}'
@@ -1113,10 +1113,34 @@ def get_recent_announcements(symbol: str, count: int = 5) -> dict:
         with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         items = data.get("data", {}).get("list", [])
-        results = [{"日期": it.get("notice_date","")[:10],
-                     "标题": it.get("title","").replace("<em>","").replace("</em>",""),
-                     "类型": it.get("ann_type_name","")}
-                    for it in items[:count]]
+
+        results = []
+        for it in items[:count]:
+            title = it.get("title","").replace("<em>","").replace("</em>","")
+            entry = {"日期": it.get("notice_date","")[:10], "标题": title}
+            # 对定增/发行类公告抓取摘要
+            if any(kw in title for kw in ["发行A股","非公开发行","定向增发","募集资金","发行股份"]):
+                art_code = it.get("art_code","")
+                if art_code:
+                    try:
+                        detail_url = f'https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={art_code}'
+                        req2 = urllib.request.Request(detail_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req2, timeout=8, context=_SSL_CTX) as resp2:
+                            detail = json.loads(resp2.read().decode("utf-8"))
+                        text = str(detail.get("data", {}).get("notice_content",
+                                detail.get("data", {}).get("content", "")))
+                        # 提取关键数字
+                        amounts = re.findall(r'(\d+\.?\d*)\s*[亿万]元', text)
+                        shares = re.findall(r'(\d+\.?\d*)\s*[万]股', text)
+                        if amounts: entry["募资金额"] = amounts[0] + "亿元" if "亿" in text else amounts[0] + "万元"
+                        if shares: entry["发行股数"] = shares[0] + "万股"
+                        # 取正文开头作为摘要（跳过HTML标签）
+                        clean = re.sub(r'<[^>]+>', '', text)
+                        entry["摘要"] = clean[:200] + ("..." if len(clean) > 200 else "")
+                    except Exception:
+                        pass  # 摘要抓取失败不影响
+            results.append(entry)
+
         return {"公告数量": len(results), "列表": results}
     except Exception as e:
         return {"error": f"公告查询失败: {str(e)}"}
