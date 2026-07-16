@@ -1054,6 +1054,12 @@ def format_report(analysis: dict) -> str:
         if stop_loss:
             lines.append(f"  [止损]     {stop_loss}")
 
+        # ---- 框架分歧 ----
+        divergence = analysis.get("框架分歧", "")
+        if divergence:
+            lines.append("")
+            lines.append(f"  {divergence}")
+
         # ---- 结论 ----
         conclusion = analysis.get("结论", "")
         if conclusion:
