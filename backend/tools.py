@@ -782,7 +782,7 @@ def format_report(analysis: dict) -> str:
             lines.append("")
             level = rating.get("评级", "?")
             fair = rating.get("合理价值", "?")
-            margin = rating.get("安全边际要求", rating.get("安全边际", "?"))
+            margin = rating.get("实际安全边际", rating.get("安全边际要求", rating.get("安全边际", "?")))
             buy_zone = rating.get("买入区间", "?")
             gap = rating.get("估值差距", "")
             weighted = rating.get("加权总分", "")
@@ -846,17 +846,21 @@ def format_report(analysis: dict) -> str:
 
             total = 0
             max_total = 0
+            # 复合指标（非0-10分量表），展示但不参与维度合计
+            _AGGREGATE_KEYS = {"加权总分", "综合评级", "置信度"}
             for dim, info in scores.items():
                 s_val = info.get("得分")
                 reason = info.get("依据", "")
+                is_aggregate = dim in _AGGREGATE_KEYS or (isinstance(s_val, (int, float)) and s_val > 10)
                 if s_val is None:
                     # 数据缺失，不参与计分
                     lines.append(f"  {dim:<8}  {'N/A':>4}  {'-':<6}  {reason}")
                 else:
-                    g = grade(s_val)
+                    g = grade(s_val) if not is_aggregate else "-"
                     lines.append(f"  {dim:<8}  {s_val:>4}  {g:<6}  {reason}")
-                    total += s_val
-                    max_total += 10
+                    if not is_aggregate:
+                        total += s_val
+                        max_total += 10
 
             lines.append(f"  {'-'*8}  {'-'*4}  {'-'*6}  {'-'*44}")
             if max_total > 0:
