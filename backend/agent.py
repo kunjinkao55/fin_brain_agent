@@ -697,27 +697,31 @@ def data_collector_node(state: FinBrainState) -> dict:
             "processing_log": [{"phase": "Data", "summary": f"LLM Collected ({len(collected)} chars)", "detail": collected[:3000]}]
         }
 
-    # 并发拉取所有股票数据
+    # 并发拉取所有股票数据（含调用追踪）
+    _tool_traces = []  # 收集所有工具调用记录
+
     def _fetch_one(code):
+        _tools = []
         try:
-            fin = get_financial_statements(code)
-            val = get_valuation(code)
-            price = fetch_stock_price(code)
-            ind = get_industry_info(code)
+            fin = get_financial_statements(code); _tools.append(("财报", "✅"))
+            val = get_valuation(code); _tools.append(("估值", "✅"))
+            price = fetch_stock_price(code); _tools.append(("行情", "✅"))
+            ind = get_industry_info(code); _tools.append(("行业", "✅"))
             cs_data = {"profit": fin.get("profit",[]), "cashflow": fin.get("cashflow",[]),
                        "balance": fin.get("balance",[]), "valuation": val,
                        "price": dict(price) if isinstance(price, dict) else price,
                        "industry": ind.get("行业","") if isinstance(ind, dict) else ""}
-            scores = calculate_scores(cs_data)
-            announcements = get_recent_announcements(code, 20)
+            scores = calculate_scores(cs_data); _tools.append(("评分", "✅"))
+            announcements = get_recent_announcements(code, 20); _tools.append(("公告", "✅"))
             name = price.get("name", code) if isinstance(price, dict) else code
             return {"代码": code, "名称": name, "行情": price, "行业": ind,
                     "公告": announcements,
                     "财报": {"利润表": fin.get("profit",[])[:4], "现金流": fin.get("cashflow",[])[:2]},
                     "估值": val.get("data",[])[:2] if isinstance(val, dict) else [],
-                    "预计算分数": scores}
+                    "预计算分数": scores, "_tools": _tools}
         except Exception as e:
-            return {"代码": code, "error": str(e)}
+            _tools.append(("数据采集", f"❌{str(e)[:30]}"))
+            return {"代码": code, "error": str(e), "_tools": _tools}
 
     start = __import__("time").time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
@@ -732,9 +736,14 @@ def data_collector_node(state: FinBrainState) -> dict:
         logger.warning("DataCollector errors: %s", [(e.get("代码","?"), e["error"][:80]) for e in errors])
 
     collected = json.dumps(results, ensure_ascii=False, indent=2)
+    # 汇总工具调用痕迹
+    _all_tools = []
+    for r in results:
+        _all_tools.extend(r.get("_tools", []))
     return {
         "collected_data": collected,
-        "processing_log": [{"phase": "Data", "summary": f"预取{len(symbols)}只 ({elapsed:.0f}ms, {len(errors)}错)", "detail": collected[:3000]}]
+        "processing_log": [{"phase": "Data", "summary": f"预取{len(symbols)}只 ({elapsed:.0f}ms, {len(errors)}错)",
+                            "detail": collected[:3000], "tool_calls": _all_tools}]
     }
 
 def analyst_node(state: FinBrainState) -> dict:
@@ -754,12 +763,18 @@ def analyst_node(state: FinBrainState) -> dict:
         pass  # 播种失败不影响
     industry_names = list(set(re.findall(r'"行业":\s*"([^"]+)"', collected)))
     industry_rag = ""
+    _rag_traces = []  # RAG查询痕迹
     for ind_name in industry_names[:3]:
         results = search_kb(f"{ind_name} 分析 估值 护城河", "industry", top_k=2)
         if results:
             snippets = [r["content"][:400] for r in results if r.get("content")]
             if snippets:
                 industry_rag += f"\n[RAG行业模板-{ind_name}]\n" + "\n---\n".join(snippets) + "\n"
+                _rag_traces.append(f"行业模板({ind_name}): {len(snippets)}条")
+        else:
+            _rag_traces.append(f"行业模板({ind_name}): 无结果")
+    if not industry_names:
+        _rag_traces.append("行业模板: 未触发(无行业分类)")
 
     multi_note = ""
     if stock_count >= 2:
@@ -789,7 +804,8 @@ def analyst_node(state: FinBrainState) -> dict:
         _llm_failures += 1
         raise
     prev_log = state.get("processing_log", [])
-    prev_log.append({"phase": "Analysis", "summary": f"Scored ({len(response.content)} chars)", "detail": response.content[:3000]})
+    prev_log.append({"phase": "Analysis", "summary": f"Scored ({len(response.content)} chars)",
+                     "detail": response.content[:3000], "rag_calls": _rag_traces})
     return {"analysis": response.content, "processing_log": prev_log}
 
 REPORTER_PROMPT = """你是 FinBrain 报告格式化专员。
@@ -1664,6 +1680,19 @@ def reporter_node(state: FinBrainState) -> dict:
         except Exception:
             break
 
+    # === 调用证据：收集工具调用和RAG查询痕迹 ===
+    _evidence_parts = []
+    for _pl in state.get("processing_log", []):
+        if _pl.get("tool_calls"):
+            _tool_summary = ", ".join(f"{t}({s})" for t, s in _pl["tool_calls"][:12])
+            _evidence_parts.append(f"数据工具: {_tool_summary}")
+        if _pl.get("rag_calls"):
+            _evidence_parts.append(f"RAG知识库: {'; '.join(_pl['rag_calls'][:5])}")
+    _evidence_text = ""
+    if _evidence_parts:
+        _evidence_text = "\n  [调用证据] " + " | ".join(_evidence_parts)
+        _evidence_text += "\n  * 以上为系统自动记录的工具调用与知识库检索痕迹，用于验证分析的数据来源。\n"
+
     # === 审计摘要：收集所有检查结果，构建可见的校验表格 ===
     _audit_rows = []
     # 从 items 中收集审计信号
@@ -1727,6 +1756,8 @@ def reporter_node(state: FinBrainState) -> dict:
     _audit_table += f"  * 审计重试: {retry_count}次 | 代码预检: {'通过' if _skip_auditor else '发现问题'}\n"
 
     audit_report += "\n" + _audit_table
+    if _evidence_text:
+        audit_report += _evidence_text
 
     prev_log = state.get("processing_log", [])
     prev_log.append({"phase": "Report", "summary": f"Formatted ({len(score_text)} chars, audit retries: {retry_count})", "detail": score_text[:2000]})
