@@ -866,7 +866,9 @@ def format_report(analysis: dict) -> str:
                     lines.append(f"  {dim:<8}  {'N/A':>4}  {'-':<6}  {reason}")
                 else:
                     g = grade(s_val) if not is_aggregate else "-"
-                    lines.append(f"  {dim:<8}  {s_val:>4}  {g:<6}  {reason}")
+                    cf_label = info.get("现金流标签", "") if isinstance(info, dict) else ""
+                    display_reason = f"{reason} {cf_label}" if cf_label else reason
+                    lines.append(f"  {dim:<8}  {s_val:>4}  {g:<6}  {display_reason}")
                     if not is_aggregate:
                         total += s_val
                         max_total += 10

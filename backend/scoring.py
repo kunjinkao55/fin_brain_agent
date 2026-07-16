@@ -78,6 +78,15 @@ def compute_investment_rating(
     elif debt > 50: quality_mult -= 0.05
     elif debt < 20: quality_mult += 0.05
 
+    # 现金流修正：低ROE可能是重资产折旧导致（非经营问题），若现金流强劲则减轻惩罚
+    _fh = financial_scores.get("财务健康", {}) if isinstance(financial_scores, dict) else {}
+    _cf_sev = _fh.get("现金流严重度", 1) if isinstance(_fh, dict) else 1
+    _cf_label = str(_fh.get("现金流标签", "")) if isinstance(_fh, dict) else ""
+    if quality_mult < 0.7 and _cf_sev <= 1:  # ROE低但现金流🟢/🟡优秀
+        quality_mult = max(quality_mult, 0.7)  # 抬底：重资产优质公司不应被ROE过度惩罚
+    elif quality_mult < 0.5 and _cf_sev <= 2:  # ROE很低但现金流至少🟠
+        quality_mult = max(quality_mult, 0.5)  # 抬底：现金流尚可则不过度折价
+
     # 成长溢价：高增速公司应享有更高PE倍数（仅对S/A级成长股给予溢价，不对低增速惩罚）
     growth_score = _safe_score(financial_scores, "成长性")
     growth_pe_mult = 1.0
