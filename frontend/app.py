@@ -5,6 +5,11 @@ FinBrain Streamlit 前端 — 暗色主题
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# 加载 .env（Streamlit 不会自动加载，必须在所有 os.getenv() 之前执行）
+from dotenv import load_dotenv
+_env_path = os.path.join(os.path.dirname(__file__), "..", "configs", ".env")
+load_dotenv(_env_path, override=True)
+
 import streamlit as st
 import json, time
 from langchain_core.callbacks import BaseCallbackHandler
