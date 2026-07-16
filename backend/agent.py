@@ -511,6 +511,12 @@ _FORMAT_MANDATORY = """
     "安全边际": "x%",
     "买入区间": "≤xx元"
   },
+  "长期结构性审视": {
+    "行业终局推演": "3-5年后，当前高毛利业务是否会标准化？毛利率可能从X%降至Y%？为什么？",
+    "管理层与治理": "实控人背景、核心团队稳定性、历史信披分红记录。信息不足时标注'公开信息不足，建议人工核实'",
+    "终极风险": "什么力量可能让公司失去存在价值？（技术替代/政策颠覆/资源枯竭/降维打击）",
+    "护城河保质期": "3年/5年/10年以上？瓦解信号是什么？"
+  },
   "证伪条件": ["条件1: 什么具体指标变化到什么程度意味着投资逻辑失效", "条件2"],
   "对比分析": {
     "板块": "板块名称",
@@ -591,6 +597,12 @@ ANALYST_PROMPT = """[铁律 - 输出格式]
 - 未来12个月正面催化剂: 新品/政策/行业复苏/订单/业绩
 - 未来12个月负面风险: 竞争/政策/周期/经营
 - 催化剂强度: 强/中性/弱
+
+第9.5步 长期结构性审视（3-5年后的行业终局）:
+- 行业宿命推演: 当前高毛利的业务，5年后是否会沦为标准化产品？毛利率可能从多少跌到多少？为什么？
+- 管理层与治理（如果公开信息可查）: 实控人背景、核心团队稳定性、历史信披和分红记录。如果信息不足，请明确标注"公开信息不足，建议人工核实"而非猜测。
+- 终极风险: 什么力量可能让这家公司失去存在价值？（技术替代/政策颠覆/资源枯竭/商业模式被降维打击）
+- 当前护城河的保质期: 3年/5年/10年以上？什么信号意味着护城河在瓦解？
 
 第10步 投资决策（现在是否值得行动）:
 - 投资评级: BUY(值得买入)/HOLD(持有观望)/SELL(建议回避)
@@ -1014,6 +1026,44 @@ def reporter_node(state: FinBrainState) -> dict:
                 "前瞻PE": f"{fwd_pe:.1f}倍" if fwd_pe > 0 else "数据缺失",
             }
 
+            # === 高级数据源插槽：等级不足时优雅降级 ===
+            import backend.datasource_tier as _dst
+            item["_data_tier"] = _dst.tier.name
+            _premium_notes = []
+            if _dst.tier >= _dst.DataSourceTier.PREMIUM:
+                mgmt = _dst.query_premium_slot("管理层画像", sym)
+                if mgmt:
+                    item["管理层数据"] = mgmt
+                    _premium_notes.append("管理层画像: 已加载")
+                inst = _dst.query_premium_slot("机构持仓", sym)
+                if inst:
+                    item["机构持仓"] = inst
+                    _premium_notes.append("机构持仓: 已加载")
+                chain = _dst.query_premium_slot("产业链图谱", sym)
+                if chain:
+                    item["产业链数据"] = chain
+                    _premium_notes.append("产业链: 已加载")
+            if _dst.tier >= _dst.DataSourceTier.INSTITUTIONAL:
+                esg = _dst.query_premium_slot("ESG与治理", sym)
+                if esg:
+                    item["ESG数据"] = esg
+                    _premium_notes.append("ESG: 已加载")
+                alt = _dst.query_premium_slot("另类数据", sym)
+                if alt:
+                    item["另类数据"] = alt
+                    _premium_notes.append("另类数据: 已加载")
+            if _premium_notes:
+                item["_premium_data_notes"] = _premium_notes
+            else:
+                # 标记当前等级下不可用的高级数据
+                _unavailable = []
+                if _dst.tier < _dst.DataSourceTier.PREMIUM:
+                    _unavailable = ["管理层画像", "机构持仓", "产业链图谱"]
+                if _dst.tier < _dst.DataSourceTier.INSTITUTIONAL:
+                    _unavailable += ["ESG治理", "另类数据"]
+                if _unavailable:
+                    item["_unavailable_premium"] = _unavailable
+
             # Q1 经营现金流预警（系统性检查，不依赖LLM注意）
             q1_cf = None
             cf_data = fin.get("cashflow", []) if isinstance(fin, dict) else []
@@ -1328,7 +1378,18 @@ def reporter_node(state: FinBrainState) -> dict:
                         f"   → 答案是\"加仓机会\" → 您适合方案B，按趋势框架操作。\n"
                         f"  两者不互斥，也可以用80%仓位执行方案A，20%仓位试探方案B。\n"
                         f"  关键不是选哪边，而是选了之后言行一致——不要用价值投资的理由买入，\n"
-                        f"  却用趋势交易的理由止损。"
+                        f"  却用趋势交易的理由止损。\n"
+                        f"\n"
+                        f"  ═══════════════════════════════════════════════════════════════\n"
+                        f"  关于止损：价格止损 vs 逻辑止损\n"
+                        f"  ═══════════════════════════════════════════════════════════════\n"
+                        f"  方案A（价值）使用\"逻辑止损\"——不是价格跌了多少就卖，而是投资逻辑\n"
+                        f"  是否被破坏。请关注报告中的[证伪条件]段落，当公司基本面恶化（而非\n"
+                        f"  股价波动）触发证伪条件时，才执行卖出。价格越跌，安全边际越大，\n"
+                        f"  逻辑未破时应考虑加仓而非止损。\n"
+                        f"  方案B（趋势）使用\"价格止损\"——股价跌破关键支撑位时离场，因为\n"
+                        f"  趋势可能已经反转。此时不需要等基本面确认（等确认时往往已经深套）。\n"
+                        f"  两种止损逻辑对应两种投资哲学，混用是长期亏损的最大来源。"
                     )
                     if isinstance(item, dict):
                         item["框架分歧"] = div_note
@@ -1403,8 +1464,18 @@ def reporter_node(state: FinBrainState) -> dict:
     else:
         score_text = str(data)
 
-    # 数据时效标注
-    header = f"数据时效: {period_note}\n{'=' * 64}\n\n"
+    # 数据时效标注 + 数据源等级
+    import backend.datasource_tier as _rpt_dst
+    _tier_labels = {0: "免费API(行情+财报+公告)", 1: "付费终端(+管理层+机构持仓+产业链)", 2: "机构级(+ESG+另类数据+Level2)"}
+    _tier_line = f"数据源: {_rpt_dst.tier.name} — {_tier_labels.get(_rpt_dst.tier.value, '?')}"
+    # 标记不可用的高级插槽
+    _unavail = set()
+    for item in (data if isinstance(data, list) else [data]):
+        if isinstance(item, dict) and item.get("_unavailable_premium"):
+            _unavail.update(item["_unavailable_premium"])
+    if _unavail:
+        _tier_line += f" | 未启用: {', '.join(sorted(_unavail))} (升级数据源后可激活)"
+    header = f"数据时效: {period_note}\n{_tier_line}\n{'=' * 64}\n\n"
 
     # _get_llm() 只在评分卡下面加一段叙述性结论
     narrative = _get_llm().invoke([
