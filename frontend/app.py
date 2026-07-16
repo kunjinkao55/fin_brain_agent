@@ -250,10 +250,19 @@ if page == "Market":
 if page == "Chat":
     st.header("AI Chat")
 
-    # ---- 对话历史 ----
-    for msg in st.session_state.chat_history:
+    # ---- 对话历史（最后的 assistant 消息如果是流式输出的，放在可折叠区内） ----
+    history = st.session_state.chat_history
+    last_stream = st.session_state.get("_last_stream", "")
+    for i, msg in enumerate(history):
+        is_last = (i == len(history) - 1)
+        is_assistant = (msg["role"] == "assistant")
+        is_streamed = is_last and is_assistant and last_stream and msg["content"] == last_stream
         with st.chat_message(msg["role"]):
-            st.text(msg["content"])
+            if is_streamed:
+                with st.expander("Response (click to expand)", expanded=True):
+                    st.text(msg["content"])
+            else:
+                st.text(msg["content"])
 
     # ---- 底部留白（防止内容被固定输入栏遮挡） ----
     st.markdown('<div style="height:90px"></div>', unsafe_allow_html=True)
@@ -268,12 +277,11 @@ if page == "Chat":
     cur = _MODE_META[current_mode]
 
     def _chat_send():
-        """发送按钮回调：在下次渲染前清空输入框，避免 widget 冲突"""
+        """发送回调：设置待处理消息，输入框由 clear_on_submit 自动清空"""
         prompt = st.session_state.get("chat_text_input", "").strip()
         if not prompt:
             return
         st.session_state["_pending_chat"] = prompt
-        st.session_state["chat_text_input"] = ""
 
     # JS：把底部栏从 Streamlit 嵌套容器中移到 body 级别，实现真正的 fixed 定位
     st.markdown("""
@@ -291,12 +299,14 @@ if page == "Chat":
     <div id="chat-bottom-bar">
     """, unsafe_allow_html=True)
 
-    ci, cm, cs = st.columns([6.5, 1.6, 0.8])
+    ci, cm = st.columns([7.8, 1.6])
     with ci:
-        st.text_input(
-            "Message", placeholder="Ask FinBrain...",
-            label_visibility="collapsed", key="chat_text_input",
-        )
+        with st.form("chat_form", clear_on_submit=True):
+            st.text_input("Message", placeholder="Ask FinBrain... (Enter to send)",
+                          label_visibility="collapsed", key="chat_text_input")
+            if st.form_submit_button("➤"):
+                _chat_send()
+                st.rerun()
     with cm:
         popover_label = f"{cur['icon']} {cur['label']}"
         with st.popover(popover_label, use_container_width=True):
@@ -307,9 +317,6 @@ if page == "Chat":
                              use_container_width=True, type=bt, key=f"pop_mode_{mode}"):
                     st.session_state.mode = mode
                     st.rerun()
-    with cs:
-        st.button("➤", type="primary", use_container_width=True,
-                  key="chat_send_btn", on_click=_chat_send)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -343,16 +350,17 @@ if page == "Chat":
         with st.chat_message("user"): st.text(prompt)
 
         with st.chat_message("assistant"):
-            stream_box = st.empty()
+            with st.expander("Generating... (streaming)", expanded=True):
+                stream_box = st.empty()
             try:
                 reply, tool_logs = run_agent(prompt, stream_placeholder=stream_box)
-                stream_box.text(reply)  # 确保最终内容完整
             except Exception as e:
                 reply = f"[Error] {e}"
                 stream_box.text(reply)
 
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        st.session_state["_last_stream"] = reply  # 保存流式文本供折叠查看
         st.rerun()
 
 

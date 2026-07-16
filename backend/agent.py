@@ -81,18 +81,18 @@ def _get_llm():
         _LLM = ChatOpenAI(
             model="deepseek-chat", temperature=0, max_tokens=4096,
             api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com",
+            base_url="https://api.deepseek.com", streaming=True,
         )
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
         _LLM = ChatOpenAI(
             model="gpt-4o", temperature=0, max_tokens=4096,
-            api_key=os.getenv("OPENAI_API_KEY"),
+            api_key=os.getenv("OPENAI_API_KEY"), streaming=True,
         )
     else:
         from langchain_anthropic import ChatAnthropic
         _LLM = ChatAnthropic(
-            model="claude-sonnet-5", temperature=0, max_tokens=4096,
+            model="claude-sonnet-5", temperature=0, max_tokens=4096, streaming=True,
         )
     return _LLM
 
@@ -257,7 +257,8 @@ def calculate_score(symbol: str) -> str:
     """确定性评分引擎。自动拉取财报+估值+行情+PE数据，计算6维评分。
     你只需要传入股票代码，不需要手动拼接数据。"""
     from backend.tools import (get_financial_statements, get_valuation,
-                                fetch_stock_price, get_industry_info, calculate_scores)
+                                fetch_stock_price, get_industry_info,
+                                get_recent_announcements, calculate_scores)
     import urllib.request
 
     # 自取数据（已缓存，重复调用零开销）
@@ -595,6 +596,7 @@ ANALYST_PROMPT = """[铁律 - 输出格式]
 5. 区分"真差"和"差到不能再差": 低毛利率+高增速=规模效应释放中。高毛利率+增速停滞=护城河可能被侵蚀。前者比后者更有投资价值。
 
 [系统定位] 你是一个基本面研究Agent，不是实时行情终端。你的价值在于"看懂生意"而非"算准价格"。
+collected_data 中已包含该股票最近5条公告——分析时务必参考：是否有重大合同/股权变动/业绩预告/分红方案/减持增持? 这些公告可能直接影响投资判断。
 - PE/PB/市值/目标价由代码计算，标注"基于最新财报，非实时行情"。用户如需精确估值应查看交易软件。
 - 你的算力应该花在：三年毛利率趋势意味着什么？现金流为何与利润背离？行业周期处于什么位置？竞争对手能否复制？
 - 不要假装精确。估值数字是方向性的——判断"偏贵/合理/低估"比给出具体PE更重要。
@@ -643,7 +645,8 @@ def data_collector_node(state: FinBrainState) -> dict:
     _clear_dedup()
     import re, concurrent.futures
     from backend.tools import (get_financial_statements, get_valuation,
-                                fetch_stock_price, get_industry_info, calculate_scores)
+                                fetch_stock_price, get_industry_info,
+                                get_recent_announcements, calculate_scores)
     question = state["user_question"]
     symbols = list(set(re.findall(r'(?<!\d)(\d{6})(?!\d)', question)))
 
@@ -671,8 +674,10 @@ def data_collector_node(state: FinBrainState) -> dict:
                        "price": dict(price) if isinstance(price, dict) else price,
                        "industry": ind.get("行业","") if isinstance(ind, dict) else ""}
             scores = calculate_scores(cs_data)
+            announcements = get_recent_announcements(code, 5)
             name = price.get("name", code) if isinstance(price, dict) else code
             return {"代码": code, "名称": name, "行情": price, "行业": ind,
+                    "公告": announcements,
                     "财报": {"利润表": fin.get("profit",[])[:4], "现金流": fin.get("cashflow",[])[:2]},
                     "估值": val.get("data",[])[:2] if isinstance(val, dict) else [],
                     "预计算分数": scores}
