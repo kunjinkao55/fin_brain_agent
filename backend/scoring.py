@@ -78,7 +78,13 @@ def compute_investment_rating(
     elif debt > 50: quality_mult -= 0.05
     elif debt < 20: quality_mult += 0.05
 
-    fair_pe = ind_pe * quality_mult
+    # 成长溢价：高增速公司应享有更高PE倍数（仅对S/A级成长股给予溢价，不对低增速惩罚）
+    growth_score = _safe_score(financial_scores, "成长性")
+    growth_pe_mult = 1.0
+    if growth_score >= 9:   growth_pe_mult = 1.8   # S级：超高速成长(如中际旭创265%增速)
+    elif growth_score >= 7: growth_pe_mult = 1.3   # A级：强劲成长
+
+    fair_pe = ind_pe * quality_mult * growth_pe_mult
     fair_value = round(eps * fair_pe, 2) if eps > 0 else 0
 
     # --- 4. 安全边际 ---
