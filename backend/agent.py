@@ -305,7 +305,7 @@ def calculate_score(symbol: str) -> str:
             price["mktcap"] = pe_data["mktcap"]
     data["price"] = price
     if isinstance(ind, dict):
-        data["industry"] = ind.get("行业", "")
+        data["industry"] = ind.get("行业", ind.get("industry_name", ""))
 
     result = calculate_scores(data)
     result["代码"] = symbol
@@ -710,11 +710,12 @@ def data_collector_node(state: FinBrainState) -> dict:
             cs_data = {"profit": fin.get("profit",[]), "cashflow": fin.get("cashflow",[]),
                        "balance": fin.get("balance",[]), "valuation": val,
                        "price": dict(price) if isinstance(price, dict) else price,
-                       "industry": ind.get("行业","") if isinstance(ind, dict) else ""}
+                       "industry": ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else ""}
             scores = calculate_scores(cs_data); _tools.append(("评分", "✅"))
             announcements = get_recent_announcements(code, 20); _tools.append(("公告", "✅"))
             name = price.get("name", code) if isinstance(price, dict) else code
-            return {"代码": code, "名称": name, "行情": price, "行业": ind,
+            return {"代码": code, "名称": name, "行情": price,
+                    "行业": ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else "",
                     "公告": announcements,
                     "财报": {"利润表": fin.get("profit",[])[:4], "现金流": fin.get("cashflow",[])[:2]},
                     "估值": val.get("data",[])[:2] if isinstance(val, dict) else [],
@@ -948,7 +949,7 @@ def reporter_node(state: FinBrainState) -> dict:
             if isinstance(price, dict):
                 cs_data["price"] = dict(price)
             if isinstance(ind, dict):
-                cs_data["industry"] = ind.get("行业", "")
+                cs_data["industry"] = ind.get("行业", ind.get("industry_name", ""))
             fixed = calculate_scores(cs_data)
             for dim in ["盈利能力", "成长性", "财务健康", "估值合理"]:
                 if dim in fixed:
@@ -958,7 +959,7 @@ def reporter_node(state: FinBrainState) -> dict:
             _scores = item.setdefault("评分", {})
             if "行业前景" not in _scores or not _scores["行业前景"].get("依据"):
                 _ind_pe = 15  # 默认中性
-                _industry_name = ind.get("行业", "") if isinstance(ind, dict) else ""
+                _industry_name = ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else ""
                 _scores["行业前景"] = {
                     "得分": 5,
                     "依据": f"行业: {_industry_name or '通用'}，基于行业周期位置和竞争格局综合评估"
@@ -991,7 +992,7 @@ def reporter_node(state: FinBrainState) -> dict:
             roe = float(latest_val.get("ROE(%)", 0) or 0)
             debt = float(latest_val.get("资产负债率(%)", 50) or 50)
             stock_price = float(price.get("price", 0) or 0) if isinstance(price, dict) else 0
-            industry = ind.get("行业", "") if isinstance(ind, dict) else ""
+            industry = ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else ""
 
             # 公司类型：LLM写在公司画像里，代码兜底
             profile = item.get("公司画像", {}) if isinstance(item, dict) else {}
@@ -1354,8 +1355,12 @@ def reporter_node(state: FinBrainState) -> dict:
                             f"这种量级差距说明两种框架对'合理估值'的定义完全不同——前者看PEG和行业趋势，后者看静态PE和资产底。")
 
                 if divergence_parts:
-                    # 提取止损价和建仓价用于方案B
+                    # 提取建仓价：兼容 ≤X元 / 回调至X元 / X-Y元区间 / X元左右
                     buy_m = re.search(r'[≤<=]\s*([\d.]+)\s*元', advice)
+                    if not buy_m:
+                        buy_m = re.search(r'(?:回调|回落|跌)(?:至|到)\s*([\d.]+)\s*元', advice)
+                    if not buy_m:
+                        buy_m = re.search(r'([\d.]+)\s*[-~至]\s*([\d.]+)\s*元', advice)  # 取区间下限
                     trend_buy = float(buy_m.group(1)) if buy_m else 0
                     sl_m = re.search(r'止损\s*([\d.]+)\s*元', str(item.get("止损", "")) if isinstance(item, dict) else "")
                     stop_loss_price = float(sl_m.group(1)) if sl_m else 0
@@ -1389,17 +1394,17 @@ def reporter_node(state: FinBrainState) -> dict:
                         f"  趋势建仓价：≤{trend_buy:.0f}元（基于PEG框架和技术支撑，非价值锚定）\n"
                         f"  当前价{sp:.0f}元 vs 建仓价{trend_buy:.0f}元 → 差距{((sp-trend_buy)/trend_buy*100):.0f}%，需等待回调\n"
                         )
-                    if stop_loss_price > 0:
-                        # 给趋势框架一个更宽的止损建议（15-20%）
-                        wider_stop = round(trend_buy * 0.85, 0) if trend_buy > 0 else stop_loss_price
+                        if stop_loss_price > 0:
+                            wider_stop = round(trend_buy * 0.85, 0)
+                            div_note += (
+                            f"  建议止损：≥{wider_stop:.0f}元（趋势框架下止损应设得更宽，避免高波动震出）\n"
+                            )
                         div_note += (
-                        f"  建议止损：≥{wider_stop:.0f}元（趋势框架下止损应设得更宽，避免高波动震出）\n"
+                        f"  关键考验：如果在{trend_buy:.0f}元买入后跌到{trend_buy*0.8:.0f}元，您会恐慌卖出还是认为加仓机会？\n"
                         )
                     div_note += (
                         f"  仓位建议：初始≤5%（趋势博弈，非价值抄底，必须轻仓试错）\n"
                         f"  适合人群：能承受20-30%回撤而不恐慌的人；相信AI产业趋势大于估值约束的人\n"
-                        f"  关键考验：如果在{trend_buy:.0f}元买入后跌到{trend_buy*0.8:.0f}元，您会恐慌卖出还是认为加仓机会？\n"
-                        f"\n"
                         f"  ═══════════════════════════════════════════════════════════════\n"
                         f"  如何选择？\n"
                         f"  ═══════════════════════════════════════════════════════════════\n"

@@ -158,7 +158,7 @@ async def api_prompt_analysis(body: dict):
             cs_data = {"profit": fin.get("profit",[]), "cashflow": fin.get("cashflow",[]),
                        "balance": fin.get("balance",[]), "valuation": val,
                        "price": dict(price) if isinstance(price, dict) else price,
-                       "industry": ind.get("行业","") if isinstance(ind, dict) else ""}
+                       "industry": ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else ""}
             scores = calculate_scores(cs_data)
             name = price.get("name", code) if isinstance(price, dict) else code
             return {"代码": code, "名称": name, "行情": price, "行业": ind,

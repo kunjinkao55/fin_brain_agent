@@ -147,7 +147,7 @@ def _local_reporter_postprocess(raw_analysis: str, data: list[dict]) -> str:
 
         # 投资决策
         try:
-            industry = ind_info.get("行业", "") if isinstance(ind_info, dict) else ""
+            industry = ind_info.get("行业", ind_info.get("industry_name", "")) if isinstance(ind_info, dict) else ""
             roe = float(latest_val.get("ROE(%)", 0) or 0)
             debt = float(latest_val.get("资产负债率(%)", 50) or 50)
             profile = item.get("公司画像", {}) if isinstance(item, dict) else {}
