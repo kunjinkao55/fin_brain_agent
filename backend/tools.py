@@ -1694,7 +1694,9 @@ def get_sector_fund_flow(top_n: int = 50, date: str = "", fund_type: str = "tota
                 })
 
         all_sectors.sort(key=lambda x: x["净额(亿)"], reverse=True)
-        return {"板块数量": len(all_sectors), "列表": all_sectors[:top_n], "资金类型": label}
+        from datetime import datetime
+        return {"板块数量": len(all_sectors), "列表": all_sectors[:top_n], "资金类型": label,
+                "更新时间": datetime.now().strftime("%Y-%m-%d %H:%M"), "数据日期": datetime.now().strftime("%Y-%m-%d")}
 
     except Exception as e:
         return {"error": f"板块资金流查询失败: {str(e)}"}
