@@ -124,7 +124,10 @@ def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str,
     Trace格式: [{"phase": "Data", "summary": "...", "detail": "..."}, ...]
     """
     agents = get_agents()
-    msgs = _to_lc(st.session_state.chat_history) + [{"role": "user", "content": user_input}]
+    # 历史压缩：超过阈值时用LLM摘要旧消息，只保留最近N条原文
+    from backend.agent import compress_history
+    compressed = compress_history(st.session_state.chat_history)
+    msgs = _to_lc(compressed) + [{"role": "user", "content": user_input}]
     tracker = ToolCallTracker()
     callbacks = [tracker]
     stream_handler = None
