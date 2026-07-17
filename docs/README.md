@@ -31,14 +31,16 @@ Intent Router ──→ Chat / Deep Analysis / Phantom Hunter
 ┌─────────────────────────────────────────────────────┐
 │  Research Pipeline (LangGraph StateGraph)            │
 │                                                      │
-│  Data Agent ──→ Analyst ──→ Valuation ──→ Critic    │
-│   (parallel)      (LLM)      (LLM)        (LLM)     │
+│  Data Agent → Classifier → Analyst → Valuation      │
+│   (parallel)    (code)      (LLM)     (LLM)          │
 │                                                      │
-│  → Reporter ──→ Audit Engine (code)                  │
-│      (LLM)        · score consistency                │
-│                   · data unit validation             │
-│                   · dilution correction              │
-│                   · scenario monotonicity            │
+│  → Critics(3-way parallel) → Repair → Reporter       │
+│     Logic/Financial/Industry   (LLM)    (LLM)        │
+│                                                      │
+│  → Audit Engine (code)                               │
+│     · score consistency · data unit validation       │
+│     · dilution correction · scenario monotonicity    │
+│     · FCF warning injection                          │
 └─────────────────────────────────────────────────────┘
     │
     ▼
@@ -60,14 +62,27 @@ Receives structured financial data + RAG-retrieved industry templates. Follows a
 ### Valuation Agent (LLM)
 Classifies the company stage (mature cyclical, cyclical recovery, stable growth, hyper-growth) and recommends appropriate valuation frameworks. For a company like 长电科技 (semiconductor packaging), it identifies "cyclical recovery with AI growth overlay" and recommends normalized-earnings PE + EV/EBITDA + PEG, explicitly flagging that static PE on trough EPS would be misleading.
 
-### Critic Agent (LLM, devil's advocate)
-Reviews the Analyst's output for: logic consistency, over-optimism, missing risks, valuation-reality mismatch, and data misinterpretation. Does NOT re-analyze — only challenges assumptions. Outputs structured findings with severity labels. Example finding: "Claims 'domestic only leader in advanced packaging' — competitors 通富微电 and 华天科技 also have advanced packaging capabilities. Overstated competitive moat."
+### Company Classifier (Code, no LLM)
+Extracts ROE level + volatility, revenue growth acceleration, and CAPEX/CFO intensity from financial data. Outputs blended company-type weights (e.g., `{"cyclical": 0.5, "growth": 0.3, "theme": 0.2}`) used by the Valuation Agent to select appropriate valuation frameworks.
+
+### Valuation Agent (LLM)
+Receives blended weights from the Classifier. Outputs a PE discount chain (Industry PE 40x → cyclical discount -30% → ROE discount -20% → CAPEX discount -15% → growth premium +20% = final 22x) with structured JSON, plus multi-framework valuation ranges (conservative PE-normalized, blended, optimistic PEG).
+
+### Critics — Three-Way Parallel Review (LLM × 3 + Code)
+- **Logic Critic**: Checks causal chain coherence, over-confident language, rating-action consistency
+- **Financial Critic**: Code-layer pre-check (FCF = CFO − CAPEX, PE/ROE mismatch, CFO/depreciation distortion) → feeds findings into LLM for semantic review of financial data interpretation
+- **Industry Critic**: Verifies competitive claims, technology positioning, supply chain analysis
+
+Outputs merged and deduplicated into a structured fix list via a code-layer Aggregator.
+
+### Repair Agent (LLM)
+Receives the structured fix list from Critics. Auto-corrects the analysis JSON: tones down absolute claims, fixes data misinterpretations, adds missing risks. Only modifies flagged fields — does not regenerate the entire report.
 
 ### Reporter Agent (LLM)
-Generates the final narrative, constrained by Critic findings. If the Critic flagged "SELL rating contradicts buy recommendation", the Reporter is explicitly instructed to align its conclusion.
+Generates the final narrative, constrained by both Critic findings and Repair corrections.
 
 ### Audit Engine (Code, no LLM)
-8 deterministic checks: dilution-valuation linkage, growth-PE consistency, risk-rating alignment, valuation sanity, data unit validity, score sum correctness, actionable advice completeness, and scenario EPS monotonicity. When the scoring engine's conservative PE anchor conflicts with the LLM's growth narrative, a `[Framework Divergence]` section presents both perspectives rather than forcing one to win.
+8 deterministic checks + FCF warning injection. When the scoring engine's conservative PE anchor conflicts with the LLM's growth narrative, a `[Framework Divergence]` section presents both perspectives rather than forcing one to win.
 
 ---
 
@@ -79,14 +94,19 @@ Every pipeline run produces an observable trace:
 📡 Data — SUCCESS | 预取1只股票
   Latency: 4800ms | Actions: ✅财报 ✅估值 ✅行情 ✅行业 ✅评分 ✅公告
 
+🏷️ Classify — SUCCESS | 50%周期制造 + 30%成长 + 20%主题
+  Metrics: ROE 0.056, volatility 0.8, CAPEX/CFO 1.4
+
 🧠 Analysis — SUCCESS | 投资分析生成完成
   Output: 8500 chars | RAG: 行业模板(半导体): 2条
 
-📊 Valuation — SUCCESS | 周期复苏型
+📊 Valuation — SUCCESS | PE折价链: 40→周期-30%→ROE-20%→CAPEX-15%→成长+20%=22x
   Frameworks: PE(正常化利润), EV/EBITDA, PEG
 
-🔍 Critic — WARNING | 审查发现漏洞
-  Findings: 逻辑3 | 过度乐观2 | 遗漏风险2 | 置信度:高
+🔍 Critics — WARNING | 三路审查: Logic:2 Financial:3 Industry:1
+  Code findings: FCF=-17亿, PE/ROE=17x mismatch
+
+🔧 Repair — SUCCESS | 已修正5项问题
 
 📝 Report — SUCCESS | 报告生成完成
   Output: 14200 chars | Audit: 0/3 retries | Precheck: 通过
