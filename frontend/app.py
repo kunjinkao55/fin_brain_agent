@@ -464,6 +464,8 @@ if page == "Chat":
         with st.chat_message("assistant"):
             with st.expander("Generating... (streaming)", expanded=True):
                 stream_box = st.empty()
+            stream_text = ""
+            trace = []
             try:
                 reply, tool_logs, stream_text, trace = run_agent(prompt, stream_placeholder=stream_box)
             except Exception as e:
