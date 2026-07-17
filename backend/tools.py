@@ -1738,22 +1738,22 @@ def get_sector_momentum(top_n: int = 15) -> dict:
             if mx == mn: return [50] * len(vals)
             return [(v - mn) / (mx - mn) * 100 for v in vals]
 
-        abs_nets = [abs(float(s["净额(亿)"])) for s in sectors]
+        nets_raw = [float(s["净额(亿)"]) for s in sectors]
         changes_raw = [float(str(s.get("涨跌幅", "0%")).replace("%", "").replace("+", "")) for s in sectors]
         totals = [float(s["流入(亿)"]) + float(s["流出(亿)"]) for s in sectors]
-        # 资金强度 = 净流入绝对值 / 总成交额
-        intensities = [abs(n) / t if t > 0 else 0 for n, t in zip(abs_nets, totals)]
+        # 资金强度：仅统计净流入板块，流出板块资金分为0
+        pos_nets = [max(0, n) for n in nets_raw]  # 流出→0
+        intensities = [abs(n) / t if t > 0 else 0 for n, t in zip(nets_raw, totals)]
 
-        norm_nets = _norm(abs_nets)
-        norm_changes = _norm([abs(float(c)) for c in changes_raw])
+        norm_nets = _norm(pos_nets)
+        norm_changes = _norm([max(0, float(c)) for c in changes_raw])  # 下跌板块涨幅分为0
         norm_intensity = _norm(intensities)
 
-        # 4. 复合评分：资金强度40% + 涨跌幅35% + 资金方向一致性25%
+        # 4. 复合评分：资金强度40% + 涨跌幅35% + 集中度25%。流出/下跌板块天然低分
         results = []
         for i, s in enumerate(sectors):
-            net = s["净额(亿)"]
-            direction_bonus = 1.0 if net > 0 else 0.6  # 流入加分，流出打折
-            score = (norm_nets[i] * 0.40 + norm_changes[i] * 0.35 + norm_intensity[i] * 0.25) * direction_bonus
+            net = nets_raw[i]
+            score = (norm_nets[i] * 0.40 + norm_changes[i] * 0.35 + norm_intensity[i] * 0.25)
             score = round(score * mood_mult, 1)
 
             # 温度计
@@ -1763,8 +1763,8 @@ def get_sector_momentum(top_n: int = 15) -> dict:
             else:             temp = "❄️观望"
 
             # 逻辑简述
-            direction = "流入" if net > 0 else "流出"
-            logic = f"主力{direction}{abs(net):.1f}亿, 涨跌幅{float(changes_raw[i]):+.2f}%"
+            direction = "净流入" if net > 0 else "净流出"
+            logic = f"{direction}{abs(net):.1f}亿, 涨跌幅{float(changes_raw[i]):+.2f}%"
             if intensities[i] > 0.5:
                 logic += ", 资金高度集中"
 
@@ -1774,9 +1774,10 @@ def get_sector_momentum(top_n: int = 15) -> dict:
                 "总成交(亿)": round(totals[i], 1), "逻辑": logic,
             })
 
-        # 按动量分数排序
+        # 按动量分数排序，仅保留净流入板块（主力真正在买的）
         results.sort(key=lambda x: x["动量分数"], reverse=True)
-        return {"板块数量": len(results), "列表": results[:top_n],
+        inflow_only = [r for r in results if r["净流入(亿)"] > 0]
+        return {"板块数量": len(inflow_only), "列表": inflow_only[:top_n],
                 "市场情绪": f"{'偏乐观' if mood_mult > 1 else '偏悲观' if mood_mult < 1 else '中性'}(上涨比{up_ratio:.0f}%)",
                 "更新时间": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
