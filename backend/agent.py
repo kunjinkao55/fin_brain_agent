@@ -179,11 +179,11 @@ def limit_up_pool(top_n: int = 30) -> str:
 
 @tool
 def place_order(action: str, symbol: str, shares: int = 0, price: float = None,
-                pct: float = 0) -> str:
-    """模拟盘下单。action:'buy'/'sell'/'reset', symbol:股票代码, shares:股数(sell时-1=全仓),
-       pct:按百分比买入(>0时忽略shares), reset用: action='reset', symbol='1000000'(初始资金)"""
+                pct: float = 0, account: str = "default") -> str:
+    """模拟盘下单。account:账户名(default/value_strategy等), action:'buy'/'sell'/'reset',
+       symbol:股票代码, shares:股数(sell时-1=全仓), pct:按百分比买入"""
     from backend.portfolio import get_portfolio
-    pf = get_portfolio()
+    pf = get_portfolio(account)
     if action.lower() == "reset":
         cash = float(symbol) if symbol.replace(".","").isdigit() else None
         result = pf.reset(cash)
@@ -202,10 +202,17 @@ def place_order(action: str, symbol: str, shares: int = 0, price: float = None,
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 @tool
-def show_portfolio(dummy: str = "") -> str:
-    """查看模拟盘持仓和盈亏总览。"""
-    from backend.portfolio import get_portfolio
-    pf = get_portfolio()
+def show_portfolio(account: str = "default") -> str:
+    """查看模拟盘持仓和盈亏总览。account:账户名(默认default)，传空字符串列出所有账户。"""
+    from backend.portfolio import get_portfolio, list_accounts as _la
+    if not account or account.strip() == "":
+        accts = _la()
+        if not accts: return "无模拟盘账户"
+        lines = ["=" * 64, "  所有模拟盘账户", "=" * 64, ""]
+        for a in accts:
+            lines.append(f"  {a['name']}: 现金{a['cash']:,.0f} | 持仓{a['positions']}只 | 总资产{a.get('total_value',a['cash']):,.0f}")
+        return "\n".join(lines)
+    pf = get_portfolio(account)
     data = pf.summary()
     lines = ["=" * 64, "  FinBrain 模拟盘", "=" * 64, ""]
     lines.append(f"  初始资金: {data['初始资金']:>12,.0f}")
@@ -237,10 +244,10 @@ def trade_history(n: int = 10) -> str:
 
 
 @tool
-def execute_analysis(action: str = "buy", symbol: str = "", pct: float = 5) -> str:
-    """一键执行分析建议下单。action:'buy'/'sell', symbol:股票代码, pct:仓位百分比(默认5%)"""
+def execute_analysis(action: str = "buy", symbol: str = "", pct: float = 5, account: str = "default") -> str:
+    """一键执行分析建议下单。account:账户名(如default/value_strategy), action:'buy'/'sell', symbol:股票代码, pct:仓位百分比"""
     from backend.portfolio import get_portfolio
-    pf = get_portfolio()
+    pf = get_portfolio(account)
     if not symbol:
         return json.dumps({"error":"请指定股票代码"}, ensure_ascii=False)
     if action == "buy":

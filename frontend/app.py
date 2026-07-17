@@ -79,7 +79,7 @@ with st.sidebar:
     st.markdown("### FinBrain")
     st.caption("AI-Powered Investment Research")
     st.divider()
-    page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Knowledge", "Evaluation", "Settings"], label_visibility="collapsed")
+    page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Knowledge", "Evaluation", "Backtest", "Settings"], label_visibility="collapsed")
     st.divider()
     # 会话持久化（LangGraph SqliteSaver + Streamlit session_state）
     import uuid
@@ -368,7 +368,7 @@ if page == "Chat":
             if is_assistant and ("====" in content[:200] or "[投资决策]" in content[:500]):
                 wrapped = []
                 for line in content.split("\n"):
-                    while len(line) > 40:
+                    while len(line) > 60:
                         wrapped.append(line[:40])
                         line = line[40:]
                     wrapped.append(line)
@@ -482,8 +482,11 @@ if page == "Chat":
 # ========== Portfolio ==========
 elif page == "Portfolio":
     st.header("Portfolio Management")
-    from backend.portfolio import get_portfolio
-    pf = get_portfolio(); d = pf.summary()
+    from backend.portfolio import get_portfolio, list_accounts, delete_account
+    accounts = list_accounts()
+    acc_names = [a["name"] for a in accounts] if accounts else ["default"]
+    cur_acc = st.selectbox("账户", acc_names, key="pf_account")
+    pf = get_portfolio(cur_acc); d = pf.summary()
     c1,c2,c3,c4 = st.columns(4)
     with c1: st.markdown(f'<div class="card"><div class="title">Cash</div><div class="value">{d["现金"]:,.0f}</div></div>', unsafe_allow_html=True)
     with c2: st.markdown(f'<div class="card"><div class="title">Positions</div><div class="value">{d["持仓市值"]:,.0f}</div></div>', unsafe_allow_html=True)
@@ -603,7 +606,7 @@ elif page == "Analysis":
                                     st.caption(f"  Audit: {step.get('audit_retries',0)}/{step.get('max_retries',3)} retries | Precheck: {step.get('code_precheck','?')}")
                     wrapped = []
                     for line in reply.split("\n"):
-                        while len(line) > 40:
+                        while len(line) > 60:
                             wrapped.append(line[:40])
                             line = line[40:]
                         wrapped.append(line)
@@ -805,6 +808,88 @@ elif page == "Evaluation":
                 for r in results:
                     if r.get("原始分数"):
                         st.caption(f"{r['代码']}: {r['原始分数']}")
+
+# ========== Backtest ==========
+elif page == "Backtest":
+    st.header("Backtest Engine")
+    st.caption("用历史K线回测分析报告的交易建议。纯代码，不调LLM。")
+
+    from backend.backtest import extract_signal, run_backtest, batch_backtest
+    from backend.portfolio import list_accounts as _list_accts, delete_account as _del_acct, Portfolio
+
+    tab1, tab2 = st.tabs(["单报告回测", "批量回测 + 账户管理"])
+
+    with tab1:
+        st.subheader("粘贴报告文本")
+        report_text = st.text_area("报告内容", height=300, placeholder="粘贴 FinBrain 生成的完整报告...",
+                                   key="bt_report")
+        lookback = st.slider("回看天数", 30, 365, 180, key="bt_lookback")
+        if st.button("Run Backtest", type="primary", key="bt_run") and report_text.strip():
+            signal = extract_signal(report_text)
+            if signal:
+                st.json(signal)
+                result = run_backtest(signal, lookback)
+                if "error" in result:
+                    st.error(result["error"])
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    with c1: st.metric("触发", "✅" if result["triggered"] else "❌")
+                    with c2: st.metric("收益率", f"{result['return_pct']:+.1f}%")
+                    with c3: st.metric("持仓天数", result["holding_days"])
+                    st.caption(f"入场: {result['entry_date']} @ {result['entry_price']} | "
+                               f"出场: {result['exit_date']} @ {result['exit_price']} | "
+                               f"原因: {result['exit_reason']}")
+            else:
+                st.warning("未能从报告中提取交易信号（建仓价/止损/目标价）")
+
+    with tab2:
+        st.subheader("批量回测")
+        reports_input = st.text_area("多份报告（每份用---分隔）", height=200,
+                                     placeholder="报告1\n---\n报告2\n---\n报告3",
+                                     key="bt_batch")
+        if st.button("Batch Backtest", type="primary", key="bt_batch_run") and reports_input.strip():
+            reports = [r.strip() for r in reports_input.split("---") if r.strip()]
+            summary = batch_backtest(reports, lookback)
+            if "error" in summary:
+                st.warning(summary["error"])
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                with c1: st.metric("总信号", summary["总信号数"])
+                with c2: st.metric("触发率", f"{summary['触发数']}/{summary['总信号数']}")
+                with c3: st.metric("胜率", f"{summary['胜率']}%")
+                with c4: st.metric("平均收益", f"{summary['平均收益']:+.1f}%")
+                c1, c2, c3 = st.columns(3)
+                with c1: st.metric("最大收益", f"{summary['最大收益']:+.1f}%")
+                with c2: st.metric("最大亏损", f"{summary['最大亏损']:+.1f}%")
+                with c3: st.metric("盈亏比", f"{summary['胜数']}:{summary['败数']}")
+                with st.expander("明细", expanded=False):
+                    st.dataframe(summary["明细"], use_container_width=True)
+
+        st.divider()
+        st.subheader("模拟账户管理")
+        accounts = _list_accts()
+        acc_names = [a["name"] for a in accounts]
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            new_acc = st.text_input("新建账户", placeholder="value_strategy", key="bt_new_acc")
+        with c2:
+            if st.button("创建", key="bt_create") and new_acc.strip():
+                Portfolio(new_acc.strip())
+                st.rerun()
+        with c3:
+            del_acc = st.selectbox("删除", [""] + acc_names, key="bt_del_acc")
+            if st.button("确认删除", key="bt_del_btn") and del_acc:
+                _del_acct(del_acc)
+                st.rerun()
+
+        if accounts:
+            st.caption(f"共 {len(accounts)} 个账户")
+            for a in accounts:
+                tv = a.get("total_value", a.get("cash", 0))
+                pnl = tv - a.get("initial_cash", tv)
+                st.caption(f"{a['name']}: 现金{a.get('cash',0):,.0f} | "
+                           f"持仓{a.get('positions',0)}只 | 总资产{tv:,.0f} | "
+                           f"盈亏{pnl:+,.0f}")
 
 # ========== Settings ==========
 elif page == "Settings":
