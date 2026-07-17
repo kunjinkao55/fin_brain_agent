@@ -804,6 +804,11 @@ def format_report(analysis: dict) -> str:
             lines.append("")
             lines.append(f"  [估值方法] {val_method}")
 
+        # 估值框架（Valuation Agent 输出）
+        val_framework = analysis.get("估值框架", "")
+        if val_framework:
+            lines.append(f"  [估值框架] {val_framework}")
+
         # 估值明细（代码计算链，透明化）
         val_chain = rating.get("估值明细", {}) if isinstance(rating, dict) else {}
         if val_chain and val_chain.get("公式"):
@@ -812,6 +817,8 @@ def format_report(analysis: dict) -> str:
                          f"财务质量乘数={val_chain.get('财务质量乘数','?')} | "
                          f"成长溢价={val_chain.get('成长溢价','?')} | "
                          f"EPS(TTM)={val_chain.get('EPS(TTM)','?')}元")
+            if val_chain.get("前瞻说明"):
+                lines.append(f"    ⚠️ {val_chain['前瞻说明']}")
 
         # === 第二部分：公司画像和竞争优势 ===
         profile = analysis.get("公司画像", {})

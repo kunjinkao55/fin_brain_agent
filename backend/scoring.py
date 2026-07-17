@@ -133,7 +133,7 @@ def compute_investment_rating(
     elif weighted >= 55: confidence = "B (中)"
     else: confidence = "C (低)"
 
-    # 估值计算链（透明化：让使用者看到合理价值是怎么算出来的）
+    # 估值计算链（透明化）+ 前瞻敏感性
     _eps_display = round(eps, 2) if eps else 0
     valuation_chain = {
         "EPS(TTM)": _eps_display,
@@ -143,6 +143,18 @@ def compute_investment_rating(
         "最终PE": round(fair_pe, 1),
         "公式": f"{_eps_display} × {ind_pe} × {quality_mult} × {growth_pe_mult} = {fair_value}",
     }
+    # 前瞻敏感性：若EPS回到正常水平，合理价值会是多少
+    if eps > 0 and _eps_display > 0:
+        _eps_2x = round(_eps_display * 2, 2)
+        _eps_3x = round(_eps_display * 3, 2)
+        _fv_2x = round(_eps_2x * fair_pe, 2)
+        _fv_3x = round(_eps_3x * fair_pe, 2)
+        valuation_chain["前瞻说明"] = (
+            f"以上基于TTM EPS {_eps_display}元（历史利润）。"
+            f"若利润恢复至{_eps_2x}元(2×当前)，合理价值≈{_fv_2x}元；"
+            f"若利润恢复至{_eps_3x}元(3×当前)，合理价值≈{_fv_3x}元。"
+            f"当前估值对盈利复苏极度敏感——利润翻倍则合理价值翻倍。"
+        )
 
     return {
         "评级": rating,

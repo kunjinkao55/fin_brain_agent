@@ -79,7 +79,7 @@ with st.sidebar:
     st.markdown("### FinBrain")
     st.caption("AI-Powered Investment Research")
     st.divider()
-    page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Knowledge", "Settings"], label_visibility="collapsed")
+    page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Knowledge", "Evaluation", "Settings"], label_visibility="collapsed")
     st.divider()
     # 会话持久化（LangGraph SqliteSaver + Streamlit session_state）
     import uuid
@@ -119,9 +119,9 @@ class StreamHandler(BaseCallbackHandler):
         self.placeholder.text(self.tokens)
 
 
-def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str]:
-    """返回 (回复文本, 工具调用记录列表, 流式生成过程文本)。
-    如果 stream_placeholder 不为空，流式输出到该占位符，同时保存过程文本。
+def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str, list]:
+    """返回 (回复文本, 工具调用记录列表, 流式生成过程文本, 执行Trace)。
+    Trace格式: [{"phase": "Data", "summary": "...", "detail": "..."}, ...]
     """
     agents = get_agents()
     msgs = _to_lc(st.session_state.chat_history) + [{"role": "user", "content": user_input}]
@@ -142,27 +142,25 @@ def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str]
         if auto == "analysis": mode = "Deep Analysis"
         elif auto == "phantom": mode = "Phantom Hunter"
 
+    trace = []
     if mode == "Phantom Hunter":
         reply = agents["phantom"].invoke({"messages": msgs}, config=cfg)["messages"][-1].content
+        trace = [{"phase": "Phantom", "summary": "妖股猎人生成完成", "detail": reply[:500]}]
     elif mode == "Deep Analysis":
         r = agents["graph"].invoke({"messages": msgs, "user_question": user_input,
                                      "collected_data":"", "analysis":"", "report":"",
                                      "processing_log": []}, config=cfg)
         reply = r.get("report")
         if not reply:
-            # 回退：用 analysis JSON 格式化
             raw = r.get("analysis","")
             if raw.strip():
                 reply = f"[流水线未生成报告，以下是原始分析摘要]\n\n{raw[:2000]}"
             else:
                 reply = "[流水线执行失败，请重试或切换到闲聊模式]"
-        proc_log = r.get("processing_log", [])
-        if proc_log and stream_placeholder is None:
-            with st.expander("Pipeline: Data -> Analysis -> Report", expanded=False):
-                for step in proc_log:
-                    st.caption(f"[{step.get('phase','?')}] {step.get('summary','')}")
+        trace = r.get("processing_log", [])
     else:
         reply = agents["chat"].invoke({"messages": msgs}, config=cfg)["messages"][-1].content
+        trace = [{"phase": "Chat", "summary": "ReAct对话完成", "detail": reply[:500]}]
 
     # 追加工具调用痕迹到回复（Deep Analysis 报告已有 [调用证据]，仅 Chat/Phantom 追加）
     if mode != "Deep Analysis" and tracker.records:
@@ -177,7 +175,7 @@ def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str]
                 reply += f"\n\n[调用证据] 工具: {', '.join(tool_names)}"
 
     stream_text = stream_handler.tokens if stream_handler else ""
-    return reply, tracker.records, stream_text
+    return reply, tracker.records, stream_text, trace
 
 
 # ========== Market ==========
@@ -304,15 +302,70 @@ if page == "Chat":
     # ---- 对话历史 ----
     history = st.session_state.chat_history
     last_stream = st.session_state.get("_last_stream", "")
+    last_trace = st.session_state.get("_last_trace", [])
     for i, msg in enumerate(history):
         is_last = (i == len(history) - 1)
         is_assistant = (msg["role"] == "assistant")
         with st.chat_message(msg["role"]):
-            # 最后一条 assistant 消息：流式生成过程折叠在报告顶部
+            # 最后一条 assistant 消息：结构化 Execution Trace
+            if is_last and is_assistant and last_trace:
+                with st.expander("Execution Trace", expanded=False):
+                    _icons2 = {"Data": "📡", "Analysis": "🧠", "Valuation": "📊", "Critic": "🔍", "Report": "📝"}
+                    _status_colors = {"SUCCESS": "#2e7d32", "WARNING": "#e69500", "PARTIAL": "#cc6600"}
+                    for step in last_trace:
+                        phase = step.get("phase", "?")
+                        icon = _icons.get(phase, "⚙️")
+                        status = step.get("status", "SUCCESS")
+                        sc = _status_colors.get(status, "#666")
+                        summary = step.get("summary", "")
+                        detail = step.get("detail", "")
+                        # Header
+                        st.markdown(f"**{icon} {phase}** — <span style='color:{sc}'>{status}</span> | {summary}", unsafe_allow_html=True)
+                        # Rich details per phase
+                        if phase == "Data":
+                            lat = step.get("latency_ms", 0)
+                            syms = step.get("symbols", [])
+                            errs = step.get("errors", 0)
+                            actions = step.get("actions", [])
+                            st.caption(f"Latency: {lat}ms | Symbols: {len(syms)} | Errors: {errs}")
+                            if actions:
+                                _done = [a for a in actions if a["status"] == "✅"]
+                                _fail = [a for a in actions if a["status"] != "✅"]
+                                st.caption("Actions: " + ", ".join(f"{'✅' if a['status']=='✅' else '❌'}{a['tool']}" for a in actions[:10]))
+                        elif phase == "Analysis":
+                            chars = step.get("output_chars", 0)
+                            rags = step.get("rag_calls", [])
+                            st.caption(f"Output: {chars} chars | RAG: {'; '.join(rags[:3]) if rags else '无'}")
+                        elif phase == "Valuation":
+                            stage = step.get("stage", "?")
+                            frameworks = step.get("frameworks", [])
+                            ref = step.get("reference", {})
+                            st.caption(f"Stage: {stage} | Frameworks: {', '.join(frameworks[:4])}")
+                            if ref:
+                                st.caption("Reference: " + " | ".join(f"{k}:{v}" for k, v in list(ref.items())[:3]))
+                        elif phase == "Critic":
+                            findings = step.get("findings", {})
+                            conf = step.get("confidence", "?")
+                            decision = step.get("decision", "?")
+                            st.caption(f"Findings: 逻辑{findings.get('逻辑漏洞',0)} | 过度乐观{findings.get('过度乐观',0)} | 遗漏风险{findings.get('遗漏风险',0)} | 置信度:{conf} | 决策:{decision}")
+                            if detail:
+                                st.caption(detail.replace("\n", " | ")[:250])
+                        elif phase == "Report":
+                            chars = step.get("output_chars", 0)
+                            retries = step.get("audit_retries", 0)
+                            max_r = step.get("max_retries", 3)
+                            precheck = step.get("code_precheck", "?")
+                            st.caption(f"Output: {chars} chars | Audit: {retries}/{max_r} retries | Code precheck: {precheck}")
+                        st.divider()
             if is_last and is_assistant and last_stream:
                 with st.expander("Generation trace", expanded=False):
-                    st.caption(last_stream[:5000])
-            st.text(msg["content"])
+                    st.caption(last_stream[:10000] if len(last_stream) > 10000 else last_stream)
+            # 报告：用等宽代码块渲染保留对齐；普通消息：直接文本
+            content = msg["content"]
+            if is_assistant and ("====" in content[:200] or "[投资决策]" in content[:500]):
+                st.code(content, language=None, line_numbers=False)
+            else:
+                st.text(content)
 
     # ---- 底部留白（防止内容被固定输入栏遮挡） ----
     st.markdown('<div style="height:90px"></div>', unsafe_allow_html=True)
@@ -403,7 +456,7 @@ if page == "Chat":
             with st.expander("Generating... (streaming)", expanded=True):
                 stream_box = st.empty()
             try:
-                reply, tool_logs, stream_text = run_agent(prompt, stream_placeholder=stream_box)
+                reply, tool_logs, stream_text, trace = run_agent(prompt, stream_placeholder=stream_box)
             except Exception as e:
                 reply = f"[Error] {e}"
                 stream_box.text(reply)
@@ -411,6 +464,7 @@ if page == "Chat":
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
         st.session_state["_last_stream"] = stream_text  # 保存流式生成过程
+        st.session_state["_last_trace"] = trace  # 保存执行Trace
         st.rerun()
 
 
@@ -520,7 +574,22 @@ elif page == "Analysis":
                                f"财报数据仍使用 financial_statements 和 valuation 工具。")
             with st.spinner(f"Analyzing {resolved_name}... (20-40s)"):
                 try:
-                    reply, _, _ = run_agent(instruction)
+                    reply, _, _, trace = run_agent(instruction)
+                    if trace:
+                        with st.expander("Execution Trace", expanded=False):
+                            _icons2 = {"Data": "📡", "Analysis": "🧠", "Valuation": "📊", "Critic": "🔍", "Report": "📝"}
+                            for step in trace:
+                                icon = _icons.get(step.get("phase", "?"), "⚙️")
+                                status = step.get("status", "SUCCESS")
+                                summary = step.get("summary", "")
+                                st.caption(f"{icon} **{step.get('phase','?')}** [{status}]: {summary}")
+                                if step.get("phase") == "Data":
+                                    st.caption(f"  Latency: {step.get('latency_ms',0)}ms | Errors: {step.get('errors',0)}")
+                                elif step.get("phase") == "Critic":
+                                    f = step.get("findings", {})
+                                    st.caption(f"  逻辑:{f.get('逻辑漏洞',0)} 过度乐观:{f.get('过度乐观',0)} 遗漏:{f.get('遗漏风险',0)} | 置信度:{step.get('confidence','?')}")
+                                elif step.get("phase") == "Report":
+                                    st.caption(f"  Audit: {step.get('audit_retries',0)}/{step.get('max_retries',3)} retries | Precheck: {step.get('code_precheck','?')}")
                     st.html(f'<div class="report-block"><pre>{reply}</pre></div>')
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -657,6 +726,68 @@ elif page == "Knowledge":
                         st.info(f"No results found in '{search_kb_sel}'")
                 except Exception as e:
                     st.error(f"Search failed: {e}")
+
+# ========== Evaluation ==========
+elif page == "Evaluation":
+    st.header("Agent Evaluation")
+    st.caption("量化评估 Agent 输出的稳定性、完整性和可靠性。不评估投资建议准确性——那是回测的事。")
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        n_stocks = st.number_input("测试股票数量", min_value=1, max_value=10, value=2, key="eval_n")
+    with c2:
+        n_runs = st.number_input("每只运行次数", min_value=1, max_value=100, value=5, key="eval_runs")
+
+    symbols = []
+    cols = st.columns(min(n_stocks, 5))
+    for i in range(n_stocks):
+        with cols[i % 5]:
+            s = st.text_input(f"股票{i+1}", placeholder="600584", key=f"eval_sym_{i}")
+            if s.strip(): symbols.append(s.strip())
+
+    if st.button("Run Evaluation", type="primary", disabled=len(symbols)==0, use_container_width=True):
+        from backend.evaluation import evaluate_stock
+        results = []
+        progress = st.progress(0)
+        total = len(symbols)
+        for idx, sym in enumerate(symbols):
+            st.caption(f"Evaluating {sym} ({n_runs} runs)...")
+            r = evaluate_stock(sym, int(n_runs))
+            results.append(r)
+            progress.progress((idx + 1) / total)
+        progress.empty()
+
+        if results:
+            st.divider()
+            st.subheader("Results")
+            # Summary table
+            st.dataframe(
+                [{k: v for k, v in r.items() if k != "原始分数"} for r in results],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "代码": st.column_config.TextColumn("Stock", width="small"),
+                    "评分一致性": st.column_config.ProgressColumn("Score Consistency", format="%.0f%%", min_value=0, max_value=100),
+                    "字段完整率": st.column_config.ProgressColumn("Field Completeness", format="%.0f%%", min_value=0, max_value=100),
+                    "工具成功率": st.column_config.ProgressColumn("Tool Success", format="%.0f%%", min_value=0, max_value=100),
+                    "评分标准差": st.column_config.NumberColumn("Score StdDev", format="%.2f"),
+                    "平均延迟_ms": st.column_config.NumberColumn("Avg Latency(ms)", format="%.0f"),
+                }
+            )
+            # Overall metrics
+            avg_cons = sum(r["评分一致性"] for r in results) / len(results)
+            avg_field = sum(r["字段完整率"] for r in results) / len(results)
+            avg_tool = sum(r["工具成功率"] for r in results) / len(results)
+            total_errs = sum(r["错误次数"] for r in results)
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.metric("Score Consistency", f"{avg_cons:.0f}%")
+            with c2: st.metric("Field Completeness", f"{avg_field:.0f}%")
+            with c3: st.metric("Tool Success", f"{avg_tool:.0f}%")
+            with c4: st.metric("Total Errors", total_errs)
+            # Score distribution
+            with st.expander("Score Distribution", expanded=False):
+                for r in results:
+                    if r.get("原始分数"):
+                        st.caption(f"{r['代码']}: {r['原始分数']}")
 
 # ========== Settings ==========
 elif page == "Settings":
