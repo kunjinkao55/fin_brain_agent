@@ -1,20 +1,56 @@
 """
-FinBrain 模拟盘模块 — JSON持久化。支持市价/限价/百分比仓位/一键重置。
+FinBrain 模拟盘模块 — 多账户 JSON 持久化。支持市价/限价/百分比仓位/一键重置。
 """
 
-import json, os, threading
+import json, os, threading, glob, re
 from datetime import datetime
 
-PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
-
-# 默认资金（可通过 .env PORTFOLIO_CASH 覆盖）
+BASE_DIR = os.path.dirname(__file__)
 DEFAULT_CASH = float(os.getenv("PORTFOLIO_CASH", "1000000"))
-LOT_SIZE = 100  # A股整手
+LOT_SIZE = 100
+
+
+def _account_file(name: str) -> str:
+    safe = re.sub(r'[^a-zA-Z0-9_一-鿿-]', '_', name)
+    return os.path.join(BASE_DIR, f"portfolio_{safe}.json")
+
+
+def list_accounts() -> list:
+    """列出所有模拟盘账户"""
+    accounts = []
+    for f in glob.glob(os.path.join(BASE_DIR, "portfolio_*.json")):
+        base = os.path.basename(f)
+        name = base[len("portfolio_"):-len(".json")]
+        try:
+            with open(f, "r") as fp:
+                d = json.load(fp)
+            accounts.append({"name": name, "cash": d.get("cash", 0),
+                             "initial_cash": d.get("initial_cash", 0),
+                             "positions": len(d.get("positions", {})),
+                             "total_value": d.get("cash", 0) + sum(
+                                 p.get("market_value", 0) for p in d.get("positions", {}).values())})
+        except Exception:
+            accounts.append({"name": name, "cash": 0, "error": True})
+    # 兼容旧版 portfolio.json → 迁移为 portfolio_default.json
+    old_file = os.path.join(BASE_DIR, "portfolio.json")
+    if os.path.exists(old_file) and not any(a["name"] == "default" for a in accounts):
+        os.rename(old_file, _account_file("default"))
+        accounts.insert(0, {"name": "default", "cash": 0, "initial_cash": DEFAULT_CASH, "positions": 0})
+    return accounts
+
+
+def delete_account(name: str) -> bool:
+    f = _account_file(name)
+    if os.path.exists(f):
+        os.remove(f)
+        return True
+    return False
 
 
 class Portfolio:
-    def __init__(self):
-        self.file = PORTFOLIO_FILE
+    def __init__(self, account_name: str = "default"):
+        self.account = account_name
+        self.file = _account_file(account_name)
         self._lock = threading.Lock()
         if os.path.exists(self.file):
             self._load()
@@ -216,8 +252,12 @@ class Portfolio:
 _portfolio = None
 
 
-def get_portfolio() -> Portfolio:
-    global _portfolio
-    if _portfolio is None:
-        _portfolio = Portfolio()
-    return _portfolio
+def get_portfolio(account: str = "default") -> Portfolio:
+    """获取指定账户的模拟盘（按账户名缓存）。"""
+    global _portfolio_cache
+    if account not in _portfolio_cache:
+        _portfolio_cache[account] = Portfolio(account)
+    return _portfolio_cache[account]
+
+
+_portfolio_cache: dict[str, Portfolio] = {}
