@@ -363,10 +363,16 @@ if page == "Chat":
             if is_last and is_assistant and last_stream:
                 with st.expander("Generation trace", expanded=False):
                     st.caption(last_stream[:10000] if len(last_stream) > 10000 else last_stream)
-            # 报告：用等宽代码块渲染保留对齐；普通消息：直接文本
+            # 报告：每行最多40字，超出自动换行
             content = msg["content"]
             if is_assistant and ("====" in content[:200] or "[投资决策]" in content[:500]):
-                st.code(content, language=None, line_numbers=False)
+                wrapped = []
+                for line in content.split("\n"):
+                    while len(line) > 40:
+                        wrapped.append(line[:40])
+                        line = line[40:]
+                    wrapped.append(line)
+                st.code("\n".join(wrapped), language=None, line_numbers=False)
             else:
                 st.text(content)
 
@@ -593,7 +599,13 @@ elif page == "Analysis":
                                     st.caption(f"  逻辑:{f.get('逻辑漏洞',0)} 过度乐观:{f.get('过度乐观',0)} 遗漏:{f.get('遗漏风险',0)} | 置信度:{step.get('confidence','?')}")
                                 elif step.get("phase") == "Report":
                                     st.caption(f"  Audit: {step.get('audit_retries',0)}/{step.get('max_retries',3)} retries | Precheck: {step.get('code_precheck','?')}")
-                    st.html(f'<div class="report-block"><pre>{reply}</pre></div>')
+                    wrapped = []
+                    for line in reply.split("\n"):
+                        while len(line) > 40:
+                            wrapped.append(line[:40])
+                            line = line[40:]
+                        wrapped.append(line)
+                    st.html(f'<div class="report-block"><pre>{"\n".join(wrapped)}</pre></div>')
                 except Exception as e:
                     st.error(f"Error: {e}")
                     st.info("Check API Key in Settings and restart.")
