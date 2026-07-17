@@ -8,6 +8,7 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(__file__)
 DEFAULT_CASH = float(os.getenv("PORTFOLIO_CASH", "1000000"))
 LOT_SIZE = 100
+_portfolio_cache: dict = {}  # 账户名 → Portfolio 实例缓存
 
 
 def _account_file(name: str) -> str:
@@ -43,6 +44,7 @@ def delete_account(name: str) -> bool:
     f = _account_file(name)
     if os.path.exists(f):
         os.remove(f)
+        _portfolio_cache.pop(name, None)  # 清缓存，否则同名重建时拿到旧对象
         return True
     return False
 
@@ -260,4 +262,3 @@ def get_portfolio(account: str = "default") -> Portfolio:
     return _portfolio_cache[account]
 
 
-_portfolio_cache: dict[str, Portfolio] = {}
