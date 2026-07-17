@@ -788,7 +788,11 @@ def format_report(analysis: dict) -> str:
             weighted = rating.get("加权总分", "")
             conf = rating.get("置信度", "")
             level_icon = {"BUY": "🟢", "HOLD": "🟡", "SELL": "🔴"}.get(level, "⚪")
-            lines.append(f"  [投资决策] {level_icon} {level}  合理价值: {fair}  安全边际: {margin}")
+            has_divergence = bool(analysis.get("框架分歧", ""))
+            if has_divergence:
+                lines.append(f"  [投资决策] {level_icon} {level}(量化锚点) / 趋势框架→见下方分歧  合理价值: {fair}  安全边际: {margin}")
+            else:
+                lines.append(f"  [投资决策] {level_icon} {level}  合理价值: {fair}  安全边际: {margin}")
             if gap: lines.append(f"    估值差距: {gap}")
             lines.append(f"    安全买入价: {buy_zone}  (需{rating.get('安全边际要求','?')}安全边际)")
             if weighted: lines.append(f"    加权总分: {weighted}/100  置信度: {conf}")

@@ -119,16 +119,18 @@ class StreamHandler(BaseCallbackHandler):
         self.placeholder.text(self.tokens)
 
 
-def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list]:
-    """返回 (回复文本, 工具调用记录列表)。
-    如果 stream_placeholder 不为空，流式输出到该占位符。
+def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str]:
+    """返回 (回复文本, 工具调用记录列表, 流式生成过程文本)。
+    如果 stream_placeholder 不为空，流式输出到该占位符，同时保存过程文本。
     """
     agents = get_agents()
     msgs = _to_lc(st.session_state.chat_history) + [{"role": "user", "content": user_input}]
     tracker = ToolCallTracker()
     callbacks = [tracker]
+    stream_handler = None
     if stream_placeholder is not None:
-        callbacks.append(StreamHandler(stream_placeholder))
+        stream_handler = StreamHandler(stream_placeholder)
+        callbacks.append(stream_handler)
     cfg = {
         "configurable": {"thread_id": st.session_state.thread_id},
         "callbacks": callbacks,
@@ -162,7 +164,20 @@ def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list]:
     else:
         reply = agents["chat"].invoke({"messages": msgs}, config=cfg)["messages"][-1].content
 
-    return reply, tracker.records
+    # 追加工具调用痕迹到回复（Deep Analysis 报告已有 [调用证据]，仅 Chat/Phantom 追加）
+    if mode != "Deep Analysis" and tracker.records:
+        tool_names = list(set(r.get("tool_name", "?") for r in tracker.records[:20]))
+        if tool_names:
+            reply += f"\n\n[调用证据] 工具: {', '.join(tool_names)}"
+    elif mode == "Deep Analysis" and tracker.records:
+        # Deep Analysis 报告内已有 [调用证据]，但如果缺失则补上
+        if "[调用证据]" not in str(reply):
+            tool_names = list(set(r.get("tool_name", "?") for r in tracker.records[:20]))
+            if tool_names:
+                reply += f"\n\n[调用证据] 工具: {', '.join(tool_names)}"
+
+    stream_text = stream_handler.tokens if stream_handler else ""
+    return reply, tracker.records, stream_text
 
 
 # ========== Market ==========
@@ -261,19 +276,18 @@ if page == "Market":
 if page == "Chat":
     st.header("AI Chat")
 
-    # ---- 对话历史（最后的 assistant 消息如果是流式输出的，放在可折叠区内） ----
+    # ---- 对话历史 ----
     history = st.session_state.chat_history
     last_stream = st.session_state.get("_last_stream", "")
     for i, msg in enumerate(history):
         is_last = (i == len(history) - 1)
         is_assistant = (msg["role"] == "assistant")
-        is_streamed = is_last and is_assistant and last_stream and msg["content"] == last_stream
         with st.chat_message(msg["role"]):
-            if is_streamed:
-                with st.expander("Response (click to expand)", expanded=True):
-                    st.text(msg["content"])
-            else:
-                st.text(msg["content"])
+            # 最后一条 assistant 消息：流式生成过程折叠在报告顶部
+            if is_last and is_assistant and last_stream:
+                with st.expander("Generation trace", expanded=False):
+                    st.caption(last_stream[:5000])
+            st.text(msg["content"])
 
     # ---- 底部留白（防止内容被固定输入栏遮挡） ----
     st.markdown('<div style="height:90px"></div>', unsafe_allow_html=True)
@@ -364,14 +378,14 @@ if page == "Chat":
             with st.expander("Generating... (streaming)", expanded=True):
                 stream_box = st.empty()
             try:
-                reply, tool_logs = run_agent(prompt, stream_placeholder=stream_box)
+                reply, tool_logs, stream_text = run_agent(prompt, stream_placeholder=stream_box)
             except Exception as e:
                 reply = f"[Error] {e}"
                 stream_box.text(reply)
 
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
-        st.session_state["_last_stream"] = reply  # 保存流式文本供折叠查看
+        st.session_state["_last_stream"] = stream_text  # 保存流式生成过程
         st.rerun()
 
 
@@ -481,7 +495,7 @@ elif page == "Analysis":
                                f"财报数据仍使用 financial_statements 和 valuation 工具。")
             with st.spinner(f"Analyzing {resolved_name}... (20-40s)"):
                 try:
-                    reply, _ = run_agent(instruction)
+                    reply, _, _ = run_agent(instruction)
                     st.html(f'<div class="report-block"><pre>{reply}</pre></div>')
                 except Exception as e:
                     st.error(f"Error: {e}")
