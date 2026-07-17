@@ -686,7 +686,19 @@ def data_collector_node(state: FinBrainState) -> dict:
     symbols = list(set(re.findall(r'(?<!\d)(\d{6})(?!\d)', question)))
 
     if not symbols:
-        # 回退到LLM搜集（用户没给具体代码时）
+        # 尝试从股票名称解析代码（如"分析长电科技"→"600584"）
+        try:
+            from backend.stock_map import fuzzy_search as _fuzzy
+            # 去除常见分析前缀/后缀，提高匹配率
+            _clean = re.sub(r'(分析|研究|评估|查看|查询|看看|帮我|请|一下|这个|这只|股票|报告)', '', question)
+            _matches = _fuzzy(_clean.strip(), limit=3) or _fuzzy(question, limit=3)
+            if _matches:
+                symbols = [m["代码"] for m in _matches if m.get("代码")]
+        except Exception:
+            pass
+
+    if not symbols:
+        # 回退到LLM搜集（用户没给具体代码且名称解析失败）
         collector = _get_collector()
         msgs = list(state.get("messages", []))
         msgs.append(HumanMessage(content=question))
@@ -742,10 +754,16 @@ def data_collector_node(state: FinBrainState) -> dict:
         r.get("行业", "") for r in results
         if isinstance(r, dict) and r.get("行业") and "error" not in r
     ))
-    # 汇总工具调用痕迹
+    # 注入 collected_data 头部，供 analyst_node 和 reporter 直接读取
+    if _industry_names:
+        collected = f'[INDUSTRY] {",".join(_industry_names)}\n' + collected
+    # 注入工具调用痕迹
     _all_tools = []
     for r in results:
         _all_tools.extend(r.get("_tools", []))
+    if _all_tools:
+        _tool_str = " ".join(f"{t}({s})" for t, s in _all_tools)
+        collected = f'[TOOLS] {_tool_str}\n' + collected
     return {
         "collected_data": collected,
         "processing_log": [{"phase": "Data", "summary": f"预取{len(symbols)}只 ({elapsed:.0f}ms, {len(errors)}错)",
@@ -768,13 +786,9 @@ def analyst_node(state: FinBrainState) -> dict:
         seed_trading_kb()
     except Exception:
         pass  # 播种失败不影响
-    # 从 data_collector 的 processing_log 中读取行业名（比正则解析 JSON 更可靠）
-    _pl = state.get("processing_log", [])
-    industry_names = []
-    for _entry in _pl:
-        if _entry.get("industries"):
-            industry_names = _entry["industries"]
-            break
+    # 从 collected_data 文本头部读取行业名（data_collector 注入的 [INDUSTRY] 标记）
+    _ind_match = re.match(r'\[INDUSTRY\]\s*([^\n]+)', collected)
+    industry_names = _ind_match.group(1).split(",") if _ind_match else []
     if not industry_names:
         # 回退：正则从 collected JSON 中提取
         industry_names = list(set(re.findall(r'"行业":\s*"([^"]+)"', collected)))
@@ -799,9 +813,12 @@ def analyst_node(state: FinBrainState) -> dict:
             f"每只股票独立评分。不输出数组=分析作废。"
         )
 
+    # 清理 collected_data 中的内部标记头，避免干扰 LLM
+    _clean_collected = re.sub(r'^\[INDUSTRY\][^\n]*\n', '', collected, flags=re.MULTILINE)
+    _clean_collected = re.sub(r'^\[TOOLS\][^\n]*\n', '', _clean_collected, flags=re.MULTILINE)
     prompt = (
         f"用户问题: {state['user_question']}\n\n"
-        f"=== 已搜集数据 ===\n{collected}\n"
+        f"=== 已搜集数据 ===\n{_clean_collected}\n"
         f"{industry_rag}"
         f"\n[任务] 基于以上数据和行业分析模板，撰写完整的分析报告JSON。"
         f"必须包含：公司画像、竞争优势、投资逻辑链、估值方法(说明该公司适用什么估值方法及理由)、"
@@ -1007,6 +1024,23 @@ def reporter_node(state: FinBrainState) -> dict:
             roe = float(latest_val.get("ROE(%)", 0) or 0)
             debt = float(latest_val.get("资产负债率(%)", 50) or 50)
             stock_price = float(price.get("price", 0) or 0) if isinstance(price, dict) else 0
+            # 多层兜底：若 fetch_stock_price 失败，从 item 已有数据提取
+            if stock_price <= 0:
+                try:
+                    _retry = fetch_stock_price(sym)
+                    if isinstance(_retry, dict) and not _retry.get("error"):
+                        stock_price = float(_retry.get("price", 0) or 0)
+                except: pass
+            if stock_price <= 0 and isinstance(item, dict):
+                # 从 item 估值水位提取
+                _vw = item.get("估值水位", {})
+                if isinstance(_vw, dict) and _vw.get("PE") and _vw.get("PB"):
+                    # 反推：EPS可以从估值明细获取
+                    pass  # PE/PB都有了但反推价格不可靠
+                # 从操作建议文本解析 "当前XX元"
+                _adv = str(item.get("操作建议", ""))
+                _pm = re.search(r'当前\s*([\d.]+)\s*元', _adv)
+                if _pm: stock_price = float(_pm.group(1))
             industry = ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else ""
 
             # 公司类型：LLM写在公司画像里，代码兜底
@@ -1037,6 +1071,7 @@ def reporter_node(state: FinBrainState) -> dict:
             )
             # 覆盖LLM——代码说了算
             # 估值水位强制覆盖（PE/PB/市值/前瞻PE — 代码统一，消除LLM矛盾）
+            pe_now = stock_price / eps_ttm if eps_ttm > 0 and stock_price > 0 else 0
             score_pe = item.get("评分", {}).get("估值合理", {}).get("依据", "")
             pe_match = re.search(r'PE\s*(\d+\.?\d*)', score_pe)
             pb_match = re.search(r'PB\s*(\d+\.?\d*)', score_pe)
@@ -1345,7 +1380,7 @@ def reporter_node(state: FinBrainState) -> dict:
                 r4 = item.get("投资评级", {}) if isinstance(item, dict) else {}
                 rating = str(r4.get("评级", ""))
                 fv = float(r4.get("合理价值", 0)) if isinstance(r4, dict) else 0
-                sp = float(r4.get("当前价格", stock_price)) if isinstance(r4, dict) and r4.get("当前价格") else stock_price
+                sp = stock_price  # 直接使用外层实际股价（r4.当前价格可能被稀释流程清空）
                 advice = str(item.get("操作建议", "")) if isinstance(item, dict) else ""
                 has_buy_plan = bool(re.search(r'[≤<=]\s*[\d.]+\s*元.*建仓|买入|仓位', advice))
 
@@ -1458,6 +1493,22 @@ def reporter_node(state: FinBrainState) -> dict:
                     )
                     if isinstance(item, dict):
                         item["框架分歧"] = div_note
+                        # 双框架执行状态：分开显示价值锚点和趋势锚点
+                        _bz_str = str(r4.get("买入区间", "")) if isinstance(r4, dict) else ""
+                        _bz_m = re.search(r'([\d.]+)', _bz_str)
+                        _v_buy = float(_bz_m.group(1)) if _bz_m else 0
+                        _t_buy = trend_buy  # from divergence extraction above
+                        _sp_actual = stock_price  # 外层作用域的实际股价
+                        if _v_buy > 0 and _t_buy > 0 and _t_buy > _v_buy * 1.5:
+                            _va_gap = (_sp_actual - _v_buy) / _v_buy * 100
+                            _tr_gap = (_sp_actual - _t_buy) / _t_buy * 100
+                            _tr_action = ("已进入建仓区" if _sp_actual <= _t_buy else
+                                         "需等待回调" if _tr_gap <= 30 else
+                                         "价格偏高，暂不建议建仓")
+                            item["执行状态"] = (
+                                f"[执行状态-A:价值框架] 安全买入价≤{_v_buy:.0f}元，当前价{_sp_actual:.0f}元(差距{_va_gap:.0f}%)\n"
+                                f"  [执行状态-B:趋势框架] 建仓价≤{_t_buy:.0f}元，当前价{_sp_actual:.0f}元(差距{_tr_gap:.0f}%)→{_tr_action}"
+                            )
             except: pass
         except Exception:
             pass  # 决策失败不阻塞报告
@@ -1714,14 +1765,25 @@ def reporter_node(state: FinBrainState) -> dict:
         except Exception:
             break
 
-    # === 调用证据：收集工具调用和RAG查询痕迹 ===
+    # === 调用证据：从 collected_data 文本头部 + processing_log 收集 ===
     _evidence_parts = []
+    # 工具痕迹（从 collected_data 的 [TOOLS] 头部读取，绕过 checkpointer 序列化问题）
+    _collected_raw = state.get("collected_data", "")
+    _tools_match = re.search(r'\[TOOLS\]\s*([^\n]+)', _collected_raw)
+    if _tools_match:
+        _evidence_parts.append(f"数据工具: {_tools_match.group(1)}")
+    else:
+        # 回退：从 processing_log 读取
+        for _pl in state.get("processing_log", []):
+            if _pl.get("tool_calls"):
+                _tool_summary = ", ".join(f"{t}({s})" for t, s in _pl["tool_calls"][:12])
+                _evidence_parts.append(f"数据工具: {_tool_summary}")
+                break
+    # RAG痕迹（从 processing_log 读取，analyst_node 写入）
     for _pl in state.get("processing_log", []):
-        if _pl.get("tool_calls"):
-            _tool_summary = ", ".join(f"{t}({s})" for t, s in _pl["tool_calls"][:12])
-            _evidence_parts.append(f"数据工具: {_tool_summary}")
         if _pl.get("rag_calls"):
             _evidence_parts.append(f"RAG知识库: {'; '.join(_pl['rag_calls'][:5])}")
+            break
     _evidence_text = ""
     if _evidence_parts:
         _evidence_text = "\n  [调用证据] " + " | ".join(_evidence_parts)
