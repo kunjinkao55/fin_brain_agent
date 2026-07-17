@@ -737,6 +737,11 @@ def data_collector_node(state: FinBrainState) -> dict:
         logger.warning("DataCollector errors: %s", [(e.get("代码","?"), e["error"][:80]) for e in errors])
 
     collected = json.dumps(results, ensure_ascii=False, indent=2)
+    # 提取行业名（从 results 中直接取，比正则从 JSON 挖更可靠）
+    _industry_names = list(set(
+        r.get("行业", "") for r in results
+        if isinstance(r, dict) and r.get("行业") and "error" not in r
+    ))
     # 汇总工具调用痕迹
     _all_tools = []
     for r in results:
@@ -744,7 +749,8 @@ def data_collector_node(state: FinBrainState) -> dict:
     return {
         "collected_data": collected,
         "processing_log": [{"phase": "Data", "summary": f"预取{len(symbols)}只 ({elapsed:.0f}ms, {len(errors)}错)",
-                            "detail": collected[:3000], "tool_calls": _all_tools}]
+                            "detail": collected[:3000], "tool_calls": _all_tools,
+                            "industries": _industry_names}]
     }
 
 def analyst_node(state: FinBrainState) -> dict:
@@ -762,7 +768,16 @@ def analyst_node(state: FinBrainState) -> dict:
         seed_trading_kb()
     except Exception:
         pass  # 播种失败不影响
-    industry_names = list(set(re.findall(r'"行业":\s*"([^"]+)"', collected)))
+    # 从 data_collector 的 processing_log 中读取行业名（比正则解析 JSON 更可靠）
+    _pl = state.get("processing_log", [])
+    industry_names = []
+    for _entry in _pl:
+        if _entry.get("industries"):
+            industry_names = _entry["industries"]
+            break
+    if not industry_names:
+        # 回退：正则从 collected JSON 中提取
+        industry_names = list(set(re.findall(r'"行业":\s*"([^"]+)"', collected)))
     industry_rag = ""
     _rag_traces = []  # RAG查询痕迹
     for ind_name in industry_names[:3]:
