@@ -1299,29 +1299,43 @@ def reporter_node(state: FinBrainState) -> dict:
             # === 价格状态机：根据当前价vs买入价自动判定执行策略 ===
             try:
                 r3 = item.get("投资评级", {}) if isinstance(item, dict) else {}
-                advice = str(item.get("操作建议", "")) if isinstance(item, dict) else ""
-                # 多种模式提取买入目标价：≤X元 / 回落至X元 / X元以下 / 买入区间
-                buy_target = None
-                for pat in [r'[≤<=]\s*([\d.]+)\s*元', r'回落至\s*([\d.]+)\s*元',
-                            r'([\d.]+)\s*元以下', r'([\d.]+)\s*元建仓']:
-                    m = re.search(pat, advice)
-                    if m: buy_target = float(m.group(1)); break
-                # 回退：从买入区间提取
-                if buy_target is None and isinstance(r3, dict):
-                    bz = str(r3.get("买入区间", ""))
-                    m = re.search(r'([\d.]+)', bz)
-                    if m: buy_target = float(m.group(1))
                 sp = float(r3.get("当前价格", stock_price)) if isinstance(r3, dict) and r3.get("当前价格") else stock_price
-                if buy_target and sp > 0:
-                    gap_pct = (sp - buy_target) / buy_target * 100
-                    if sp <= buy_target:
-                        state_note = f"[执行状态] 当前价{sp:.2f}元已进入≤{buy_target:.2f}元建仓区→建议立即执行首笔建仓。"
+                advice = str(item.get("操作建议", "")) if isinstance(item, dict) else ""
+                buy_zone_str = str(r3.get("买入区间", "")) if isinstance(r3, dict) else ""
+                bz_m = re.search(r'([\d.]+)', buy_zone_str)
+                value_buy = float(bz_m.group(1)) if bz_m else 0
+
+                # 趋势建仓价（从操作建议提取）
+                trend_buy = None
+                for pat in [r'[≤<=]\s*([\d.]+)\s*元', r'回落至\s*([\d.]+)\s*元',
+                            r'([\d.]+)\s*元以下', r'([\d.]+)\s*元建仓',
+                            r'(?:回调|回落|跌)(?:至|到)\s*([\d.]+)\s*元',
+                            r'([\d.]+)\s*[-~至]\s*([\d.]+)\s*元']:
+                    m = re.search(pat, advice)
+                    if m: trend_buy = float(m.group(1)); break
+                has_divergence = bool(item.get("框架分歧", ""))
+
+                if has_divergence and value_buy > 0 and trend_buy and trend_buy > value_buy * 1.5:
+                    # 双框架：分别展示价值锚点和趋势锚点的买入触发
+                    _va_gap = (sp - value_buy) / value_buy * 100 if value_buy > 0 else 0
+                    _tr_gap = (sp - trend_buy) / trend_buy * 100 if trend_buy > 0 else 0
+                    item["执行状态"] = (
+                        f"[执行状态-A:价值框架] 安全买入价≤{value_buy:.0f}元，当前价{sp:.0f}元(差距{_va_gap:.0f}%)→远未触及价值买点\n"
+                        f"  [执行状态-B:趋势框架] 建仓区间≤{trend_buy:.0f}元，当前价{sp:.0f}元(差距{_tr_gap:.0f}%)→"
+                        + (f"已进入建仓区" if sp <= trend_buy else
+                           f"需等待回调" if _tr_gap <= 30 else
+                           f"价格偏高，暂不建议建仓")
+                    )
+                elif trend_buy and sp > 0:
+                    gap_pct = (sp - trend_buy) / trend_buy * 100
+                    if sp <= trend_buy:
+                        state_note = f"[执行状态] 当前价{sp:.2f}元已进入≤{trend_buy:.2f}元建仓区→建议立即执行首笔建仓。"
                     elif gap_pct <= 3:
-                        state_note = f"[执行状态] 当前价{sp:.2f}元略高于{buy_target:.2f}元建仓价(差距{gap_pct:.1f}%)→建议挂单等待回落至{buy_target:.2f}元后成交。"
+                        state_note = f"[执行状态] 当前价{sp:.2f}元略高于{trend_buy:.2f}元建仓价(差距{gap_pct:.1f}%)→建议挂单等待回落至{trend_buy:.2f}元后成交。"
                     elif gap_pct <= 8:
-                        state_note = f"[执行状态] 当前价{sp:.2f}元距建仓价{buy_target:.2f}元差{gap_pct:.0f}%→暂不建仓，等待回调。"
+                        state_note = f"[执行状态] 当前价{sp:.2f}元距建仓价{trend_buy:.2f}元差{gap_pct:.0f}%→暂不建仓，等待回调。"
                     else:
-                        state_note = f"[执行状态] 当前价{sp:.2f}元显著高于建仓价{buy_target:.2f}元(差距{gap_pct:.0f}%)→价格偏高，暂不建议建仓。"
+                        state_note = f"[执行状态] 当前价{sp:.2f}元显著高于建仓价{trend_buy:.2f}元(差距{gap_pct:.0f}%)→价格偏高，暂不建议建仓。"
                     if isinstance(item, dict):
                         item["执行状态"] = state_note
             except: pass
