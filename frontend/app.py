@@ -487,8 +487,21 @@ elif page == "Portfolio":
     st.header("Portfolio Management")
     from backend.portfolio import get_portfolio, list_accounts, delete_account
     accounts = list_accounts()
-    acc_names = [a["name"] for a in accounts] if accounts else ["default"]
-    cur_acc = st.selectbox("账户", acc_names, key="pf_account")
+    if not accounts:
+        get_portfolio("default")  # 自动创建默认账户
+        accounts = list_accounts()
+    acc_names = [a["name"] for a in accounts]
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1: cur_acc = st.selectbox("账户", acc_names, key="pf_account")
+    with c2:
+        new_name = st.text_input("新建", placeholder="账户名", key="pf_new", label_visibility="collapsed")
+    with c3:
+        if st.button("创建", key="pf_create") and new_name.strip():
+            get_portfolio(new_name.strip())
+            st.rerun()
+        if st.button("删除", key="pf_del") and cur_acc and len(acc_names) > 1:
+            delete_account(cur_acc)
+            st.rerun()
     pf = get_portfolio(cur_acc); d = pf.summary()
     c1,c2,c3,c4 = st.columns(4)
     with c1: st.markdown(f'<div class="card"><div class="title">Cash</div><div class="value">{d["现金"]:,.0f}</div></div>', unsafe_allow_html=True)

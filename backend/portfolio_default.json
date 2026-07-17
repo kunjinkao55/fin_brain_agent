@@ -1,0 +1,72 @@
+{
+  "cash": 823486.0,
+  "initial_cash": 1000000.0,
+  "positions": {
+    "600011": {
+      "name": "",
+      "shares": 7300,
+      "avg_cost": 6.84,
+      "date": "2026-07-10"
+    },
+    "600900": {
+      "name": "",
+      "shares": 1700,
+      "avg_cost": 28.03,
+      "date": "2026-07-10"
+    },
+    "600674": {
+      "name": "",
+      "shares": 2000,
+      "avg_cost": 14.67,
+      "date": "2026-07-10"
+    },
+    "300071": {
+      "name": "",
+      "shares": 10100,
+      "avg_cost": 4.91,
+      "date": "2026-07-10"
+    }
+  },
+  "history": [
+    {
+      "symbol": "600011",
+      "name": "",
+      "action": "BUY",
+      "shares": 7300,
+      "price": 6.84,
+      "total": 49932.0,
+      "date": "2026-07-10 15:40:43",
+      "pnl": 0
+    },
+    {
+      "symbol": "600900",
+      "name": "",
+      "action": "BUY",
+      "shares": 1700,
+      "price": 28.03,
+      "total": 47651.0,
+      "date": "2026-07-10 15:40:43",
+      "pnl": 0
+    },
+    {
+      "symbol": "600674",
+      "name": "",
+      "action": "BUY",
+      "shares": 2000,
+      "price": 14.67,
+      "total": 29340.0,
+      "date": "2026-07-10 15:40:43",
+      "pnl": 0
+    },
+    {
+      "symbol": "300071",
+      "name": "",
+      "action": "BUY",
+      "shares": 10100,
+      "price": 4.91,
+      "total": 49591.0,
+      "date": "2026-07-10 16:03:18",
+      "pnl": 0
+    }
+  ]
+}
