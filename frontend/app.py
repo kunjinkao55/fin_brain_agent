@@ -230,9 +230,14 @@ if page == "Market":
         fig = go.Figure(data=[go.Bar(x=bar_values, y=names, orientation='h', marker_color=colors,
                                       text=bar_text, textposition='outside', textfont=dict(color='#ddd', size=9))])
         fund_label = data.get("资金类型", "")
+        update_time = data.get("更新时间", "")
+        data_date = data.get("数据日期", "")
+        title_text = f"{title_prefix}{fund_label} ({len(all_sectors)} sectors)"
+        if update_time:
+            title_text += f"<br><sup>数据日期: {data_date} | 更新时间: {update_time}</sup>"
         fig.update_layout(
-            title=f"{title_prefix}{fund_label} ({len(all_sectors)} sectors)", height=max(600, len(names)*20),
-            margin=dict(l=10, r=100, t=40, b=10), paper_bgcolor="#111", plot_bgcolor="#111",
+            title=title_text, height=max(600, len(names)*20),
+            margin=dict(l=10, r=100, t=50, b=10), paper_bgcolor="#111", plot_bgcolor="#111",
             font=dict(color="#ddd"), xaxis=dict(title=x_title, showgrid=True, gridcolor="#333"), yaxis=dict(showgrid=False))
         st.plotly_chart(fig, use_container_width=True, key=f"kline_{key_suffix}")
 
