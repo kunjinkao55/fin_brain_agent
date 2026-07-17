@@ -1470,6 +1470,14 @@ def calculate_scores(financial_data: dict) -> dict:
         else:                     # 轻资产行业：OFC/NI>0.8即好
             if cf_ratio >= 0.8: cf_score = 2
 
+        # FCF = CFO - CAPEX。重资产行业CFO可能很高但全被CAPEX吃掉
+        capex_val = float(cf_latest.get("购建固定资产支付现金", 0) or 0)
+        fcf = op_cf - capex_val
+        if op_cf > 0 and capex_val > 0:
+            fcf_ratio = fcf / op_cf  # FCF/CFO：现金流中多少是真正自由的
+        else:
+            fcf_ratio = 0
+
     if debt < 30: debt_score = 10
     elif debt < 50: debt_score = 7
     elif debt < 60: debt_score = 5
@@ -1481,11 +1489,19 @@ def calculate_scores(financial_data: dict) -> dict:
     elif cf_ratio >= 0.3: cf_label, cf_emoji, cf_severity = "警惕", "🟠", 2
     else:                 cf_label, cf_emoji, cf_severity = "警报", "🔴", 3
 
+    # FCF 预警标记（供 _fix_and_decide 强制注入风险段落）
+    _fcf_warning = ""
+    if op_cf > 0 and capex_val > 0 and fcf < 0 and fcf_ratio < -0.3:
+        _fcf_warning = ("FCF预警: 经营现金流{:.0f}亿但资本开支{:.0f}亿, "
+                        "自由现金流≈{:.0f}亿(负!), CFO虽高但被CAPEX吞噬, "
+                        "'利润含金量高'仅适用于CFO,不适用于FCF".format(op_cf/1e8, capex_val/1e8, fcf/1e8))
+
     scores["财务健康"] = {
         "得分": min(10, debt_score + cf_score),
         "依据": f"资产负债率{debt}%, 经营现金流/扣非净利润={cf_ratio:.2f}{dep_note}",
         "现金流标签": f"{cf_emoji}{cf_label}(覆盖率{cf_ratio:.2f})",
         "现金流严重度": cf_severity,
+        "FCF预警": _fcf_warning,
     }
 
     # --- 4. 估值合理 (0-10) —— 行业PE锚定 ---
