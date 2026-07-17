@@ -892,101 +892,276 @@ def valuation_agent_node(state: FinBrainState) -> dict:
     return {"analysis": enriched, "processing_log": prev_log}
 
 
-CRITIC_PROMPT = """你是独立投资逻辑审查员（空头视角）。你唯一的任务是找出分析中的逻辑漏洞，不是重新分析股票。
+LOGIC_CRITIC_PROMPT = """你是投资逻辑审查员。只检查逻辑链是否自洽，不管数据对错。
 
-审查清单:
-1. 逻辑一致性：投资逻辑链是否自洽？"因为A→导致B→最终C"的每一步是否成立？
-2. 过度乐观：是否存在"必然""确定""毫无疑问"等过度自信措辞？假设是否过于乐观？
-3. 遗漏风险：是否忽略了关键风险（周期反转、竞争恶化、政策变化、技术替代）？
-4. 估值-基本面匹配：高增长假设是否有足够证据？PE倍数的依据是否充分？
-5. 数据误读：是否存在对财务数据的错误解读（如将周期因素当成结构改善）？
+检查:
+1. "因为A→导致B→最终C→市场D→因此E"的每一步是否成立？是否有跳步或循环论证？
+2. 是否存在"必然""确定""唯一"等过度自信措辞？
+3. 操作建议是否与评级方向一致（SELL不应有买入计划，BUY不应有清仓建议）？
 
-输出格式: 严格JSON
-{"通过": true/false, "逻辑漏洞": ["具体问题"], "过度乐观": ["不合理的假设"], "遗漏风险": ["未提及的风险"], "建议": "一句话总结", "置信度": "高/中/低"}
+输出: {"通过": true/false, "逻辑漏洞": [...], "建议": "..."}
+如果没有问题，返回 {"通过": true, "逻辑漏洞": [], "建议": ""}"""
 
-如果你认为分析整体合理，返回 {"通过": true, "逻辑漏洞": [], "过度乐观": [], "遗漏风险": [], "建议": "分析整体自洽，核心逻辑成立", "置信度": "高"}"""
-
-
-def critic_node(state: FinBrainState) -> dict:
-    """独立逻辑审查员（LLM，空头视角）。"""
+def _financial_code_check(analysis_text: str) -> list:
+    """代码层财务数值验证（不调LLM）。检查FCF/CFO/CAPEX等确定性指标。"""
     import re as _re
-    raw = state.get("analysis", "")
-    if not raw.strip():
-        return {"analysis": raw, "processing_log": state.get("processing_log", [])}
-    trimmed = raw.strip()
-    if not (trimmed.startswith("{") or trimmed.startswith("[")):
-        return {"analysis": raw, "processing_log": state.get("processing_log", [])}
+    issues = []
+    # FCF检查：CFO高但CAPEX更大→FCF为负
+    cfo_m = _re.search(r'经营现金流[^}]*?([\d.]+)\s*亿', analysis_text)
+    capex_m = _re.search(r'(?:购建固定|资本开支)[^}]*?([\d.]+)\s*亿', analysis_text)
+    if cfo_m and capex_m:
+        cfo = float(cfo_m.group(1))
+        capex = float(capex_m.group(1))
+        if capex > cfo:
+            issues.append("FCF=CFO({:.0f}亿)-CAPEX({:.0f}亿)≈{:.0f}亿(自由现金流为负! 经营现金流虽高但被资本开支吞噬，'利润含金量极高'的表述需加注FCF为负的风险)".format(cfo, capex, cfo-capex))
+    # PE vs ROE匹配
+    pe_m = _re.search(r'PE[:\s]*(\d+\.?\d*)\s*倍', analysis_text)
+    roe_m = _re.search(r'ROE[:\s]*(\d+\.?\d*)', analysis_text)
+    if pe_m and roe_m:
+        pe = float(pe_m.group(1))
+        roe = float(roe_m.group(1))
+        if roe < 8 and pe > 40:
+            pe_roe_ratio = pe/roe
+            issues.append("PE({:.0f}倍)与ROE({:.1f}%)严重不匹配: PE/ROE={:.0f}倍,需极高增速支撑".format(pe, roe, pe_roe_ratio))
+    # CFO/净利润比值的折旧解释
+    cfo_ni_m = _re.search(r'经营现金流[^}]*?净利润[^}]*?([\d.]+)\s*倍', analysis_text)
+    dep_m = _re.search(r'折旧[^}]*?([\d.]+)\s*亿', analysis_text)
+    if cfo_ni_m and dep_m:
+        ratio = float(cfo_ni_m.group(1))
+        dep = float(dep_m.group(1))
+        if ratio > 3 and dep > 30:
+            issues.append("CFO/净利润={:.1f}倍但折旧高达{:.0f}亿: 高比值主因折旧(非现金支出)推高CFO，不代表经营回款能力远超同行。需区分CFO和FCF".format(ratio, dep))
+    return issues
+
+
+FINANCIAL_CRITIC_PROMPT = """你是财务数据审查员。只检查财务解读是否准确，不管投资逻辑。
+
+系统已自动完成以下数值验证（你不需要再检查这些）:
+{code_findings}
+
+你需要检查的（语义层面）:
+1. 毛利率变化归因是否合理？是周期因素还是结构改善？
+2. 利润增速解读是否考虑基数效应？单季暴增是否被误读为趋势？
+3. 现金流质量的定性描述是否符合行业特征？
+
+输出: {"通过": true/false, "财务误读": [...], "建议": "..."}
+如果没有问题，返回 {"通过": true, "财务误读": [], "建议": ""}"""
+
+INDUSTRY_CRITIC_PROMPT = """你是行业事实审查员。只检查行业相关的陈述是否准确。
+
+检查:
+1. 竞争格局描述是否准确？"唯一""绝对领先"等表述是否有竞争对手可以反驳？
+2. 行业周期位置的判断是否有数据支撑？是周期底部还是结构性衰退？
+3. 技术路线描述是否客观？是否忽略了替代技术或竞争对手的进展？
+4. 产业链上下游的议价能力分析是否合理？
+
+输出: {"通过": true/false, "行业误述": [...], "建议": "..."}
+如果没有问题，返回 {"通过": true, "行业误述": [], "建议": ""}"""
+
+REPAIR_PROMPT = """你是报告修正专员。你会收到一份投资分析JSON和三组Critic审查结果（逻辑/财务/行业）。
+
+你的任务：
+1. 阅读Critic发现的所有问题
+2. 只修改分析JSON中被Critic标记为有问题的字段
+3. 不改变Critic未涉及的字段
+4. 修正：过度自信措辞→改为客观表述；数据误读→修正归因；遗漏风险→补充风险条目；竞争描述→修正不实表述
+
+输出: 修正后的完整JSON（保持原结构，只改问题字段）"""
+
+
+def _call_critic(prompt_template, analysis_text):
+    """调用单个Critic。Financial Critic 先跑代码层数值验证再调LLM。"""
+    prompt = prompt_template
+    if "{code_findings}" in prompt_template:
+        code_issues = _financial_code_check(analysis_text)
+        code_text = "\n".join("- " + c for c in code_issues) if code_issues else "无"
+        prompt = prompt_template.replace("{code_findings}", code_text)
     try:
-        critic_resp = _get_llm().invoke([
-            SystemMessage(content=CRITIC_PROMPT),
-            HumanMessage(content="请审查以下投资分析JSON中的逻辑漏洞:\n\n" + trimmed[:4000]),
+        resp = _get_llm().invoke([
+            SystemMessage(content=prompt),
+            HumanMessage(content="审查以下分析:\n\n" + analysis_text[:4000]),
         ])
-        critique = critic_resp.content.strip()
-        try:
-            critique_json = json.loads(critique)
-        except json.JSONDecodeError:
-            m = _re.search(r'\{.*"通过".*\}', critique, _re.DOTALL)
-            critique_json = json.loads(m.group(0)) if m else {"通过": True, "建议": "无法解析审查结果"}
+        result = json.loads(resp.content.strip())
+        # 合并代码层发现的数值问题
+        if "{code_findings}" in prompt_template:
+            for issue in (_financial_code_check(analysis_text)):
+                if issue not in result.get("财务误读", []):
+                    result.setdefault("财务误读", []).append(issue)
+        return result
     except Exception:
-        critique_json = {"通过": True, "建议": "审查跳过(LLM错误)"}
-    passed = critique_json.get("通过", True)
-    flaws = critique_json.get("逻辑漏洞", [])
-    overconf = critique_json.get("过度乐观", [])
-    missing_risks = critique_json.get("遗漏风险", [])
-    advice = critique_json.get("建议", "")
-    conf = critique_json.get("置信度", "中")
-    critique_header = "[Critic审查: {}] 置信度:{}".format(
-        "通过" if passed else "发现漏洞", conf)
-    if flaws:
-        for f in flaws[:3]:
-            critique_header += "\n  ⚠️ 逻辑漏洞: " + f
-    if overconf:
-        for o in overconf[:2]:
-            critique_header += "\n  ⚠️ 过度乐观: " + o
-    if missing_risks:
-        for r in missing_risks[:2]:
-            critique_header += "\n  ⚠️ 遗漏风险: " + r
-    if advice:
-        critique_header += "\n  💡 " + advice
-    # 注入结构化反馈标记供 Reporter 解析（避免从 header 文本提取）
-    _fixes = []
-    if flaws: _fixes.extend(flaws[:3])
-    if overconf: _fixes.extend(overconf[:2])
-    _fix_json = json.dumps(_fixes, ensure_ascii=False)
-    enriched = critique_header + "\n[CRITIC_FIXES] " + _fix_json + "\n" + raw
+        return {"通过": True, "逻辑漏洞": [], "财务误读": [], "行业误述": [], "建议": ""}
+
+
+def critics_node(state: FinBrainState) -> dict:
+    """三路并行Critic：逻辑/财务/行业。合并去重后输出结构化修复清单。"""
+    import concurrent.futures, re as _re
+    raw = state.get("analysis", "")
+    if not raw.strip() or not (raw.strip().startswith("{") or raw.strip().startswith("[")):
+        return {"analysis": raw, "processing_log": state.get("processing_log", [])}
+
+    # 并行调用三个Critic
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {
+            "Logic": ex.submit(_call_critic, LOGIC_CRITIC_PROMPT, raw),
+            "Financial": ex.submit(_call_critic, FINANCIAL_CRITIC_PROMPT, raw),
+            "Industry": ex.submit(_call_critic, INDUSTRY_CRITIC_PROMPT, raw),
+        }
+        results = {k: f.result() for k, f in futures.items()}
+
+    # 聚合：合并三类发现，去重
+    all_issues = []
+    for cat in ["逻辑漏洞", "财务误读", "行业误述"]:
+        for critic_name, r in results.items():
+            for item in r.get(cat, []):
+                if item and item not in all_issues:
+                    all_issues.append(item)
+
+    # 构建结构化修复清单
+    fix_list = []
+    for item in all_issues:
+        fix_list.append({"issue": item, "must_fix": True})
+
+    # 注入 [CRITIC_FIXES] 供Repair Agent使用
+    fix_json = json.dumps(fix_list, ensure_ascii=False)
+    enriched = raw + "\n[CRITIC_FIXES] " + fix_json
+
+    # 构建可读的Critic摘要
+    summaries = []
+    for name, r in results.items():
+        total = sum(len(r.get(k, [])) for k in ["逻辑漏洞", "财务误读", "行业误述"])
+        summaries.append(f"{name}:{total}个问题")
+    header = "[Critics: {}]".format(" | ".join(summaries))
+    enriched = header + "\n" + enriched
+
     prev_log = state.get("processing_log", [])
-    prev_log.append({"phase": "Critic", "summary": "审查" + ("通过" if passed else "发现漏洞"),
-                     "status": "WARNING" if not passed else "SUCCESS",
-                     "findings": {"逻辑漏洞": len(flaws), "过度乐观": len(overconf),
-                                  "遗漏风险": len(missing_risks)},
-                     "confidence": conf, "decision": "通过" if passed else "需修正",
-                     "detail": critique_header})
+    prev_log.append({"phase": "Critics", "summary": "三路审查完成",
+                     "status": "WARNING" if all_issues else "SUCCESS",
+                     "findings": {"Logic": len(results.get("Logic", {}).get("逻辑漏洞", [])),
+                                  "Financial": len(results.get("Financial", {}).get("财务误读", [])),
+                                  "Industry": len(results.get("Industry", {}).get("行业误述", []))},
+                     "total_issues": len(all_issues)})
     return {"analysis": enriched, "processing_log": prev_log}
 
 
-VALUATION_PROMPT = """你是估值框架选择专家。你的任务不是计算具体估值数字，而是判断这家公司适合用什么估值方法，并给出多框架参考。
+def repair_node(state: FinBrainState) -> dict:
+    """Repair Agent: 接收Critics的修复清单，自动修正分析JSON中的问题。"""
+    import re as _re
+    raw = state.get("analysis", "")
+    if "[CRITIC_FIXES]" not in raw:
+        return {"analysis": raw, "processing_log": state.get("processing_log", [])}
+
+    # 提取修复清单
+    cm = _re.search(r'\[CRITIC_FIXES\]\s*(\[.*\])', raw, _re.DOTALL)
+    if not cm:
+        return {"analysis": raw, "processing_log": state.get("processing_log", [])}
+
+    try:
+        fix_list = json.loads(cm.group(1))
+    except Exception:
+        return {"analysis": raw, "processing_log": state.get("processing_log", [])}
+
+    if not fix_list:
+        return {"analysis": raw, "processing_log": state.get("processing_log", [])}
+
+    # 用Repair Agent修正
+    fix_text = "\n".join(f"{i+1}. {f['issue']}" for i, f in enumerate(fix_list[:8]))
+    try:
+        repair_resp = _get_llm().invoke([
+            SystemMessage(content=REPAIR_PROMPT),
+            HumanMessage(content="Critic发现问题:\n" + fix_text + "\n\n原始JSON:\n" + raw[:4000] + "\n\n请输出修正后的完整JSON。"),
+        ])
+        repaired = repair_resp.content.strip()
+        # 提取JSON
+        if not repaired.startswith("{"):
+            m = _re.search(r'\{.*', repaired, _re.DOTALL)
+            if m: repaired = m.group(0)
+    except Exception:
+        repaired = raw
+
+    # 添加修复摘要
+    header = "[Repair: 已修正{}项问题]".format(len(fix_list))
+    enriched = header + "\n" + repaired
+
+    prev_log = state.get("processing_log", [])
+    prev_log.append({"phase": "Repair", "summary": "已修正{}项问题".format(len(fix_list)),
+                     "status": "SUCCESS", "fix_count": len(fix_list)})
+    return {"analysis": enriched, "processing_log": prev_log}
+
+
+def _classify_company(collected_data: str) -> dict:
+    """纯代码提取公司特征，输出混合属性权重（不调LLM）。
+    指标: ROE水平+波动性、营收增速趋势、CAPEX/CFO强度、行业周期度"""
+    import re as _re
+    roes = [float(m)/100 if float(m)>100 else float(m) for m in _re.findall(r'"ROE\(%\)":\s*([\d.]+)', collected_data)]
+    revs = [float(m) for m in _re.findall(r'"营业总收入":\s*([\d.]+)', collected_data)]
+    caps = [float(m) for m in _re.findall(r'购建固定资产[^}]*?([\d.]+)\s*[亿万]', collected_data)]
+    cfos = [float(m) for m in _re.findall(r'经营现金流[^}]*?([\d.]+)\s*[亿万]', collected_data)]
+
+    avg_roe = sum(roes)/len(roes) if roes else 0.05
+    roe_vol = (max(roes)-min(roes))/abs(avg_roe) if avg_roe and len(roes)>1 else 0
+    # 营收增速趋势：正加速→成长，负/减速→周期
+    rev_growths = [(revs[i]/revs[i+1]-1) for i in range(len(revs)-1)] if len(revs)>1 else [0]
+    rev_accel = rev_growths[0] - rev_growths[-1] if len(rev_growths)>1 else 0
+    # CAPEX强度
+    capex_intensity = abs(caps[0])/abs(cfos[0]) if caps and cfos and cfos[0]!=0 else 0
+    # 综合判断
+    cyclical = 0.3 + roe_vol*0.25 + (1-min(capex_intensity/3, 1))*0.15
+    cyclical = min(0.65, max(0.15, cyclical))
+    growth = 0.15 + max(0, rev_accel*0.3) + (1-min(capex_intensity/2, 1))*0.1
+    growth = min(0.55, max(0.05, growth))
+    theme = round(max(0.05, 1.0 - cyclical - growth), 2)
+    total = cyclical + growth + theme
+    cyclical, growth, theme = round(cyclical/total, 2), round(growth/total, 2), round(theme/total, 2)
+    label = "周期制造" if cyclical>0.4 else ("成长制造" if growth>0.35 else "主题驱动")
+    return {"cyclical": cyclical, "growth": growth, "theme": theme,
+            "metrics": {"avg_roe": round(avg_roe,3), "roe_volatility": round(roe_vol,2),
+                        "rev_acceleration": round(rev_accel,2), "capex_intensity": round(capex_intensity,2)},
+            "summary": "{:.0f}%{} + {:.0f}%成长 + {:.0f}%主题".format(cyclical*100, label, growth*100, theme*100)}
+
+
+def company_classifier_node(state: FinBrainState) -> dict:
+    """公司分类节点（纯代码）：从 collected_data 提取指标，输出混合属性权重。"""
+    collected = state.get("collected_data", "")
+    if not collected.strip():
+        return {"analysis": state.get("analysis", ""), "processing_log": state.get("processing_log", [])}
+    try:
+        clf = _classify_company(collected)
+        header = "[CompanyClass: {}]".format(clf["summary"])
+        analysis = state.get("analysis", "")
+        enriched = header + "\n" + (analysis if analysis else collected)
+        prev_log = state.get("processing_log", [])
+        prev_log.append({"phase": "Classify", "summary": clf["summary"], "status": "SUCCESS",
+                         "weights": {"cyclical": clf["cyclical"], "growth": clf["growth"], "theme": clf["theme"]}})
+        return {"analysis": enriched, "processing_log": prev_log}
+    except Exception:
+        return {"analysis": state.get("analysis", ""), "processing_log": state.get("processing_log", [])}
+
+
+VALUATION_PROMPT = """你是估值框架选择专家。系统已通过代码提取了公司混合属性权重。请基于权重给出多框架估值和PE折价链。
 
 步骤:
-1. 识别公司所处阶段：成熟周期型 / 周期复苏型 / 稳定成长型 / 高速成长型
-2. 根据阶段推荐估值框架组合（可多选）：PE(静态)/PE(正常化利润)/PEG/EV_EBITDA/PB/DCF
-3. 给出多框架估值参考区间，标注每个框架的适用前提
+1. 根据公司属性权重，为每种属性匹配合适的估值方法
+2. 计算PE折价链：最终PE = 行业中枢PE × (1 + Σ调整因子)
+3. 输出每种框架的估值区间
 
 输出格式: 严格JSON
 {
-  "公司阶段": "周期复苏型(利润从底部恢复，当前EPS不能反映正常盈利能力)",
-  "适用框架": ["PE(正常化利润)", "EV/EBITDA", "PEG"],
-  "不适用框架": ["PE(静态-基于TTM EPS)"],
-  "框架说明": {
-    "PE(正常化利润)": "基于周期平均EPS而非TTM低谷EPS，避免低谷利润导致估值失真",
-    "EV/EBITDA": "剔除折旧影响，适合重资产折旧大的封测/制造企业",
-    "PEG": "若未来2-3年增速可持续>30%，PEG<1可作为成长性支撑"
-  },
+  "公司阶段": "周期复苏型(利润从底部恢复，先进封装处于成长期)",
+  "混合权重": {"周期制造": 0.5, "成长制造": 0.3, "AI主题": 0.2},
+  "PE折价链": [
+    {"因子": "行业PE中枢", "调整": "+40倍", "累计PE": 40},
+    {"因子": "周期属性折价", "调整": "-30%", "累计PE": 28},
+    {"因子": "ROE不足(5.6%)", "调整": "-20%", "累计PE": 22},
+    {"因子": "资本开支压力", "调整": "-15%", "累计PE": 19},
+    {"因子": "先进封装成长溢价", "调整": "+20%", "累计PE": 23}
+  ],
+  "最终PE": 23,
   "估值参考": {
     "保守(PE正常化)": "xx-xx元",
     "中性(混合)": "xx-xx元",
     "乐观(PEG)": "xx-xx元"
   },
-  "核心风险": "当前TTM EPS处于周期低谷，若以此为锚会严重低估。但正常化利润的假设需要验证——毛利率能否持续改善、先进封装占比能否提升。"
+  "核心风险": "..."
 }"""
 
 AUDITOR_PROMPT = """你是 FinBrain 校验审计员。你的唯一任务是审查投资报告，找出逻辑漏洞和数据矛盾。你不写报告，只输出审查结论。
@@ -1028,6 +1203,9 @@ def reporter_node(state: FinBrainState) -> dict:
     raw = re.sub(r'^  ⚠️[^\n]*\n', '', raw, flags=re.MULTILINE)
     raw = re.sub(r'^  💡[^\n]*\n', '', raw, flags=re.MULTILINE)
     raw = re.sub(r'^\[CRITIC_FIXES\][^\n]*\n', '', raw, flags=re.MULTILINE)
+    raw = re.sub(r'^\[CompanyClass:[^\n]*\n', '', raw, flags=re.MULTILINE)
+    raw = re.sub(r'^\[Critics:[^\n]*\n', '', raw, flags=re.MULTILINE)
+    raw = re.sub(r'^\[Repair:[^\n]*\n', '', raw, flags=re.MULTILINE)
     raw = re.sub(r'^\[估值框架:[^\n]*\n', '', raw, flags=re.MULTILINE)
 
     if not raw.strip():
@@ -1310,6 +1488,11 @@ def reporter_node(state: FinBrainState) -> dict:
                 item["风险"] = (item.get("风险", []) if isinstance(item, list) else []) + [
                     f"{_cf_label} — 经营现金流覆盖率偏低，建议关注应收账款周转与存货变动。"
                 ]
+
+            # FCF 预警注入：CFO 高但被 CAPEX 吞噬 → 强制追加风险
+            _fcf_warn = _fh.get("FCF预警", "") if isinstance(_fh, dict) else ""
+            if _fcf_warn:
+                item["风险"] = (item.get("风险", []) if isinstance(item, list) else []) + [_fcf_warn]
 
             # Web Search 机构共识（仅 web_search 启用时）
             ws_key = os.getenv("WEB_SEARCH_API_KEY", "")
@@ -2062,16 +2245,21 @@ def build_graph():
 
     graph = StateGraph(FinBrainState)
     graph.add_node("data_collector", data_collector_node)
+    graph.add_node("classifier", company_classifier_node)
     graph.add_node("analyst", analyst_node)
     graph.add_node("valuation", valuation_agent_node)
-    graph.add_node("critic", critic_node)
+    graph.add_node("critics", critics_node)
+    graph.add_node("repair", repair_node)
     graph.add_node("reporter", reporter_node)
 
     graph.add_edge(START, "data_collector")
-    graph.add_edge("data_collector", "analyst")
+    graph.add_edge("data_collector", "classifier")
+    graph.add_edge("classifier", "analyst")
     graph.add_edge("analyst", "valuation")
-    graph.add_edge("valuation", "critic")
-    graph.add_edge("critic", "reporter")
+    graph.add_edge("valuation", "critics")
+    graph.add_edge("critics", "repair")
+    graph.add_edge("repair", "reporter")
+    graph.add_edge("repair", "reporter")
     graph.add_edge("reporter", END)
 
     _GRAPH = graph.compile(checkpointer=_make_checkpointer())

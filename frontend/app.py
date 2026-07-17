@@ -310,7 +310,7 @@ if page == "Chat":
             # 最后一条 assistant 消息：结构化 Execution Trace
             if is_last and is_assistant and last_trace:
                 with st.expander("Execution Trace", expanded=False):
-                    _icons2 = {"Data": "📡", "Analysis": "🧠", "Valuation": "📊", "Critic": "🔍", "Report": "📝"}
+                    _icons = {"Data": "📡", "Classify": "🏷️", "Analysis": "🧠", "Valuation": "📊", "Critics": "🔍", "Repair": "🔧", "Report": "📝"}
                     _status_colors = {"SUCCESS": "#2e7d32", "WARNING": "#e69500", "PARTIAL": "#cc6600"}
                     for step in last_trace:
                         phase = step.get("phase", "?")
@@ -343,13 +343,16 @@ if page == "Chat":
                             st.caption(f"Stage: {stage} | Frameworks: {', '.join(frameworks[:4])}")
                             if ref:
                                 st.caption("Reference: " + " | ".join(f"{k}:{v}" for k, v in list(ref.items())[:3]))
-                        elif phase == "Critic":
+                        elif phase == "Critics":
                             findings = step.get("findings", {})
                             conf = step.get("confidence", "?")
                             decision = step.get("decision", "?")
                             st.caption(f"Findings: 逻辑{findings.get('逻辑漏洞',0)} | 过度乐观{findings.get('过度乐观',0)} | 遗漏风险{findings.get('遗漏风险',0)} | 置信度:{conf} | 决策:{decision}")
                             if detail:
                                 st.caption(detail.replace("\n", " | ")[:250])
+                        elif phase == "Repair":
+                            fix_count = step.get("fix_count", 0)
+                            st.caption(f"Fixed: {fix_count} issues auto-corrected")
                         elif phase == "Report":
                             chars = step.get("output_chars", 0)
                             retries = step.get("audit_retries", 0)
@@ -577,7 +580,7 @@ elif page == "Analysis":
                     reply, _, _, trace = run_agent(instruction)
                     if trace:
                         with st.expander("Execution Trace", expanded=False):
-                            _icons2 = {"Data": "📡", "Analysis": "🧠", "Valuation": "📊", "Critic": "🔍", "Report": "📝"}
+                            _icons = {"Data": "📡", "Classify": "🏷️", "Analysis": "🧠", "Valuation": "📊", "Critics": "🔍", "Repair": "🔧", "Report": "📝"}
                             for step in trace:
                                 icon = _icons.get(step.get("phase", "?"), "⚙️")
                                 status = step.get("status", "SUCCESS")
