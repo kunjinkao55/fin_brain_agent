@@ -1707,6 +1707,84 @@ def get_sector_fund_flow(top_n: int = 50, date: str = "", fund_type: str = "tota
 
 
 # ============================================================
+#  板块动量评分（中线动量聚焦）
+# ============================================================
+
+def get_sector_momentum(top_n: int = 15) -> dict:
+    """中线动量聚焦：综合资金流向+涨跌幅+市场情绪，计算板块动量分数。
+    不预测未来，追踪当前主力共识最强的板块——'趋势中继'而非'底部反转'。
+
+    返回: {板块, 动量分数, 温度计, 净流入, 涨跌幅, 总成交, 逻辑简述}
+    """
+    try:
+        from datetime import datetime
+
+        # 1. 获取全市场资金流数据
+        sf = get_sector_fund_flow(100, fund_type="total")
+        sectors = sf.get("列表", [])
+        if not sectors:
+            return {"error": "板块资金流数据不可用", "列表": []}
+
+        # 2. 获取市场宽度作为情绪背景
+        breadth = get_market_breadth()
+        up_ratio = float(str(breadth.get("上涨比例", "50")).replace("%", ""))
+        # 市场情绪因子：上涨>60%偏乐观(×1.1), <30%偏悲观(×0.9)
+        mood_mult = 1.1 if up_ratio > 60 else (0.9 if up_ratio < 30 else 1.0)
+
+        # 3. 归一化辅助（确保所有值都是 float）
+        def _norm(values):
+            vals = [float(v) for v in values]
+            mn, mx = min(vals), max(vals)
+            if mx == mn: return [50] * len(vals)
+            return [(v - mn) / (mx - mn) * 100 for v in vals]
+
+        abs_nets = [abs(float(s["净额(亿)"])) for s in sectors]
+        changes_raw = [float(str(s.get("涨跌幅", "0%")).replace("%", "").replace("+", "")) for s in sectors]
+        totals = [float(s["流入(亿)"]) + float(s["流出(亿)"]) for s in sectors]
+        # 资金强度 = 净流入绝对值 / 总成交额
+        intensities = [abs(n) / t if t > 0 else 0 for n, t in zip(abs_nets, totals)]
+
+        norm_nets = _norm(abs_nets)
+        norm_changes = _norm([abs(float(c)) for c in changes_raw])
+        norm_intensity = _norm(intensities)
+
+        # 4. 复合评分：资金强度40% + 涨跌幅35% + 资金方向一致性25%
+        results = []
+        for i, s in enumerate(sectors):
+            net = s["净额(亿)"]
+            direction_bonus = 1.0 if net > 0 else 0.6  # 流入加分，流出打折
+            score = (norm_nets[i] * 0.40 + norm_changes[i] * 0.35 + norm_intensity[i] * 0.25) * direction_bonus
+            score = round(score * mood_mult, 1)
+
+            # 温度计
+            if score >= 80:   temp = "🔥高潮期"
+            elif score >= 60: temp = "⚡加速期"
+            elif score >= 40: temp = "🌡️升温中"
+            else:             temp = "❄️观望"
+
+            # 逻辑简述
+            direction = "流入" if net > 0 else "流出"
+            logic = f"主力{direction}{abs(net):.1f}亿, 涨跌幅{float(changes_raw[i]):+.2f}%"
+            if intensities[i] > 0.5:
+                logic += ", 资金高度集中"
+
+            results.append({
+                "板块": s["板块"], "动量分数": score, "温度计": temp,
+                "净流入(亿)": round(net, 1), "涨跌幅": f"{changes_raw[i]:+.2f}%",
+                "总成交(亿)": round(totals[i], 1), "逻辑": logic,
+            })
+
+        # 按动量分数排序
+        results.sort(key=lambda x: x["动量分数"], reverse=True)
+        return {"板块数量": len(results), "列表": results[:top_n],
+                "市场情绪": f"{'偏乐观' if mood_mult > 1 else '偏悲观' if mood_mult < 1 else '中性'}(上涨比{up_ratio:.0f}%)",
+                "更新时间": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+    except Exception as e:
+        return {"error": f"动量评分计算失败: {str(e)}", "列表": []}
+
+
+# ============================================================
 #  工具12：日内分时数据
 # ============================================================
 
