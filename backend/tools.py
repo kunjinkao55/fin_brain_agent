@@ -962,6 +962,16 @@ def format_report(analysis: dict) -> str:
                         lines.append(f"    {info} {scenario}({prob}): {price} — {assumption}")
                     else:
                         lines.append(f"    {info} {scenario}({prob}): {price}元")
+            # 情景vs合理价值对齐检查：悲观情景价超过合理价值2倍时追加注释
+            try:
+                rating = analysis.get("投资评级", {}) if isinstance(analysis, dict) else {}
+                fv = float(rating.get("合理价值", 0)) if isinstance(rating, dict) else 0
+                pess = scenarios.get("悲观", {}) if isinstance(scenarios, dict) else {}
+                pess_price = float(pess.get("价格", 0)) if isinstance(pess, dict) else 0
+                if fv > 0 and pess_price > fv * 2:
+                    lines.append(f"    * 情景估值由趋势研判生成，最低情景({pess_price}元)仍显著高于量化合理价值({fv:.0f}元)，"
+                                 f"反映了市场情绪和成长预期——非基本面锚点，仅供参考。")
+            except: pass
 
         # ---- 对比分析 ----
         compare = analysis.get("对比分析", {})
