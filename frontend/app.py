@@ -209,6 +209,31 @@ if page == "Market":
             st.markdown(f'<div class="metric-box"><div class="label">Breadth</div><div class="value">{breadth["上涨比例"]}</div></div>', unsafe_allow_html=True)
     st.divider()
 
+    # ---- 中线动量聚焦 (缓存5分钟) ----
+    @st.cache_data(ttl=300)
+    def _cached_momentum():
+        from backend.tools import get_sector_momentum
+        return get_sector_momentum(15)
+
+    momentum = _cached_momentum()
+    mom_list = momentum.get("列表", [])
+    if mom_list and "error" not in momentum:
+        st.subheader(f"中线动量聚焦 {momentum.get('市场情绪','')}")
+        st.caption("追踪主力共识最强的板块——'趋势中继'而非'底部反转'。加速期适合关注，高潮期只出不进。")
+        cols = st.columns(min(len(mom_list[:10]), 5))
+        temp_colors = {"🔥高潮期": "#cc3333", "⚡加速期": "#e69500", "🌡️升温中": "#4a90d9", "❄️观望": "#666"}
+        for i, m in enumerate(mom_list[:10]):
+            with cols[i % 5]:
+                tc = temp_colors.get(m["温度计"], "#666")
+                st.markdown(
+                    f'<div style="border-left:3px solid {tc}; padding:4px 8px; margin:2px 0; font-size:13px">'
+                    f'<b>{i+1}. {m["板块"]}</b> <span style="color:{tc}">{m["温度计"]}</span><br>'
+                    f'<span style="font-size:11px;color:#aaa">动量{m["动量分数"]:.0f} | {m["净流入(亿)"]:+.1f}亿 | {m["涨跌幅"]}</span><br>'
+                    f'<span style="font-size:10px;color:#888">{m["逻辑"]}</span></div>',
+                    unsafe_allow_html=True
+                )
+    st.divider()
+
     # ---- 板块资金流对比图 (缓存5分钟) ----
     @st.cache_data(ttl=300)
     def _cached_sector_total():
