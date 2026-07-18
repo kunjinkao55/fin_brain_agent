@@ -1238,7 +1238,12 @@ REPORTER_PROMPT = """你是 FinBrain 报告格式化专员。
 将分析JSON格式化为可读报告。评分卡和表格会由代码自动生成，你只需要写:
 - 单只股票: 结论段(1-2段，含投资建议)
 - 多只股票: 排名总评 + 总结建议
-不使用emoji，不使用markdown加粗。"""
+
+约束：
+1. 必须使用评分卡中的实际当前价格，不得编造或估算股价。
+2. 投资决策的评级只能是 BUY/HOLD/SELL 之一，不能写"中性/观望/量化锚点"等模糊或双重评级。
+3. 如果存在框架分歧（即量化锚点评级与趋势研判操作建议方向不一致），结论段必须同时说明两套逻辑的结论：先说明量化锚点结论（基于合理价值与当前价），再说明趋势研判结论（基于拐点/行业趋势）。不能只写一个与量化锚点矛盾的结论。
+4. 不要使用emoji，不要使用markdown加粗。"""
 
 
 def _validate_scenarios(item: dict):
@@ -1463,6 +1468,23 @@ def reporter_node(state: FinBrainState) -> dict:
             for dim in ["盈利能力", "成长性", "财务健康", "估值合理"]:
                 if dim in fixed:
                     item.setdefault("评分", {})[dim] = fixed[dim]
+
+            # 规范化评分维度：删除 LLM 可能重复输出的非标准维度（如"估值合理性"与"估值合理"并存）
+            _scores = item.setdefault("评分", {})
+            _standard_score_dims = {"盈利能力", "成长性", "财务健康", "估值合理", "行业前景", "资金认可"}
+            for dim in list(_scores.keys()):
+                if dim not in _standard_score_dims:
+                    # 如果是"估值合理性"等类似维度，直接删除，避免重复和合计混乱
+                    if dim in ("估值合理性", "估值"):
+                        del _scores[dim]
+                    elif dim in ("盈利", "盈利性"):
+                        del _scores[dim]
+                    elif dim in ("成长", "成长性"):
+                        del _scores[dim]
+                    elif dim in ("财务健康度", "财务"):
+                        del _scores[dim]
+                    else:
+                        del _scores[dim]
 
             # 代码兜底：LLM 可能遗漏的行业前景/资金认可维度
             _scores = item.setdefault("评分", {})
@@ -2288,7 +2310,34 @@ def reporter_node(state: FinBrainState) -> dict:
                                     k: oi[k] for k in ["_dilution_coefficient", "_dilution_shares", "_dilution_fund_amount"]
                                     if k in oi
                                 }
-                        data = new_data
+
+                        # 合并旧 JSON 字段：Analyst 重试时往往只关注审计问题，导致亮点/风险/情景估值等字段丢失。
+                        # 用旧 JSON 补齐新 JSON 缺失字段，确保报告完整性不被破坏。
+                        def _merge_analysis(old, new):
+                            if not isinstance(old, dict) or not isinstance(new, dict):
+                                return new
+                            merged = {}
+                            for key, val in new.items():
+                                merged[key] = _merge_analysis(old.get(key), val) if key in old else val
+                            for key, val in old.items():
+                                if key not in merged:
+                                    merged[key] = val
+                                elif isinstance(val, list) and isinstance(merged.get(key), list) and len(merged[key]) == 0:
+                                    merged[key] = val
+                                elif isinstance(val, dict) and isinstance(merged.get(key), dict):
+                                    merged[key] = _merge_analysis(val, merged[key])
+                            return merged
+
+                        old_data_map = {oi.get("代码"): oi for oi in old_items if isinstance(oi, dict) and oi.get("代码")}
+                        new_items_raw = new_data if isinstance(new_data, list) else [new_data]
+                        merged_items = []
+                        for ni in new_items_raw:
+                            if isinstance(ni, dict) and ni.get("代码") in old_data_map:
+                                merged_items.append(_merge_analysis(old_data_map[ni["代码"]], ni))
+                            else:
+                                merged_items.append(ni)
+                        data = merged_items if isinstance(new_data, list) else merged_items[0]
+
                         # 将旧标记注入新 item
                         new_items = data if isinstance(data, list) else [data]
                         for ni in new_items:
