@@ -227,7 +227,7 @@ Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → auto-ad
 | Frontend | Streamlit + Plotly |
 | Cache | Local memory (TTL) / Redis (configurable) |
 | Data Tier | FREE / PREMIUM / INSTITUTIONAL (pluggable premium slots) |
-| Testing | 44 e2e tests (compilation, data tools, scoring consistency, output compliance, report quality guards) |
+| Testing | 54 e2e tests (compilation, data tools, scoring consistency, output compliance, report quality guards) |
 
 ---
 
@@ -306,7 +306,7 @@ finbrain/
 │   ├── app.py                  # Streamlit UI (7 pages)
 │   └── kline_chart.py          # K-line chart module
 ├── tests/
-│   └── test_e2e.py             # 44 e2e tests
+│   └── test_e2e.py             # 54 e2e tests
 ├── docs/                       # Documentation
 └── data/
     ├── uploads/                # User-uploaded documents
