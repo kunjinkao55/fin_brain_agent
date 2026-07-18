@@ -82,7 +82,7 @@ Receives the structured fix list from Critics. Auto-corrects the analysis JSON: 
 Generates the final narrative, constrained by both Critic findings and Repair corrections.
 
 ### Audit Engine (Code, no LLM)
-8 deterministic checks + FCF warning injection. When the scoring engine's conservative PE anchor conflicts with the LLM's growth narrative, a `[Framework Divergence]` section presents both perspectives rather than forcing one to win.
+9 deterministic checks + FCF warning injection. When the scoring engine's conservative PE anchor conflicts with the LLM's growth narrative, a `[Framework Divergence]` section presents both perspectives rather than forcing one to win.
 
 ---
 
@@ -146,7 +146,7 @@ Three configurable tiers (FREE/PREMIUM/INSTITUTIONAL) with pluggable premium dat
 - Financial statements (8 quarters, parent + deducted profit)
 - Valuation metrics (ROE, gross/net margin, EPS, BPS, total shares)
 - Real-time stock prices and K-line charts (intraday/5-day/daily/weekly/monthly)
-- Announcement scanning (20 items, 3-level priority, dilution detection with auto-correction)
+- Announcement scanning (20 items, 3-level priority, dilution detection with auto-correction, earnings flash report content extraction)
 - Sector fund flow and market breadth monitoring
 - Sector momentum scoring (fund flow + relative strength + concentration, 4-tier temperature gauge)
 
@@ -161,7 +161,7 @@ Three configurable tiers (FREE/PREMIUM/INSTITUTIONAL) with pluggable premium dat
 - Intent routing (Chat / Deep Analysis / Phantom Hunter)
 - Critic Agent with structured findings (logic flaws, over-optimism, missing risks)
 - Valuation Agent with company-stage classification
-- Audit Engine with 8 deterministic checks + code pre-check
+- Audit Engine with 9 deterministic checks + code pre-check
 - 4-level escalation (warning → surgical fix → analyst retry → circuit breaker)
 - Processing marker system to prevent double-processing across retries
 
@@ -227,7 +227,7 @@ Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → auto-ad
 | Frontend | Streamlit + Plotly |
 | Cache | Local memory (TTL) / Redis (configurable) |
 | Data Tier | FREE / PREMIUM / INSTITUTIONAL (pluggable premium slots) |
-| Testing | 33 e2e tests (compilation, data tools, scoring consistency, output compliance) |
+| Testing | 44 e2e tests (compilation, data tools, scoring consistency, output compliance, report quality guards) |
 
 ---
 
@@ -306,7 +306,7 @@ finbrain/
 │   ├── app.py                  # Streamlit UI (7 pages)
 │   └── kline_chart.py          # K-line chart module
 ├── tests/
-│   └── test_e2e.py             # 33 e2e tests
+│   └── test_e2e.py             # 44 e2e tests
 ├── docs/                       # Documentation
 └── data/
     ├── uploads/                # User-uploaded documents
