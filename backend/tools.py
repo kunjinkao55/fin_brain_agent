@@ -786,6 +786,7 @@ def format_report(analysis: dict) -> str:
         lines = []
         code = analysis.get("代码", "?")
         name = analysis.get("名称", "?")
+        current_price = analysis.get("当前股价", 0) or analysis.get("投资评级", {}).get("当前价格", 0)
 
         lines.append(f"=" * 64)
         lines.append(f"  FinBrain 投资研究: {name} ({code})")
@@ -810,11 +811,12 @@ def format_report(analysis: dict) -> str:
             weighted = rating.get("加权总分", "")
             conf = rating.get("置信度", "")
             level_icon = {"BUY": "🟢", "HOLD": "🟡", "SELL": "🔴"}.get(level, "⚪")
+            price_str = f"当前价{float(current_price):.2f}元" if current_price else "当前价: 数据缺失"
             has_divergence = bool(analysis.get("框架分歧", ""))
             if has_divergence:
-                lines.append(f"  [投资决策] {level_icon} {level}(量化锚点) / 趋势框架→见下方分歧  合理价值: {fair}  安全边际: {margin}")
+                lines.append(f"  [投资决策] {level_icon} {level}(量化锚点) / 趋势框架→见下方分歧  {price_str}  合理价值: {fair}  安全边际: {margin}")
             else:
-                lines.append(f"  [投资决策] {level_icon} {level}  合理价值: {fair}  安全边际: {margin}")
+                lines.append(f"  [投资决策] {level_icon} {level}  {price_str}  合理价值: {fair}  安全边际: {margin}")
             if gap: lines.append(f"    估值差距: {gap}")
             lines.append(f"    安全买入价: {buy_zone}  (需{rating.get('安全边际要求','?')}安全边际)")
             if weighted: lines.append(f"    加权总分: {weighted}/100  置信度: {conf}")
@@ -1107,10 +1109,23 @@ def format_report(analysis: dict) -> str:
         # ---- 证伪条件 ----
         falsify = analysis.get("证伪条件", [])
         if falsify:
-            lines.append("")
-            lines.append("  [证伪条件] 以下情况出现则投资逻辑失效:")
+            # 过滤空内容或只有"条件X"前缀没有实质描述的项
+            clean_falsify = []
             for f in falsify:
-                lines.append(f"    ❌ {f}")
+                if not isinstance(f, str):
+                    continue
+                body = f.strip()
+                if not body:
+                    continue
+                # 去掉 "条件X:" / "条件X" 前缀后检查是否还有内容
+                stripped = re.sub(r'^条件\d+\s*[:：]?\s*', '', body).strip()
+                if stripped and stripped != body.rstrip(':'):
+                    clean_falsify.append(body)
+            if clean_falsify:
+                lines.append("")
+                lines.append("  [证伪条件] 以下情况出现则投资逻辑失效:")
+                for f in clean_falsify:
+                    lines.append(f"    ❌ {f}")
 
         # ---- 校验Agent ----
         val_notes = analysis.get("校验", [])

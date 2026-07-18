@@ -693,14 +693,14 @@ if page == "Chat":
             if is_last and is_assistant and last_stream:
                 with st.expander("Generation trace", expanded=False):
                     st.caption(last_stream[:10000] if len(last_stream) > 10000 else last_stream)
-            # 报告：每行最多40字，超出自动换行
+            # 报告：每行最多75字，超出自动换行
             content = msg["content"]
             if is_assistant and ("====" in content[:200] or "[投资决策]" in content[:500]):
                 wrapped = []
                 for line in content.split("\n"):
-                    while len(line) > 60:
-                        wrapped.append(line[:40])
-                        line = line[40:]
+                    while len(line) > 75:
+                        wrapped.append(line[:75])
+                        line = line[75:]
                     wrapped.append(line)
                 st.code("\n".join(wrapped), language=None, line_numbers=False)
             else:
@@ -938,9 +938,9 @@ elif page == "Analysis":
                                     st.caption(f"  Audit: {step.get('audit_retries',0)}/{step.get('max_retries',3)} retries | Precheck: {step.get('code_precheck','?')}")
                     wrapped = []
                     for line in reply.split("\n"):
-                        while len(line) > 60:
-                            wrapped.append(line[:40])
-                            line = line[40:]
+                        while len(line) > 75:
+                            wrapped.append(line[:75])
+                            line = line[75:]
                         wrapped.append(line)
                     st.html(f'<div class="report-block"><pre>{"\n".join(wrapped)}</pre></div>')
                 except Exception as e:
