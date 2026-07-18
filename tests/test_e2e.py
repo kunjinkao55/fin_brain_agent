@@ -782,6 +782,67 @@ class TestLLMFallback(unittest.TestCase):
             self.assertEqual(mock_create.call_count, 2)
 
 
+class TestMarketSentiment(unittest.TestCase):
+    """市场情绪评分（仅作参考，不参与估值）"""
+
+    def _mock_env(self, breadth, limit_up, dragon):
+        """统一 mock 全局情绪数据源"""
+        return patch("backend.tools.get_market_breadth", return_value=breadth),                patch("backend.tools.get_limit_up_pool", return_value=limit_up),                patch("backend.tools.get_dragon_tiger_list", return_value=dragon),                patch("backend.cache.get", return_value=None)
+
+    def test_sentiment_neutral(self):
+        """市场中性、个股横盘，情绪得分应为 0"""
+        from backend.tools import market_sentiment_score
+        b, l, d, c = self._mock_env(
+            {"上涨比例": "50.0%", "全A": {"上涨": 100, "下跌": 100, "平盘": 0, "总计": 200}},
+            {"列表": []}, {"列表": []}
+        )
+        with b, l, d, c:
+            r = market_sentiment_score("600131", {"price": 10.0, "yesterday_close": 10.0})
+            self.assertEqual(r["综合情绪得分"], 0.0)
+            self.assertEqual(r["情绪标签"], "中性")
+            self.assertIn("按基本面估值锚点执行", r["对操作建议"])
+
+    def test_sentiment_bullish(self):
+        """市场偏暖、个股大涨，情绪得分偏热"""
+        from backend.tools import market_sentiment_score
+        b, l, d, c = self._mock_env(
+            {"上涨比例": "60.0%", "全A": {"上涨": 120, "下跌": 80, "平盘": 0, "总计": 200}},
+            {"列表": []}, {"列表": []}
+        )
+        with b, l, d, c:
+            r = market_sentiment_score("600132", {"price": 10.5, "yesterday_close": 10.0})
+            self.assertAlmostEqual(r["综合情绪得分"], 0.6, places=1)
+            self.assertEqual(r["情绪标签"], "偏热")
+            self.assertIn("分批建仓", r["对操作建议"])
+
+    def test_sentiment_bearish(self):
+        """市场偏冷、个股大跌，情绪得分偏冷"""
+        from backend.tools import market_sentiment_score
+        b, l, d, c = self._mock_env(
+            {"上涨比例": "40.0%", "全A": {"上涨": 80, "下跌": 120, "平盘": 0, "总计": 200}},
+            {"列表": []}, {"列表": []}
+        )
+        with b, l, d, c:
+            r = market_sentiment_score("600133", {"price": 9.5, "yesterday_close": 10.0})
+            self.assertAlmostEqual(r["综合情绪得分"], -0.6, places=1)
+            self.assertEqual(r["情绪标签"], "偏冷")
+            self.assertIn("耐心观察", r["对操作建议"])
+
+    def test_sentiment_limit_up(self):
+        """个股涨停时短线热度得分应反映涨停"""
+        from backend.tools import market_sentiment_score
+        b, l, d, c = self._mock_env(
+            {"上涨比例": "55.0%", "全A": {"上涨": 110, "下跌": 90, "平盘": 0, "总计": 200}},
+            {"列表": [{"代码": "600134", "名称": "测试"}]}, {"列表": []}
+        )
+        with b, l, d, c:
+            r = market_sentiment_score("600134", {"price": 11.0, "yesterday_close": 10.0})
+            self.assertAlmostEqual(r["综合情绪得分"], 0.8, places=1)
+            self.assertEqual(r["情绪标签"], "极度乐观")
+            self.assertIn("涨停", r["短线热度"]["备注"])
+            self.assertIn("追高风险", r["对操作建议"])
+
+
 
 def run_all():
     """运行全部测试并输出结果"""
@@ -790,7 +851,8 @@ def run_all():
     for cls in [TestCompilation, TestDataTools, TestScoringConsistency,
                 TestInvestmentRating, TestHarnessGuards, TestConfig,
                 TestOutputConsistency, TestReportQualityGuards,
-                TestStructuredOutput, TestGraphRouting, TestLLMFallback]:
+                TestStructuredOutput, TestGraphRouting, TestLLMFallback,
+                TestMarketSentiment]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
     runner = unittest.TextTestRunner(verbosity=2)

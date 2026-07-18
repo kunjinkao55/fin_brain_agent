@@ -863,6 +863,12 @@ def data_collector_node(state: FinBrainState) -> dict:
     # 并发拉取所有股票数据（含调用追踪）
     _tool_traces = []  # 收集所有工具调用记录
 
+    # 预取全局情绪数据，避免每个股票重复调用
+    from backend.tools import market_sentiment_score, get_limit_up_pool, get_dragon_tiger_list
+    _breadth = get_market_breadth()
+    _limit_up = get_limit_up_pool(top_n=30)
+    _dragon = get_dragon_tiger_list()
+
     def _fetch_one(code):
         _tools = []
         try:
@@ -888,13 +894,14 @@ def data_collector_node(state: FinBrainState) -> dict:
             if _flash:
                 cs_data["flash"] = _flash
             scores = calculate_scores(cs_data); _tools.append(("评分", "✅"))
+            sentiment = market_sentiment_score(code, price, _breadth, _limit_up, _dragon); _tools.append(("情绪", "✅"))
             name = price.get("name", code) if isinstance(price, dict) else code
             return {"代码": code, "名称": name, "行情": price,
                     "行业": ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else "",
                     "公告": announcements,
                     "财报": {"利润表": profit_rows[:4], "现金流": fin.get("cashflow",[])[:2]},
                     "估值": val.get("data",[])[:2] if isinstance(val, dict) else [],
-                    "预计算分数": scores, "_tools": _tools}
+                    "预计算分数": scores, "市场情绪": sentiment, "_tools": _tools}
         except Exception as e:
             _tools.append(("数据采集", f"❌{str(e)[:30]}"))
             return {"代码": code, "error": str(e), "_tools": _tools}
@@ -2262,6 +2269,24 @@ def reporter_node(state: FinBrainState) -> dict:
         sym = data.get("代码", "")
         if sym:
             _fix_and_decide(data, sym)
+
+    # === 注入市场情绪参考（从 collected_data 提取，作为报告参考项）===
+    _sentiment_map = {}
+    try:
+        _collected_clean = re.sub(r'^\[(INDUSTRY|TOOLS)\][^\n]*\n', '', collected, flags=re.MULTILINE)
+        _collected_list = json.loads(_collected_clean)
+        if isinstance(_collected_list, list):
+            for _r in _collected_list:
+                if isinstance(_r, dict) and _r.get("代码") and "市场情绪" in _r:
+                    _sentiment_map[_r["代码"]] = _r["市场情绪"]
+    except Exception:
+        pass
+    _items_to_inject = data if isinstance(data, list) else [data]
+    for _it in _items_to_inject:
+        if isinstance(_it, dict):
+            _sym = _it.get("代码", "")
+            if _sym in _sentiment_map:
+                _it["市场情绪"] = _sentiment_map[_sym]
 
     # === 校验Agent：4项一致性检查 ===
     items_to_check = data if isinstance(data, list) else [data]

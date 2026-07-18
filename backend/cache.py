@@ -13,6 +13,7 @@ _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # TTL 配置（秒）
 TTL = {
+    "market_breadth": 300, "market_sentiment": 300,
     "stock_price": 30,       "stock_history": 300,
     "financial_statements": 1800, "valuation": 1800,
     "industry_info": 3600,   "fund_flow": 300,
