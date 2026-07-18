@@ -5,6 +5,7 @@ FinBrain 端到端验证脚本
 """
 
 import sys, os, json, time, unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ["FINBRAIN_DATA_MODE"] = "local"
@@ -545,6 +546,81 @@ class TestReportQualityGuards(unittest.TestCase):
         self.assertIn("IT服务Ⅱ", cfg["industry_pe"])
         self.assertGreater(cfg["industry_pe"]["IT服务Ⅱ"], cfg["default_ind_pe"])
 
+
+class TestStructuredOutput(unittest.TestCase):
+    """结构化输出 Schema 校验"""
+
+    def test_analyst_output_schema(self):
+        """典型 Analyst JSON 可被 AnalystOutput 解析"""
+        from backend.schemas import AnalystOutput
+        payload = {
+            "代码": "600131", "名称": "国网信通",
+            "公司画像": {"主营业务": "电力信息化", "公司类型": "成长型"},
+            "投资逻辑链": "国网数字化投入加大→订单增长→利润释放",
+            "评分": {
+                "盈利能力": {"得分": 7, "依据": "ROE 10%"},
+                "成长性": {"得分": 8, "依据": "营收+20%"},
+            },
+            "亮点": ["订单饱满"], "风险": ["应收账款高"],
+            "证伪条件": ["煤价反弹"],
+            "操作建议": "≤10元建仓",
+        }
+        obj = AnalystOutput.model_validate(payload)
+        self.assertEqual(obj.代码, "600131")
+        self.assertEqual(obj.评分["成长性"].得分, 8)
+
+    def test_critic_output_schema(self):
+        """CriticOutput 可解析默认通过对象"""
+        from backend.schemas import CriticOutput
+        obj = CriticOutput.model_validate({"通过": True, "逻辑漏洞": []})
+        self.assertTrue(obj.通过)
+
+    def test_valuation_output_schema(self):
+        """ValuationOutput 解析典型输出"""
+        from backend.schemas import ValuationOutput
+        obj = ValuationOutput.model_validate({"公司阶段": "成长期", "适用框架": ["PE"] })
+        self.assertIn("PE", obj.适用框架)
+
+    def test_audit_output_schema(self):
+        """AuditOutput 解析典型问题列表"""
+        from backend.schemas import AuditOutput
+        payload = {"问题": [{"级别": "❌", "描述": "估值过高", "修正建议": "下调目标价"}]}
+        obj = AuditOutput.model_validate(payload)
+        self.assertEqual(len(obj.问题), 1)
+
+
+class TestGraphRouting(unittest.TestCase):
+    """LangGraph 条件分支路由"""
+
+    def test_route_after_data_retry(self):
+        """collected_data 无股票代码时，路由回 data_collector"""
+        from backend.agent import route_after_data
+        self.assertEqual(route_after_data({"collected_data": "", "processing_log": []}), "data_collector")
+
+    def test_route_after_data_forward(self):
+        """collected_data 含股票代码时，进入 classifier"""
+        from backend.agent import route_after_data
+        state = {"collected_data": '{"代码": "600131"}', "processing_log": []}
+        self.assertEqual(route_after_data(state), "classifier")
+
+    def test_route_after_data_no_infinite_loop(self):
+        """已重试一次后不再回 data_collector"""
+        from backend.agent import route_after_data
+        log = [{"phase": "Data"}, {"phase": "Data"}]
+        self.assertEqual(route_after_data({"collected_data": "", "processing_log": log}), "classifier")
+
+    def test_route_after_critic_skip_repair(self):
+        """Critic 无问题时跳过 Repair"""
+        from backend.agent import route_after_critic
+        log = [{"phase": "Critics", "total_issues": 0}]
+        self.assertEqual(route_after_critic({"processing_log": log}), "reporter")
+
+    def test_route_after_critic_goto_repair(self):
+        """Critic 有问题时进入 Repair"""
+        from backend.agent import route_after_critic
+        log = [{"phase": "Critics", "total_issues": 3}]
+        self.assertEqual(route_after_critic({"processing_log": log}), "repair")
+
     def test_pessimistic_above_fair_value_bridge_note(self):
         """情景悲观价>量化合理价值时，报告必须出现桥接说明"""
         from backend.tools import format_report
@@ -606,6 +682,106 @@ class TestReportQualityGuards(unittest.TestCase):
         self.assertAlmostEqual(profit[0]["归母净利润"] / 1e8, 2.31, places=1)
 
 
+class TestLLMFallback(unittest.TestCase):
+    """LLM 多槽位熔断链"""
+
+    def test_read_llm_slots_from_env(self):
+        """从环境变量读取 3 槽位配置"""
+        from backend.agent import _read_llm_slots
+        with patch.dict(os.environ, {
+            "LLM_SLOT_1_PROVIDER": "deepseek",
+            "LLM_SLOT_1_MODEL": "deepseek-chat",
+            "LLM_SLOT_1_API_KEY": "sk-1",
+            "LLM_SLOT_2_PROVIDER": "openai",
+            "LLM_SLOT_2_MODEL": "gpt-4o",
+            "LLM_SLOT_3_PROVIDER": "anthropic",
+            "LLM_SLOT_3_MODEL": "claude-sonnet-5",
+        }, clear=False):
+            slots = _read_llm_slots()
+            self.assertEqual(len(slots), 3)
+            self.assertEqual(slots[0]["provider"], "deepseek")
+            self.assertEqual(slots[1]["provider"], "openai")
+            self.assertEqual(slots[2]["provider"], "anthropic")
+
+    def test_read_llm_slots_optional_23(self):
+        """slot 2/3 可选，留空时不被读取"""
+        from backend.agent import _read_llm_slots
+        with patch.dict(os.environ, {
+            "LLM_SLOT_1_PROVIDER": "deepseek",
+            "LLM_SLOT_1_MODEL": "deepseek-chat",
+        }, clear=False):
+            slots = _read_llm_slots()
+            self.assertEqual(len(slots), 1)
+            self.assertEqual(slots[0]["provider"], "deepseek")
+
+    def test_fallback_chain_slot2_on_failure(self):
+        """slot 1 失败时自动切换到 slot 2"""
+        from backend.agent import LLMFallbackChain
+
+        class FakeLLM:
+            def __init__(self, name):
+                self.name = name
+            def invoke(self, *args, **kwargs):
+                if self.name == "slot1":
+                    raise RuntimeError("slot1 failed")
+                return f"ok from {self.name}"
+
+        with patch("backend.agent._create_llm") as mock_create:
+            mock_create.side_effect = [FakeLLM("slot1"), FakeLLM("slot2")]
+            chain = LLMFallbackChain([
+                {"provider": "deepseek", "model": "x", "api_key": "k1", "base_url": ""},
+                {"provider": "openai", "model": "y", "api_key": "k2", "base_url": ""},
+            ])
+            result = chain.invoke("hello")
+            self.assertEqual(result, "ok from slot2")
+            self.assertEqual(mock_create.call_count, 2)
+
+    def test_fallback_chain_all_fail(self):
+        """所有槽位失败时抛出 RuntimeError"""
+        from backend.agent import LLMFallbackChain
+
+        class BadLLM:
+            def invoke(self, *args, **kwargs):
+                raise RuntimeError("always fail")
+
+        with patch("backend.agent._create_llm") as mock_create:
+            mock_create.return_value = BadLLM()
+            chain = LLMFallbackChain([
+                {"provider": "deepseek", "model": "x", "api_key": "k1", "base_url": ""},
+                {"provider": "openai", "model": "y", "api_key": "k2", "base_url": ""},
+            ])
+            with self.assertRaises(RuntimeError):
+                chain.invoke("hello")
+            self.assertEqual(mock_create.call_count, 2)
+
+    def test_fallback_chain_structured_slot2_on_failure(self):
+        """结构化输出链在 slot 1 失败后切换到 slot 2"""
+        from backend.agent import LLMFallbackChain
+        from backend.schemas import CriticOutput
+
+        class FakeLLM:
+            def __init__(self, name, fail=False):
+                self.name = name
+                self.fail = fail
+            def with_structured_output(self, schema, method):
+                return self
+            def invoke(self, *args, **kwargs):
+                if self.fail:
+                    raise RuntimeError("slot1 failed")
+                return CriticOutput(通过=True, 逻辑漏洞=[])
+
+        with patch("backend.agent._create_llm") as mock_create:
+            mock_create.side_effect = [FakeLLM("slot1", fail=True), FakeLLM("slot2")]
+            chain = LLMFallbackChain([
+                {"provider": "deepseek", "model": "x", "api_key": "k1", "base_url": ""},
+                {"provider": "openai", "model": "y", "api_key": "k2", "base_url": ""},
+            ])
+            structured = chain.with_structured_output(CriticOutput)
+            result = structured.invoke("hello")
+            self.assertTrue(result.通过)
+            self.assertEqual(mock_create.call_count, 2)
+
+
 
 def run_all():
     """运行全部测试并输出结果"""
@@ -613,7 +789,8 @@ def run_all():
     suite = unittest.TestSuite()
     for cls in [TestCompilation, TestDataTools, TestScoringConsistency,
                 TestInvestmentRating, TestHarnessGuards, TestConfig,
-                TestOutputConsistency, TestReportQualityGuards]:
+                TestOutputConsistency, TestReportQualityGuards,
+                TestStructuredOutput, TestGraphRouting, TestLLMFallback]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
     runner = unittest.TextTestRunner(verbosity=2)

@@ -14,6 +14,8 @@ from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+from backend.schemas import AnalystOutput, ValuationOutput, CriticOutput, AuditOutput
+
 # LangGraph SqliteSaver — 框架内置持久化，跨会话恢复对话
 _DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "raw", "checkpoints.db")
 
@@ -66,39 +68,179 @@ _llm_failures = 0
 _MAX_LLM_FAILURES = 3
 
 
+def _read_llm_slots() -> list[dict]:
+    """从环境变量读取 3 槽位 LLM 配置。slot 1 必填；slot 2/3 可选。"""
+    slots = []
+    for i in range(1, 4):
+        prefix = f"LLM_SLOT_{i}"
+        provider = os.getenv(f"{prefix}_PROVIDER", "").strip().lower()
+        model = os.getenv(f"{prefix}_MODEL", "").strip()
+        api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+        base_url = os.getenv(f"{prefix}_BASE_URL", "").strip()
+        if not provider and not model:
+            # slot 2/3 允许全部为空；slot 1 若未配置则兼容旧单变量
+            if i == 1:
+                provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
+                model = os.getenv("LLM_MODEL", "").strip() or ("deepseek-chat" if provider == "deepseek" else "")
+                if provider == "deepseek":
+                    api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
+                    base_url = base_url or os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
+                elif provider == "openai":
+                    api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+                    base_url = base_url or os.getenv("LLM_BASE_URL", "")
+                elif provider == "anthropic":
+                    api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
+                    base_url = base_url or os.getenv("LLM_BASE_URL", "")
+            else:
+                continue
+        if not provider:
+            continue
+        if not model:
+            model = {"deepseek": "deepseek-chat", "openai": "gpt-4o", "anthropic": "claude-sonnet-5"}.get(provider, "")
+        slots.append({
+            "provider": provider,
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url,
+        })
+    return slots
+
+
+def _create_llm(slot: dict):
+    """根据单个槽位配置创建 LLM 实例。"""
+    provider = slot["provider"]
+    model = slot["model"]
+    api_key = slot.get("api_key", "")
+    base_url = slot.get("base_url", "")
+    if provider in ("deepseek", "openai"):
+        from langchain_openai import ChatOpenAI
+        kwargs = {"model": model, "temperature": 0, "max_tokens": 4096, "streaming": True}
+        if api_key: kwargs["api_key"] = api_key
+        if base_url: kwargs["base_url"] = base_url
+        return ChatOpenAI(**kwargs)
+    elif provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        kwargs = {"model": model, "temperature": 0, "max_tokens": 4096, "streaming": True}
+        if api_key: kwargs["api_key"] = api_key
+        if base_url: kwargs["base_url"] = base_url
+        return ChatAnthropic(**kwargs)
+    else:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+class LLMFallbackChain:
+    """LLM 多槽位熔断链：invoke 失败时自动切换下一个槽位。"""
+
+    def __init__(self, slots: list[dict]):
+        self.slots = slots
+        self._current_idx = 0
+        self._llm = None
+
+    def _current_llm(self):
+        if self._llm is None:
+            self._llm = _create_llm(self.slots[self._current_idx])
+        return self._llm
+
+    def invoke(self, *args, **kwargs):
+        """顺序尝试所有槽位，直到成功或全部失败。"""
+        last_err = None
+        for i in range(len(self.slots)):
+            self._current_idx = i
+            try:
+                self._llm = _create_llm(self.slots[i])
+                return self._llm.invoke(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                self._llm = None
+        raise RuntimeError(f"LLM 全部 {len(self.slots)} 个槽位调用失败。请检查 API Key 和网络。最后错误: {last_err}")
+
+    def with_structured_output(self, schema, method="function_calling"):
+        """返回结构化输出 wrapper，内部仍按槽位熔断。"""
+        return _StructuredFallbackChain(self, schema, method)
+
+
+class _StructuredFallbackChain:
+    """带熔断的结构化输出链。"""
+
+    def __init__(self, chain: LLMFallbackChain, schema, method: str):
+        self.chain = chain
+        self.schema = schema
+        self.method = method
+
+    def invoke(self, *args, **kwargs):
+        last_err = None
+        for i in range(len(self.chain.slots)):
+            self.chain._current_idx = i
+            try:
+                base = _create_llm(self.chain.slots[i])
+                structured = base.with_structured_output(self.schema, method=self.method)
+                return structured.invoke(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                self.chain._llm = None
+        # 全部槽位结构化失败：回退到原始文本输出并手动解析
+        raw = self.chain.invoke(*args, **kwargs)
+        content = raw.content if hasattr(raw, 'content') else str(raw)
+        parsed = _parse_structured(content, self.schema)
+        if parsed is not None:
+            return parsed
+        raise RuntimeError(f"结构化输出失败，且手动解析也失败。最后错误: {last_err}")
+
+
 def _get_llm():
-    """获取 LLM 实例。连续失败 3 次→熔断。"""
-    global _llm_failures
-    if _llm_failures >= _MAX_LLM_FAILURES:
-        raise RuntimeError(f"LLM API 连续失败{_MAX_LLM_FAILURES}次，已熔断。请检查 API Key 和网络后重启。")
+    """获取 LLM 实例（多槽位熔断链）。"""
     global _LLM
     if _LLM is not None:
         return _LLM
-
-    provider = os.getenv("LLM_PROVIDER", "anthropic")
-    if provider == "deepseek":
-        from langchain_openai import ChatOpenAI
-        _LLM = ChatOpenAI(
-            model=os.getenv("LLM_MODEL","deepseek-chat"), temperature=0, max_tokens=4096,
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url=os.getenv("LLM_BASE_URL","https://api.deepseek.com"), streaming=True,
-        )
-    elif provider == "openai":
-        from langchain_openai import ChatOpenAI
-        _LLM = ChatOpenAI(
-            model=os.getenv("LLM_MODEL","gpt-4o"), temperature=0, max_tokens=4096,
-            api_key=os.getenv("OPENAI_API_KEY"), streaming=True,
-        )
-    else:
-        from langchain_anthropic import ChatAnthropic
-        _LLM = ChatAnthropic(
-            model=os.getenv("LLM_MODEL","claude-sonnet-5"), temperature=0, max_tokens=4096, streaming=True,
-        )
+    slots = _read_llm_slots()
+    if not slots:
+        raise RuntimeError("未配置任何 LLM 槽位。请在前端 Settings 或 configs/.env 中配置 LLM_SLOT_* 变量。")
+    _LLM = LLMFallbackChain(slots)
     return _LLM
 
-# ============================================================
-#  State Schema
-# ============================================================
+
+def _get_llm_with_schema(schema):
+    """
+    返回绑定结构化输出的 LLM Runnable。
+    优先 function_calling；失败时回退到 json_mode + Pydantic 校验。
+    """
+    base = _get_llm()
+    # 如果是单槽位链，直接尝试底层 with_structured_output；
+    # 多槽位链的 with_structured_output 已在 LLMFallbackChain 中处理。
+    if isinstance(base, LLMFallbackChain):
+        return base.with_structured_output(schema, method="function_calling")
+    try:
+        return base.with_structured_output(schema, method="function_calling")
+    except Exception:
+        try:
+            return base.with_structured_output(schema, method="json_mode")
+        except Exception:
+            return base
+
+    """手动解析 JSON 并用 Pydantic schema 校验。用于 with_structured_output 失败时的兜底。"""
+    import json, re
+    try:
+        return schema.model_validate_json(content)
+    except Exception:
+        pass
+    # 尝试从 markdown 代码块提取
+    m = re.search(r'```(?:json)?\s*([\s\S]*?)```', content)
+    if m:
+        try:
+            return schema.model_validate_json(m.group(1))
+        except Exception:
+            pass
+    # 尝试从文本中提取第一个 JSON 对象/数组
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(content):
+        if ch in '[{':
+            try:
+                obj, _ = decoder.raw_decode(content[i:])
+                return schema.model_validate(obj)
+            except Exception:
+                continue
+    return None
+
 
 class FinBrainState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -881,19 +1023,35 @@ def analyst_node(state: FinBrainState) -> dict:
         f"输出纯JSON。{multi_note}"
     )
     try:
-        response = _get_llm().invoke([
-            SystemMessage(content=ANALYST_PROMPT),
-            HumanMessage(content=prompt),
-        ])
+        if stock_count >= 2:
+            # 多股对比：保持原 JSON 字符串输出，避免 schema 列表/单对象歧义
+            response = _get_llm().invoke([
+                SystemMessage(content=ANALYST_PROMPT),
+                HumanMessage(content=prompt),
+            ])
+            analysis_text = response.content
+        else:
+            structured_llm = _get_llm_with_schema(AnalystOutput)
+            response = structured_llm.invoke([
+                SystemMessage(content=ANALYST_PROMPT),
+                HumanMessage(content=prompt),
+            ])
+            if isinstance(response, AnalystOutput):
+                analysis_text = response.model_dump_json(ensure_ascii=False)
+            elif hasattr(response, 'content'):
+                parsed = _parse_structured(response.content, AnalystOutput)
+                analysis_text = parsed.model_dump_json(ensure_ascii=False) if parsed else response.content
+            else:
+                analysis_text = str(response)
         _llm_failures = 0  # 成功→重置
     except Exception:
         _llm_failures += 1
         raise
     prev_log = state.get("processing_log", [])
     prev_log.append({"phase": "Analysis", "summary": f"投资分析生成完成",
-                     "status": "SUCCESS", "output_chars": len(response.content),
+                     "status": "SUCCESS", "output_chars": len(analysis_text),
                      "rag_calls": _rag_traces, "industry_count": len(industry_names)})
-    return {"analysis": response.content, "processing_log": prev_log}
+    return {"analysis": analysis_text, "processing_log": prev_log}
 
 def valuation_agent_node(state: FinBrainState) -> dict:
     """估值框架选择Agent：判断公司阶段，推荐估值方法，输出多框架参考区间。"""
@@ -913,16 +1071,18 @@ def valuation_agent_node(state: FinBrainState) -> dict:
     if pe_match: data_summary += f"PE={pe_match.group(1)}倍; "
 
     try:
-        val_resp = _get_llm().invoke([
+        structured_llm = _get_llm_with_schema(ValuationOutput)
+        val_resp = structured_llm.invoke([
             SystemMessage(content=VALUATION_PROMPT),
             HumanMessage(content=f"{data_summary}\n\n分析JSON:\n{raw[:3000]}\n\n请判断公司阶段并推荐估值框架。"),
         ])
-        val_text = val_resp.content.strip()
-        try:
-            val_json = json.loads(val_text)
-        except json.JSONDecodeError:
-            m = _vre.search(r'\{.*"公司阶段".*\}', val_text, _vre.DOTALL)
-            val_json = json.loads(m.group(0)) if m else {"公司阶段": "无法判断", "适用框架": ["PE(静态)"]}
+        if isinstance(val_resp, ValuationOutput):
+            val_json = val_resp.model_dump(exclude_none=True)
+        elif hasattr(val_resp, 'content'):
+            parsed = _parse_structured(val_resp.content, ValuationOutput)
+            val_json = parsed.model_dump(exclude_none=True) if parsed else {"公司阶段": "无法判断", "适用框架": ["PE(静态)"]}
+        else:
+            val_json = {"公司阶段": "无法判断", "适用框架": ["PE(静态)"]}
     except Exception:
         val_json = {"公司阶段": "判断跳过(LLM错误)", "适用框架": ["PE(静态)"]}
 
@@ -1027,19 +1187,27 @@ def _call_critic(prompt_template, analysis_text):
         code_text = "\n".join("- " + c for c in code_issues) if code_issues else "无"
         prompt = prompt_template.replace("{code_findings}", code_text)
     try:
-        resp = _get_llm().invoke([
+        structured_llm = _get_llm_with_schema(CriticOutput)
+        resp = structured_llm.invoke([
             SystemMessage(content=prompt),
             HumanMessage(content="审查以下分析:\n\n" + analysis_text[:4000]),
         ])
-        result = json.loads(resp.content.strip())
-        # 合并代码层发现的数值问题
-        if "{code_findings}" in prompt_template:
-            for issue in (_financial_code_check(analysis_text)):
-                if issue not in result.get("财务误读", []):
-                    result.setdefault("财务误读", []).append(issue)
-        return result
+        if isinstance(resp, CriticOutput):
+            result = resp.model_dump(exclude_none=True)
+        elif hasattr(resp, 'content'):
+            parsed = _parse_structured(resp.content, CriticOutput)
+            result = parsed.model_dump(exclude_none=True) if parsed else {"通过": True, "逻辑漏洞": [], "财务误读": [], "行业误述": [], "建议": ""}
+        else:
+            result = {"通过": True, "逻辑漏洞": [], "财务误读": [], "行业误述": [], "建议": ""}
     except Exception:
         return {"通过": True, "逻辑漏洞": [], "财务误读": [], "行业误述": [], "建议": ""}
+
+    # 合并代码层发现的数值问题
+    if "{code_findings}" in prompt_template:
+        for issue in (_financial_code_check(analysis_text)):
+            if issue not in result.get("财务误读", []):
+                result.setdefault("财务误读", []).append(issue)
+    return result
 
 
 def critics_node(state: FinBrainState) -> dict:
@@ -1116,15 +1284,30 @@ def repair_node(state: FinBrainState) -> dict:
     # 用Repair Agent修正
     fix_text = "\n".join(f"{i+1}. {f['issue']}" for i, f in enumerate(fix_list[:8]))
     try:
-        repair_resp = _get_llm().invoke([
-            SystemMessage(content=REPAIR_PROMPT),
-            HumanMessage(content="Critic发现问题:\n" + fix_text + "\n\n原始JSON:\n" + raw[:4000] + "\n\n请输出修正后的完整JSON。"),
-        ])
-        repaired = repair_resp.content.strip()
-        # 提取JSON
-        if not repaired.startswith("{"):
-            m = _re.search(r'\{.*', repaired, _re.DOTALL)
-            if m: repaired = m.group(0)
+        raw_is_array = raw.strip().startswith("[")
+        if raw_is_array:
+            # 多股对比：保持原 JSON 字符串输出
+            repair_resp = _get_llm().invoke([
+                SystemMessage(content=REPAIR_PROMPT),
+                HumanMessage(content="Critic发现问题:\n" + fix_text + "\n\n原始JSON:\n" + raw[:4000] + "\n\n请输出修正后的完整JSON。"),
+            ])
+            repaired = repair_resp.content.strip()
+            if not repaired.startswith("{"):
+                m = _re.search(r'\{.*', repaired, _re.DOTALL)
+                if m: repaired = m.group(0)
+        else:
+            structured_llm = _get_llm_with_schema(AnalystOutput)
+            repair_resp = structured_llm.invoke([
+                SystemMessage(content=REPAIR_PROMPT),
+                HumanMessage(content="Critic发现问题:\n" + fix_text + "\n\n原始JSON:\n" + raw[:4000] + "\n\n请输出修正后的完整JSON对象。"),
+            ])
+            if isinstance(repair_resp, AnalystOutput):
+                repaired = repair_resp.model_dump_json(ensure_ascii=False)
+            elif hasattr(repair_resp, 'content'):
+                parsed = _parse_structured(repair_resp.content, AnalystOutput)
+                repaired = parsed.model_dump_json(ensure_ascii=False) if parsed else repair_resp.content
+            else:
+                repaired = str(repair_resp)
     except Exception:
         repaired = raw
 
@@ -2248,11 +2431,21 @@ def reporter_node(state: FinBrainState) -> dict:
                         _tail_sections += audit_report[idx:end] + "\n"
             audit_body = _head + ("\n...(中略)...\n" + _tail_sections if _tail_sections else "")
             audit_prompt = f"请审查以下投资报告，找出逻辑矛盾:\n\n{audit_body}"
-            audit_resp = _get_llm().invoke([
-                SystemMessage(content=AUDITOR_PROMPT),
-                HumanMessage(content=audit_prompt),
-            ])
-            audit_json = json.loads(audit_resp.content.strip())
+            try:
+                structured_audit_llm = _get_llm_with_schema(AuditOutput)
+                audit_resp = structured_audit_llm.invoke([
+                    SystemMessage(content=AUDITOR_PROMPT),
+                    HumanMessage(content=audit_prompt),
+                ])
+                if isinstance(audit_resp, AuditOutput):
+                    audit_json = audit_resp.model_dump(exclude_none=True)
+                elif hasattr(audit_resp, 'content'):
+                    parsed = _parse_structured(audit_resp.content, AuditOutput)
+                    audit_json = parsed.model_dump(exclude_none=True) if parsed else {"问题": []}
+                else:
+                    audit_json = {"问题": []}
+            except Exception:
+                audit_json = {"问题": []}
             issues = audit_json.get("问题", [])
             if not issues:
                 break
@@ -2501,6 +2694,29 @@ def reporter_node(state: FinBrainState) -> dict:
 
 _GRAPH = None
 
+def route_after_data(state: FinBrainState) -> str:
+    """数据节点后路由：数据不足则重取一次，否则进入分类器。"""
+    import re
+    collected = state.get("collected_data", "")
+    data_attempts = sum(1 for log in state.get("processing_log", []) if log.get("phase") == "Data")
+    has_symbol = bool(re.search(r'"代码":\s*"\d{6}"', collected))
+    if not has_symbol and data_attempts < 2:
+        return "data_collector"
+    return "classifier"
+
+
+def route_after_critic(state: FinBrainState) -> str:
+    """Critic 后路由：无严重问题则跳过 Repair，否则进入 Repair。"""
+    total_issues = 0
+    for log in reversed(state.get("processing_log", [])):
+        if log.get("phase") == "Critics":
+            total_issues = log.get("total_issues", 0)
+            break
+    if total_issues == 0:
+        return "reporter"
+    return "repair"
+
+
 def build_graph():
     global _GRAPH
     if _GRAPH is not None:
@@ -2516,12 +2732,13 @@ def build_graph():
     graph.add_node("reporter", reporter_node)
 
     graph.add_edge(START, "data_collector")
-    graph.add_edge("data_collector", "classifier")
+    graph.add_conditional_edges("data_collector", route_after_data,
+                                {"data_collector": "data_collector", "classifier": "classifier"})
     graph.add_edge("classifier", "analyst")
     graph.add_edge("analyst", "valuation")
     graph.add_edge("valuation", "critics")
-    graph.add_edge("critics", "repair")
-    graph.add_edge("repair", "reporter")
+    graph.add_conditional_edges("critics", route_after_critic,
+                                {"repair": "repair", "reporter": "reporter"})
     graph.add_edge("repair", "reporter")
     graph.add_edge("reporter", END)
 

@@ -33,14 +33,18 @@ Intent Router ──→ Chat / Deep Analysis / Phantom Hunter
 │                                                      │
 │  Data Agent → Classifier → Analyst → Valuation      │
 │   (parallel)    (code)      (LLM)     (LLM)          │
+│       │                                              │
+│       └─ data missing? ──→ re-fetch once            │
 │                                                      │
-│  → Critics(3-way parallel) → Repair → Reporter       │
+│  → Critics(3-way parallel) ──→ Repair? ──→ Reporter │
 │     Logic/Financial/Industry   (LLM)    (LLM)        │
+│       │                            │                 │
+│       └─ no issues? ──→ skip Repair ──┘             │
 │                                                      │
 │  → Audit Engine (code)                               │
 │     · score consistency · data unit validation       │
 │     · dilution correction · scenario monotonicity    │
-│     · FCF warning injection                          │
+│     · FCF warning injection · structured output      │
 └─────────────────────────────────────────────────────┘
     │
     ▼
@@ -121,10 +125,19 @@ This trace is visible in the Streamlit UI as a collapsible panel, making the sys
 ### Deterministic-Probabilistic Boundary
 Financial calculations (EPS, PE, ROE, scores, fair value, dilution ratios) are pure Python functions. The LLM never touches numbers it can get wrong. This guarantees: same stock → same scores every time (verified: 100-run consistency >96%).
 
+### Structured Output / Guardrails
+LLM nodes (Analyst, Valuation, Critic, Repair, Audit) use `with_structured_output` with Pydantic schemas (`AnalystOutput`, `ValuationOutput`, `CriticOutput`, `AuditOutput`). If framework-level structured decoding fails, a multi-slot fallback chain falls back to raw text parsing with schema validation. This eliminates the fragility of `json.loads` + regex.
+
+### LLM Fallback Chain
+Three configurable LLM slots (slot 1 required, slot 2/3 optional) provide automatic failover. If the primary model fails or does not support structured output, the chain tries the next configured slot. All failures are logged; complete failure raises a clear `RuntimeError`.
+
 ### Dual-Layer Verification
 - **Code layer (Audit Engine)**: 8 pre-checks on mathematical consistency, unit validity, field completeness
 - **LLM layer (Critic Agent)**: Semantic review of logic, assumptions, and narrative quality
 - **Code pre-check**: If all deterministic checks pass, the LLM auditor runs in "warning-only" mode, avoiding unnecessary retries
+
+### Conditional Routing
+LangGraph conditional edges route the workflow based on state: missing data triggers a re-fetch, and Critics with no issues skip the Repair node. This makes error recovery part of the graph rather than ad-hoc exception handling.
 
 ### RAG Knowledge System
 8 industry templates covering semiconductors, power/energy, pharma, consumer, optical modules/comms, manufacturing/new energy, financials, and real estate. Each template spans: industry cycle, valuation patterns (with historical PE ranges), competitive landscape, supply chain position, and key metrics. Embedded via ONNX MiniLM (local, no API calls). Retrieved knowledge is injected into the Analyst and Valuation Agent contexts.
@@ -159,11 +172,14 @@ Three configurable tiers (FREE/PREMIUM/INSTITUTIONAL) with pluggable premium dat
 
 **Agent Layer**
 - Intent routing (Chat / Deep Analysis / Phantom Hunter)
+- Structured LLM outputs: Analyst, Valuation, Critic, Repair, Audit use Pydantic schemas
 - Critic Agent with structured findings (logic flaws, over-optimism, missing risks)
 - Valuation Agent with company-stage classification
 - Audit Engine with 9 deterministic checks + code pre-check
+- LangGraph conditional edges: data missing → re-fetch, Critic clean → skip Repair
 - 4-level escalation (warning → surgical fix → analyst retry → circuit breaker)
 - Processing marker system to prevent double-processing across retries
+- 3-slot LLM fallback chain (slot 1 required, slot 2/3 optional)
 
 **Output Layer**
 - Structured markdown report with scoring card, valuation chain, and audit summary
@@ -197,7 +213,7 @@ Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → auto-ad
 
 ## Roadmap
 
-**Current (v0.2)**
+**Current (v0.3)**
 - [x] Multi-agent workflow (Data → Analyst → Valuation → Critic → Reporter → Audit)
 - [x] RAG knowledge augmentation (8 industry templates)
 - [x] Dual-layer verification (code + LLM)
@@ -205,12 +221,16 @@ Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → auto-ad
 - [x] Execution trace visualization
 - [x] Evaluation benchmark page
 - [x] Sector momentum scoring
+- [x] Structured output with Pydantic schemas for all LLM nodes
+- [x] LangGraph conditional edges for data retry and Critic → Repair skip
+- [x] 3-slot LLM fallback chain
 
 **Next**
-- [ ] Revision Agent: Critic findings → automatic report correction
-- [ ] Agent evaluation benchmark suite (20 stocks × 100 runs)
-- [ ] Conditional edges for error recovery (data missing → re-fetch, audit fail → targeted retry)
+- [ ] Backtesting engine: max drawdown, Sharpe, win rate, daily PnL curve
+- [ ] Agent evaluation benchmark suite: N stocks × M runs → return distribution
 - [ ] Premium data source integration (Wind/Choice API for management + institutional data)
+- [ ] Human-in-the-Loop: `interrupt()` before simulated order execution
+- [ ] Streaming: `graph.stream()` / `astream_events()` with live frontend trace
 - [ ] Agent trace export (LangSmith-compatible format)
 
 ---
@@ -220,14 +240,14 @@ Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → auto-ad
 | Layer | Technology |
 |-------|-----------|
 | Agent Framework | LangGraph StateGraph + LangChain tools |
-| LLM | DeepSeek (default) / OpenAI / Anthropic (configurable) |
+| LLM | DeepSeek / OpenAI / Anthropic (3-slot configurable fallback chain) |
 | State Persistence | LangGraph SqliteSaver |
 | Vector Database | ChromaDB + ONNX MiniLM-L6-V2 (local embedding) |
 | Data Sources | Sina Finance + EastMoney DataCenter + THS 10jqka |
 | Frontend | Streamlit + Plotly |
 | Cache | Local memory (TTL) / Redis (configurable) |
 | Data Tier | FREE / PREMIUM / INSTITUTIONAL (pluggable premium slots) |
-| Testing | 54 e2e tests (compilation, data tools, scoring consistency, output compliance, report quality guards) |
+| Testing | 68 e2e tests (compilation, data tools, scoring consistency, output compliance, report quality guards, structured output, graph routing, LLM fallback) |
 
 ---
 
@@ -252,10 +272,19 @@ pip install pdfplumber python-docx plotly streamlit py-mini-racer
 Create `configs/.env`:
 
 ```env
-# LLM
-LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-chat
-DEEPSEEK_API_KEY=<your-api-key>
+# LLM (3-slot fallback chain: slot 1 required, slot 2/3 optional)
+LLM_SLOT_1_PROVIDER=deepseek
+LLM_SLOT_1_MODEL=deepseek-chat
+LLM_SLOT_1_API_KEY=<your-api-key>
+LLM_SLOT_1_BASE_URL=https://api.deepseek.com
+
+# LLM_SLOT_2_PROVIDER=openai
+# LLM_SLOT_2_MODEL=gpt-4o
+# LLM_SLOT_2_API_KEY=<your-openai-key>
+
+# LLM_SLOT_3_PROVIDER=anthropic
+# LLM_SLOT_3_MODEL=claude-sonnet-5
+# LLM_SLOT_3_API_KEY=<your-anthropic-key>
 
 # Data tier (FREE | PREMIUM | INSTITUTIONAL)
 FINBRAIN_DATA_TIER=FREE
@@ -263,6 +292,8 @@ FINBRAIN_DATA_TIER=FREE
 # Optional: Redis cache
 # REDIS_URL=redis://localhost:6379
 ```
+
+Old single-provider format (`LLM_PROVIDER`, `LLM_MODEL`, `LLM_BASE_URL`, `DEEPSEEK_API_KEY`, ...) is still read for backward compatibility, but the Settings UI saves in the new 3-slot format.
 
 ### Run
 
@@ -288,7 +319,8 @@ finbrain/
 │   ├── strategies.json         # 3 strategy presets
 │   └── scoring.json            # Valuation weights, industry PE anchors, safety margins
 ├── backend/
-│   ├── agent.py                # StateGraph, all agent nodes, prompts (~2000 lines)
+│   ├── agent.py                # StateGraph, all agent nodes, prompts (~2900 lines)
+│   ├── schemas.py              # Pydantic schemas for structured LLM output
 │   ├── tools.py                # 14 data tools + scoring + formatting (~1700 lines)
 │   ├── scoring.py              # Deterministic scoring engine with growth premium
 │   ├── scoring_config.py       # Typed config loader

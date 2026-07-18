@@ -1304,42 +1304,136 @@ elif page == "Settings":
                     st.success(f"Deleted '{selected}'. Reset to default. Restart.")
 
     with tab1:
-        # 读取当前配置
-        cur_provider = os.getenv("LLM_PROVIDER","deepseek")
-        cur_model = os.getenv("LLM_MODEL", "")
-        cur_key = os.getenv("DEEPSEEK_API_KEY","") or os.getenv("OPENAI_API_KEY","") or os.getenv("ANTHROPIC_API_KEY","")
+        st.subheader("LLM Fallback Chain")
+        st.caption("Slot 1 必填；Slot 2/3 为可选熔断备用。当 Slot 1 调用失败时，系统自动依次尝试下一槽位。")
 
-        provider = st.selectbox("Provider", ["deepseek","openai","anthropic"],
-                                index=["deepseek","openai","anthropic"].index(cur_provider) if cur_provider in ["deepseek","openai","anthropic"] else 0)
-        # 模型默认值按 provider
-        model_defaults = {"deepseek":"deepseek-chat","openai":"gpt-4o","anthropic":"claude-sonnet-5"}
-        model = st.text_input("Model", value=cur_model or model_defaults.get(provider,""), placeholder=model_defaults.get(provider,""), key="settings_model")
-        api_key = st.text_input("API Key", type="password", value=cur_key, placeholder="sk-...", key="settings_apikey")
-        base_url = st.text_input("Base URL (optional)", value=os.getenv("LLM_BASE_URL","https://api.deepseek.com" if provider=="deepseek" else ""), key="settings_url")
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", ".env")
+        providers = ["deepseek", "openai", "anthropic"]
+        model_defaults = {"deepseek": "deepseek-chat", "openai": "gpt-4o", "anthropic": "claude-sonnet-5"}
+        base_defaults = {"deepseek": "https://api.deepseek.com", "openai": "", "anthropic": ""}
+
+        def _read_slot(i: int) -> dict:
+            prefix = f"LLM_SLOT_{i}"
+            provider = os.getenv(f"{prefix}_PROVIDER", "").strip()
+            model = os.getenv(f"{prefix}_MODEL", "").strip()
+            api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+            base_url = os.getenv(f"{prefix}_BASE_URL", "").strip()
+            # 兼容旧单变量：仅 slot 1
+            if i == 1 and not provider and not model:
+                provider = os.getenv("LLM_PROVIDER", "deepseek").strip()
+                model = os.getenv("LLM_MODEL", "").strip() or model_defaults.get(provider, "")
+                old_key = os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("OPENAI_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
+                api_key = api_key or old_key
+                base_url = base_url or os.getenv("LLM_BASE_URL", base_defaults.get(provider, ""))
+            return {
+                "provider": provider,
+                "model": model,
+                "api_key": api_key,
+                "base_url": base_url,
+            }
+
+        slots = []
+        for i in range(1, 4):
+            cur = _read_slot(i)
+            required = i == 1
+            enabled = required or st.checkbox(
+                f"启用 Slot {i}", value=cur["provider"] != "",
+                key=f"llm_slot_{i}_enabled", disabled=required
+            )
+            with st.expander(f"Slot {i} {'*' if required else '(optional)'} {'✅' if enabled else '❌'}", expanded=enabled):
+                provider = st.selectbox(
+                    "Provider",
+                    providers,
+                    index=providers.index(cur["provider"]) if cur["provider"] in providers else 0,
+                    key=f"llm_slot_{i}_provider",
+                    disabled=not enabled,
+                )
+                model = st.text_input(
+                    "Model",
+                    value=cur["model"] or model_defaults.get(provider, ""),
+                    placeholder=model_defaults.get(provider, ""),
+                    key=f"llm_slot_{i}_model",
+                    disabled=not enabled,
+                )
+                api_key = st.text_input(
+                    "API Key",
+                    type="password",
+                    value=cur["api_key"],
+                    placeholder="sk-...",
+                    key=f"llm_slot_{i}_apikey",
+                    disabled=not enabled,
+                )
+                base_url = st.text_input(
+                    "Base URL (optional)",
+                    value=cur["base_url"] or base_defaults.get(provider, ""),
+                    placeholder=base_defaults.get(provider, ""),
+                    key=f"llm_slot_{i}_baseurl",
+                    disabled=not enabled,
+                )
+                slots.append({
+                    "provider": provider,
+                    "model": model,
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "required": required,
+                    "enabled": enabled,
+                })
 
         if st.button("Apply & Save", type="primary"):
-            os.environ["LLM_PROVIDER"] = provider
-            os.environ["LLM_MODEL"] = model
-            if api_key:
-                os.environ[f"{provider.upper()}_API_KEY"] = api_key
-            if base_url:
-                os.environ["LLM_BASE_URL"] = base_url
-            # 写入 .env
-            env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", ".env")
-            lines = []
-            if os.path.exists(env_path):
-                with open(env_path) as f:
-                    for line in f:
-                        if not any(line.startswith(p) for p in ["LLM_PROVIDER","LLM_MODEL","LLM_BASE_URL",
-                                "DEEPSEEK_API_KEY","OPENAI_API_KEY","ANTHROPIC_API_KEY"]):
+            # 校验 slot 1
+            if not slots[0]["provider"] or not slots[0]["model"]:
+                st.error("Slot 1 必须填写 Provider 和 Model")
+            else:
+                # 写环境变量（只写入启用的 slot；禁用 slot 2/3 时清理变量）
+                for i, s in enumerate(slots, start=1):
+                    prefix = f"LLM_SLOT_{i}"
+                    if not s["enabled"]:
+                        for suffix in ["_PROVIDER", "_MODEL", "_API_KEY", "_BASE_URL"]:
+                            key = f"{prefix}{suffix}"
+                            if key in os.environ:
+                                del os.environ[key]
+                        continue
+                    os.environ[f"{prefix}_PROVIDER"] = s["provider"]
+                    os.environ[f"{prefix}_MODEL"] = s["model"]
+                    if s["api_key"]:
+                        os.environ[f"{prefix}_API_KEY"] = s["api_key"]
+                    if s["base_url"]:
+                        os.environ[f"{prefix}_BASE_URL"] = s["base_url"]
+                    # 如果留空，删除旧环境变量
+                    if not s["api_key"] and f"{prefix}_API_KEY" in os.environ:
+                        del os.environ[f"{prefix}_API_KEY"]
+                    if not s["base_url"] and f"{prefix}_BASE_URL" in os.environ:
+                        del os.environ[f"{prefix}_BASE_URL"]
+
+                # 重写 .env：清理旧单变量 + 写入 slot 变量
+                lines = []
+                if os.path.exists(env_path):
+                    with open(env_path, encoding="utf-8") as f:
+                        for line in f:
+                            if any(line.startswith(p) for p in [
+                                "LLM_PROVIDER", "LLM_MODEL", "LLM_BASE_URL",
+                                "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"
+                            ]):
+                                continue
+                            # 清理已有的 LLM_SLOT_* 行，后面会重新写入
+                            if line.startswith("LLM_SLOT_"):
+                                continue
                             lines.append(line.rstrip())
-            lines.append(f"LLM_PROVIDER={provider}")
-            lines.append(f"LLM_MODEL={model}")
-            if api_key: lines.append(f"{provider.upper()}_API_KEY={api_key}")
-            if base_url: lines.append(f"LLM_BASE_URL={base_url}")
-            with open(env_path, "w") as f:
-                f.write("\n".join(lines) + "\n")
-            st.success(f"Saved: {provider}/{model}. Restart to apply.")
+
+                for i, s in enumerate(slots, start=1):
+                    if not s["enabled"]:
+                        continue
+                    prefix = f"LLM_SLOT_{i}"
+                    lines.append(f"{prefix}_PROVIDER={s['provider']}")
+                    lines.append(f"{prefix}_MODEL={s['model']}")
+                    if s["api_key"]: lines.append(f"{prefix}_API_KEY={s['api_key']}")
+                    if s["base_url"]: lines.append(f"{prefix}_BASE_URL={s['base_url']}")
+
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+
+                configured = [i for i, s in enumerate(slots, start=1) if s["enabled"] and s["provider"] and s["model"]]
+                st.success(f"Saved {len(configured)} slot(s): {', '.join(f'Slot {i}' for i in configured)}. Restart to apply.")
 
     with tab2:
         st.caption("10 tools active")
