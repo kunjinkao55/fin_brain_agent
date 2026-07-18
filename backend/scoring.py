@@ -13,15 +13,15 @@ logger = logging.getLogger(__name__)
 
 
 def _quality_adjustment(roe: float, debt: float) -> float:
-    """根据财务质量微调安全边际"""
+    """根据财务质量微调安全边际（允许负向调整，优质公司可适当放宽）"""
     adj_cfg = get_safety_adjustments()
     adj = 0.0
     if roe > adj_cfg["roe_high"]: adj += adj_cfg["roe_high_adj"]
     elif roe < adj_cfg["roe_low"]: adj += adj_cfg["roe_low_adj"]
     if debt < adj_cfg["debt_low"]: adj += adj_cfg["debt_low_adj"]
     elif debt > adj_cfg["debt_high"]: adj += adj_cfg["debt_high_adj"]
-    limits = adj_cfg["limits"]
-    return max(limits[0] - 0.10, min(limits[1] - 0.40, adj))
+    # 允许负值：高ROE/低负债的下调不应被钳掉（此前下限恒为+0.05，导致任何公司安全边际只增不减）
+    return max(-0.05, min(0.15, adj))
 
 # ============================================================
 #  公开 API
@@ -36,6 +36,7 @@ def compute_investment_rating(
     industry: str,           # 行业名
     roe: float,              # ROE(%)
     debt: float,             # 资产负债率(%)
+    bps: float = 0.0,        # 每股净资产（用于买入价PB地板）
 ) -> dict:
     """
     根据公司类型动态赋权，计算综合评分 + 合理价值 + 安全边际 + 投资评级。
@@ -104,6 +105,14 @@ def compute_investment_rating(
 
     # --- 5. 买入区间 ---
     buy_zone_upper = round(fair_value * (1 - safety_margin), 2) if fair_value > 0 else 0
+    _pb_floor_note = ""
+    # PB地板：质量乘数×安全边际双重折让可能把买入价压到远低于每股净资产（如0.57倍PB），
+    # 实操上几乎不可能触发。当前PB≥1时（破净股如银行豁免），买入价不得低于0.8倍每股净资产。
+    if bps > 0 and buy_zone_upper > 0 and stock_price > 0 and stock_price / bps >= 1:
+        _pb_floor = round(bps * 0.8, 2)
+        if buy_zone_upper < _pb_floor:
+            _pb_floor_note = f"买入价触及PB地板(0.8×每股净资产{bps:.2f}元)，{buy_zone_upper}→{_pb_floor}元"
+            buy_zone_upper = _pb_floor
 
     # --- 6. 投资评级 ---
     if stock_price <= 0 or fair_value <= 0:
@@ -155,6 +164,8 @@ def compute_investment_rating(
             f"若利润恢复至{_eps_3x}元(3×当前)，合理价值≈{_fv_3x}元。"
             f"当前估值对盈利复苏极度敏感——利润翻倍则合理价值翻倍。"
         )
+    if _pb_floor_note:
+        valuation_chain["PB地板"] = _pb_floor_note
 
     return {
         "评级": rating,

@@ -330,13 +330,150 @@ class TestOutputConsistency(unittest.TestCase):
         self.assertEqual(float(_cached), 0.874)
 
 
+class TestReportQualityGuards(unittest.TestCase):
+    """报告质量守卫：针对质检暴露的算术错误/时效性/口径问题"""
+
+    def test_flash_report_extraction(self):
+        """业绩快报正文必须提取出结构化数据（营收/归母/扣非/同比）"""
+        from backend.tools import _extract_flash_report, _format_flash_hint
+        sample = ("本报告期实现营业总收入343,295.19万元，同比减少2.59%；"
+                  "归属于上市公司股东的净利润23,057.90万元，同比下降12.97%；"
+                  "扣除非经常性损益后归属于上市公司股东的净利润22,857.60万元，同比增长11.18%。")
+        flash = _extract_flash_report(sample, "国网信通2025年半年度业绩快报公告")
+        self.assertIsNotNone(flash)
+        self.assertEqual(flash["营收(亿元)"], 34.33)
+        self.assertEqual(flash["归母净利润(亿元)"], 2.31)
+        self.assertEqual(flash["扣非净利润(亿元)"], 2.29)
+        self.assertEqual(flash["扣非同比(%)"], 11.18)
+        self.assertEqual(flash["归母同比(%)"], -12.97)
+        self.assertIn("快报", _format_flash_hint(flash))
+
+    def test_flash_report_gm_vs_kf_disambiguation(self):
+        """归母净利润提取必须排除'扣除非经常性损益后归母净利润'的干扰"""
+        from backend.tools import _extract_flash_report
+        sample = ("扣除非经常性损益后归属于上市公司股东的净利润22,857.60万元，同比增长11.18%；"
+                  "归属于上市公司股东的净利润23,057.90万元，同比下降12.97%。")
+        flash = _extract_flash_report(sample, "业绩快报")
+        # 归母必须是23,057.90万(2.31亿)，不能错抓成扣非的22,857.60万
+        self.assertEqual(flash["归母净利润(亿元)"], 2.31)
+        self.assertEqual(flash["扣非净利润(亿元)"], 2.29)
+
+    def test_scenario_arithmetic_validation(self):
+        """情景估值：价格≠EPS×PE 时代码必须按算术重算"""
+        from backend.agent import _validate_scenarios
+        item = {"情景估值": {
+            "悲观": {"价格": 7.00, "EPS": 0.25, "PE": 20, "概率": "20%"},
+            "基准": {"价格": 9.38, "EPS": 0.375, "PE": 25, "概率": "55%"},
+            "乐观": {"价格": 12.50, "EPS": 0.59, "PE": 25, "概率": "25%"},
+        }}
+        _validate_scenarios(item)
+        sc = item["情景估值"]
+        self.assertEqual(sc["悲观"]["价格"], 5.0)   # 0.25×20
+        self.assertEqual(sc["乐观"]["价格"], 14.75)  # 0.59×25
+        self.assertAlmostEqual(sc["概率加权价值"], 9.85, places=2)
+        self.assertFalse(item["_scenario_check"]["arith_ok"])
+        self.assertTrue(item["_scenario_check"]["monotonic_ok"])
+
+    def test_scenario_monotonicity_detection(self):
+        """情景价格倒挂必须被标记"""
+        from backend.agent import _validate_scenarios
+        item = {"情景估值": {
+            "悲观": {"价格": 15.0, "概率": "20%"},
+            "基准": {"价格": 9.0, "概率": "60%"},
+            "乐观": {"价格": 12.0, "概率": "20%"},
+        }}
+        _validate_scenarios(item)
+        self.assertFalse(item["_scenario_check"]["monotonic_ok"])
+
+    def test_safety_margin_negative_adjustment(self):
+        """安全边际质量微调必须允许负值（优质公司放宽），不再恒为+0.05"""
+        from backend.scoring import _quality_adjustment
+        self.assertLess(_quality_adjustment(roe=25, debt=15), 0)
+        self.assertGreater(_quality_adjustment(roe=3, debt=80), 0)
+
+    def test_pb_floor_on_buy_zone(self):
+        """买入价不得跌破0.8倍每股净资产（当前PB≥1时）；破净股豁免"""
+        from backend.scoring import compute_investment_rating
+        fin = {"盈利能力": {"得分": 2}, "成长性": {"得分": 5},
+               "财务健康": {"得分": 4}, "估值合理": {"得分": 6}}
+        llm = {"行业前景": {"得分": 5}, "资金认可": {"得分": 5}}
+        r = compute_investment_rating("困境反转型", fin, llm,
+                                      eps=0.55, stock_price=14.10, industry="电力",
+                                      roe=4.0, debt=55, bps=5.41)
+        self.assertIn("PB地板", r["估值明细"])
+        # 地板价 = 5.41×0.8 = 4.33
+        self.assertIn("4.33", r["买入区间"])
+        # 破净银行（股价5<BPS10）不触发
+        r2 = compute_investment_rating("价值型", fin, llm,
+                                       eps=1.0, stock_price=5.0, industry="银行",
+                                       roe=9.0, debt=90, bps=10.0)
+        self.assertNotIn("PB地板", r2["估值明细"])
+
+    def test_cashflow_annual_period_preferred(self):
+        """现金流覆盖率必须优先使用年报口径并标注期间"""
+        from backend.tools import calculate_scores
+        cs = {
+            "profit": [
+                {"报告期": "一季报", "扣非净利润": 352_0000},   # Q1净利极小
+                {"报告期": "年报", "扣非净利润": 6_6000_0000},
+            ],
+            "cashflow": [
+                {"报告期": "一季报", "经营现金流净额": 3.25e8},  # Q1覆盖率92倍(失真)
+                {"报告期": "年报", "经营现金流净额": 21.5e8},    # 年报覆盖率3.26倍
+            ],
+            "balance": [{"报告期": "年报", "资产总计": 100, "负债合计": 50}],
+            "valuation": {"data": [{"日期": "2025-12-31", "ROE(%)": 10, "毛利率(%)": 17,
+                          "净利率(%)": 6, "每股收益": 0.55, "每股净资产": 5.41,
+                          "总股本": 12e8, "资产负债率(%)": 52}]},
+            "price": {"price": 14.1}, "industry": "计算机",
+        }
+        fh = calculate_scores(cs)["财务健康"]
+        self.assertIn("年报", fh["依据"])
+        self.assertIn("年报", fh["现金流标签"])
+        # 年报口径覆盖率 = 21.5/6.6 ≈ 3.26，绝不能出现Q1口径的92倍
+        self.assertNotIn("92", fh["依据"])
+
+    def test_profitability_basis_formatted(self):
+        """盈利能力依据中的浮点必须格式化（不再出现17.1648694075%）"""
+        from backend.tools import calculate_scores
+        cs = {
+            "profit": [{"报告期": "年报", "扣非净利润": 1e8}],
+            "cashflow": [],
+            "balance": [],
+            "valuation": {"data": [{"日期": "2025-12-31", "ROE(%)": 17.1648694075,
+                          "毛利率(%)": 13.30, "净利率(%)": 6.34, "每股收益": 0.55,
+                          "每股净资产": 5.41, "总股本": 12e8, "资产负债率(%)": 52.9908925347}]},
+            "price": {"price": 14.1}, "industry": "计算机",
+        }
+        scores = calculate_scores(cs)
+        self.assertNotIn("17.164869", scores["盈利能力"]["依据"])
+        self.assertIn("17.2", scores["盈利能力"]["依据"])
+
+    def test_analyst_prompt_flash_report_rule(self):
+        """ANALYST_PROMPT必须包含业绩快报时序规则"""
+        from backend.agent import ANALYST_PROMPT
+        self.assertIn("业绩快报", ANALYST_PROMPT)
+        self.assertIn("禁止再写", ANALYST_PROMPT)
+
+    def test_auditor_prompt_timeliness_check(self):
+        """AUDITOR_PROMPT必须包含时效性矛盾检查"""
+        from backend.agent import AUDITOR_PROMPT
+        self.assertIn("时效性矛盾", AUDITOR_PROMPT)
+
+    def test_scenario_template_has_structured_eps_pe(self):
+        """情景估值输出模板必须含结构化EPS/PE字段"""
+        from backend.agent import _FORMAT_MANDATORY
+        self.assertIn('"EPS"', _FORMAT_MANDATORY)
+        self.assertIn('"PE"', _FORMAT_MANDATORY)
+
+
 def run_all():
     """运行全部测试并输出结果"""
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for cls in [TestCompilation, TestDataTools, TestScoringConsistency,
                 TestInvestmentRating, TestHarnessGuards, TestConfig,
-                TestOutputConsistency]:
+                TestOutputConsistency, TestReportQualityGuards]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
     runner = unittest.TextTestRunner(verbosity=2)

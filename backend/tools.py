@@ -819,6 +819,8 @@ def format_report(analysis: dict) -> str:
                          f"EPS(TTM)={val_chain.get('EPS(TTM)','?')}元")
             if val_chain.get("前瞻说明"):
                 lines.append(f"    ⚠️ {val_chain['前瞻说明']}")
+            if val_chain.get("PB地板"):
+                lines.append(f"    ⚠️ {val_chain['PB地板']}")
 
         # === 第二部分：公司画像和竞争优势 ===
         profile = analysis.get("公司画像", {})
@@ -888,6 +890,8 @@ def format_report(analysis: dict) -> str:
             if max_total > 0:
                 lines.append(f"  {'合计':<8}  {total:>4}/{max_total}   {'':<6}  " +
                              f"{'S:>=9 A:>=7 B:>=5 C:<5'}")
+                lines.append(f"  * 合计为各维度简单加总(满分{max_total})；加权总分(满分100)按公司类型动态权重×10计算，"
+                             f"两者口径不同，数值不可直接比较。")
 
         # ---- 亮点 ----
         highlights = analysis.get("亮点", [])
@@ -935,6 +939,9 @@ def format_report(analysis: dict) -> str:
             if fwd_pe: parts.append(f"前瞻PE:{fwd_pe}")
             lines.append("")
             lines.append(f"  [估值水位] {' '.join(parts)}")
+            fwd_note = analysis.get("_fwd_pe_note", "")
+            if fwd_note:
+                lines.append(f"    ⚠️ {fwd_note}")
         lines.append(f"    * 基于最新财报数据计算，非实时行情。日内股价波动会导致PE/PB/市值变化。请以交易软件实时数据为准。")
 
         # ---- 机构共识 (Web Search) ----
@@ -967,12 +974,22 @@ def format_report(analysis: dict) -> str:
                 s = scenarios.get(scenario, {})
                 if s:
                     price = s.get("价格", "?")
+                    if isinstance(price, (int, float)):
+                        price = f"{price:.2f}".rstrip("0").rstrip(".")
                     prob = s.get("概率", "?")
                     assumption = str(s.get("假设", "")).strip()
+                    # 结构化 EPS/PE 字段（代码已校验 价格=EPS×PE）
+                    eps_pe = ""
+                    if s.get("EPS") is not None and s.get("PE") is not None:
+                        eps_pe = f" [EPS={s['EPS']}×PE={s['PE']}]"
                     if assumption and not assumption.startswith("—"):
-                        lines.append(f"    {info} {scenario}({prob}): {price} — {assumption}")
+                        lines.append(f"    {info} {scenario}({prob}): {price}元{eps_pe} — {assumption}")
                     else:
-                        lines.append(f"    {info} {scenario}({prob}): {price}元")
+                        lines.append(f"    {info} {scenario}({prob}): {price}元{eps_pe}")
+            # 概率加权价值（代码重算）
+            wv = scenarios.get("概率加权价值")
+            if wv is not None:
+                lines.append(f"    📊 概率加权价值: {wv}元")
             # 情景vs合理价值对齐检查：悲观情景价超过合理价值2倍时追加注释
             try:
                 rating = analysis.get("投资评级", {}) if isinstance(analysis, dict) else {}
@@ -1191,8 +1208,89 @@ def get_limit_up_pool(top_n: int = 30) -> dict:
         return {"error": f"涨停板查询失败: {str(e)}"}
 
 
+def _flash_metric(clean: str, keywords: list, exclude_before: str = None):
+    """在业绩快报正文中定位关键词，提取金额(统一为亿元)和同比增速(带符号%)。
+    兼容两种格式:
+      A) 表格: "营业总收入 343,329.01 352,468.92 -2.59"（单位见文首"单位：万元"）
+      B) 散文: "营业总收入34.33亿元，同比下降2.59%"
+    exclude_before: 关键词前20字符内含该串则跳过（用于区分归母/扣非归母）。
+    返回 (amount, yoy)，失败返回 (None, None)。"""
+    for kw in keywords:
+        start = 0
+        while True:
+            idx = clean.find(kw, start)
+            if idx < 0:
+                break
+            start = idx + len(kw)
+            if exclude_before and exclude_before in clean[max(0, idx - 20):idx]:
+                continue
+            window = clean[idx + len(kw):idx + len(kw) + 200]
+            # A) 表格格式：关键词后紧跟"本期值 上年同期 变动幅度"三个数字
+            mt = re.match(r'\s*([\d,]+(?:\.\d+)?)\s+(?:[\d,]+(?:\.\d+)?)\s+(-?[\d.]+)\s*%?', window)
+            if mt:
+                amount = float(mt.group(1).replace(",", ""))
+                if "单位：万" in clean[:2000] or "单位:万" in clean[:2000]:
+                    amount /= 10000
+                return round(amount, 2), round(float(mt.group(2)), 2)
+            # B) 散文格式
+            amount = None
+            m = re.search(r'([\d,]+(?:\.\d+)?)\s*(亿|万)?\s*元', window)
+            if m:
+                amount = float(m.group(1).replace(",", ""))
+                if m.group(2) == "万":
+                    amount /= 10000
+                elif m.group(2) is None:
+                    amount /= 1e8
+                amount = round(amount, 2)
+            yoy = None
+            m2 = re.search(r'(增长|下降|增加|减少)\s*([\d.]+)\s*%', window)
+            if m2:
+                sign = -1 if m2.group(1) in ("下降", "减少") else 1
+                yoy = round(sign * float(m2.group(2)), 2)
+            return amount, yoy
+    return None, None
+
+
+def _extract_flash_report(clean: str, title: str = "") -> dict | None:
+    """从业绩快报/业绩预告正文提取结构化数据。返回 None 表示未提取到任何有效数字。"""
+    data = {}
+    m = re.search(r'(20\d{2}\s*年\s*(?:半年度|一季度|第一季度|前三季度|第三季度|年度)?)', title)
+    if m:
+        data["报告期"] = m.group(1).replace(" ", "")
+    rev, rev_yoy = _flash_metric(clean, ["营业总收入", "营业收入"])
+    if rev is not None: data["营收(亿元)"] = rev
+    if rev_yoy is not None: data["营收同比(%)"] = rev_yoy
+    # 表格格式中关键词常被表格换行拆散（"归属于上市公司股东的净…利润"），
+    # 用第三字区分：归母="净"，扣非归母="扣"
+    gm, gm_yoy = _flash_metric(clean, ["归属于上市公司股东的净"], exclude_before="扣除非经常性损益")
+    if gm is None:
+        gm, gm_yoy = _flash_metric(clean, ["归属于上市公司股东的净利润"],
+                                   exclude_before="扣除非经常性损益")
+    if gm is not None: data["归母净利润(亿元)"] = gm
+    if gm_yoy is not None: data["归母同比(%)"] = gm_yoy
+    kf, kf_yoy = _flash_metric(clean, ["归属于上市公司股东的扣", "扣除非经常性损益"])
+    if kf is not None: data["扣非净利润(亿元)"] = kf
+    if kf_yoy is not None: data["扣非同比(%)"] = kf_yoy
+    return data if len(data) > 1 else None
+
+
+def _format_flash_hint(flash: dict) -> str:
+    """把快报数据格式化成一行提示，供公告列表渲染。"""
+    parts = []
+    for key, yoy_key, label in [("营收(亿元)", "营收同比(%)", "营收"),
+                                ("归母净利润(亿元)", "归母同比(%)", "归母净利"),
+                                ("扣非净利润(亿元)", "扣非同比(%)", "扣非净利")]:
+        if flash.get(key) is not None:
+            s = f"{label}{flash[key]}亿"
+            if flash.get(yoy_key) is not None:
+                s += f"({flash[yoy_key]:+.1f}%)"
+            parts.append(s)
+    period = f"[{flash['报告期']}]" if flash.get("报告期") else ""
+    return f"快报{period}: " + ", ".join(parts) if parts else ""
+
+
 def get_recent_announcements(symbol: str, count: int = 5) -> dict:
-    """获取个股最近 N 条公告（东财）。对定增/发行类公告自动抓取摘要中的关键数字。"""
+    """获取个股最近 N 条公告（东财）。对定增/发行类、业绩快报/预告类公告自动抓取正文提取关键数字。"""
     try:
         url = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
         params = f'sr=-1&page_size={count}&page_index=1&ann_type=A&client_source=web&stock_list={symbol}'
@@ -1202,31 +1300,52 @@ def get_recent_announcements(symbol: str, count: int = 5) -> dict:
             data = json.loads(resp.read().decode("utf-8"))
         items = data.get("data", {}).get("list", [])
 
+        _DILUTION_KW = ["发行A股", "非公开发行", "定向增发", "募集资金", "发行股份"]
+        _FLASH_KW = ["业绩快报", "业绩预告"]
         results = []
         for it in items[:count]:
             title = it.get("title","").replace("<em>","").replace("</em>","")
             entry = {"日期": it.get("notice_date","")[:10], "标题": title}
-            # 对定增/发行类公告抓取摘要
-            if any(kw in title for kw in ["发行A股","非公开发行","定向增发","募集资金","发行股份"]):
+            # 对定增/发行类、业绩快报/预告类公告抓取正文
+            if any(kw in title for kw in _DILUTION_KW + _FLASH_KW):
                 art_code = it.get("art_code","")
                 if art_code:
                     try:
-                        detail_url = f'https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={art_code}'
-                        req2 = urllib.request.Request(detail_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req2, timeout=8, context=_SSL_CTX) as resp2:
-                            detail = json.loads(resp2.read().decode("utf-8"))
-                        text = str(detail.get("data", {}).get("notice_content",
-                                detail.get("data", {}).get("content", "")))
-                        # 提取关键数字
-                        amounts = re.findall(r'(\d+\.?\d*)\s*[亿万]元', text)
-                        shares = re.findall(r'(\d+\.?\d*)\s*[万]股', text)
-                        if amounts: entry["募资金额"] = amounts[0] + "亿元" if "亿" in text else amounts[0] + "万元"
-                        if shares: entry["发行股数"] = shares[0] + "万股"
-                        # 取正文开头作为摘要（跳过HTML标签）
+                        # 主用 np-cnotice 内容接口（np-anotice/detail 已失效返回空），失败回退旧接口
+                        text = ""
+                        for detail_url in (
+                            f'https://np-cnotice-stock.eastmoney.com/api/content/ann?art_code={art_code}&client_source=web&page_index=1',
+                            f'https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={art_code}',
+                        ):
+                            try:
+                                req2 = urllib.request.Request(detail_url, headers={"User-Agent": "Mozilla/5.0"})
+                                with urllib.request.urlopen(req2, timeout=8, context=_SSL_CTX) as resp2:
+                                    detail = json.loads(resp2.read().decode("utf-8"))
+                                text = str(detail.get("data", {}).get("notice_content",
+                                        detail.get("data", {}).get("content", "")))
+                                if text:
+                                    break
+                            except Exception:
+                                continue
+                        if not text:
+                            raise ValueError("正文为空")
+                        # 去HTML标签
                         clean = re.sub(r'<[^>]+>', '', text)
+                        if any(kw in title for kw in _DILUTION_KW):
+                            # 提取关键数字
+                            amounts = re.findall(r'(\d+\.?\d*)\s*[亿万]元', clean)
+                            shares = re.findall(r'(\d+\.?\d*)\s*[万]股', clean)
+                            if amounts: entry["募资金额"] = amounts[0] + "亿元" if "亿" in clean else amounts[0] + "万元"
+                            if shares: entry["发行股数"] = shares[0] + "万股"
+                        if any(kw in title for kw in _FLASH_KW):
+                            flash = _extract_flash_report(clean, title)
+                            if flash:
+                                entry["快报数据"] = flash
+                                hint = _format_flash_hint(flash)
+                                if hint: entry["提示"] = hint
                         entry["摘要"] = clean[:200] + ("..." if len(clean) > 200 else "")
                     except Exception:
-                        pass  # 摘要抓取失败不影响
+                        pass  # 正文抓取失败不影响
             results.append(entry)
 
         return {"公告数量": len(results), "列表": results}
@@ -1366,7 +1485,7 @@ def calculate_scores(financial_data: dict) -> dict:
 
     if gm >= 40: pe_score = min(10, pe_score + 1)
     if nm >= 20: pe_score = min(10, pe_score + 1)
-    scores["盈利能力"] = {"得分": pe_score, "依据": f"ROE {roe}%, 毛利率{gm}%, 净利率{nm}%"}
+    scores["盈利能力"] = {"得分": pe_score, "依据": f"ROE {roe:.1f}%, 毛利率{gm:.1f}%, 净利率{nm:.1f}%"}
 
     # --- 2. 成长性 (0-10) —— 年报底色 + 季报势头，扣非净利润优先 ---
     profit_data = financial_data.get("profit", [])
@@ -1455,11 +1574,26 @@ def calculate_scores(financial_data: dict) -> dict:
     dep = 0  # 折旧摊销（重资产行业现金流修正因子）
     cf_score = 0
     cf_ratio = 0
+    cf_period = ""
+    op_cf = 0.0
+    capex_val = 0.0
+    fcf = 0.0
+    fcf_ratio = 0.0
+    net_profit = 1.0
     if cf_data:
-        cf_latest = cf_data[0]  # 降序排列，[0]最新
+        # 年报口径优先：季度现金流受季节性影响大（Q1净利极小→覆盖率虚高至90+），期间混用会失真
+        cf_annual = [c for c in cf_data if c.get("报告期") == "年报"]
+        annual_profit = [p for p in profit_data if p.get("报告期") == "年报"]
+        if cf_annual and annual_profit:
+            cf_latest = cf_annual[0]
+            cf_period = "年报"
+            net_profit = float(annual_profit[0].get("扣非净利润") or annual_profit[0].get("归母净利润") or 1)
+        else:
+            cf_latest = cf_data[0]  # 降序排列，[0]最新
+            cf_period = cf_latest.get("报告期", "最新期")
+            net_profit = float(profit_data[0].get("扣非净利润") or profit_data[0].get("归母净利润") or 1) if profit_data else 1
         op_cf = float(cf_latest.get("经营现金流净额", 0) or 0)
         dep = float(cf_latest.get("折旧摊销", 0) or 0)
-        net_profit = float(profit_data[0].get("扣非净利润") or profit_data[0].get("归母净利润") or 1) if profit_data else 1
         # 扣非净利润（排除资产处置等非经常项目）用于现金流质量判断
         cf_ratio = op_cf / net_profit if net_profit > 0 else 0
         # 折旧修正：重资产行业OFC/NI天然偏高，折旧占比>30%净利润时降低加分门槛
@@ -1498,8 +1632,8 @@ def calculate_scores(financial_data: dict) -> dict:
 
     scores["财务健康"] = {
         "得分": min(10, debt_score + cf_score),
-        "依据": f"资产负债率{debt}%, 经营现金流/扣非净利润={cf_ratio:.2f}{dep_note}",
-        "现金流标签": f"{cf_emoji}{cf_label}(覆盖率{cf_ratio:.2f})",
+        "依据": f"资产负债率{debt:.1f}%, 经营现金流/扣非净利润={cf_ratio:.2f}({cf_period}口径){dep_note}",
+        "现金流标签": f"{cf_emoji}{cf_label}(覆盖率{cf_ratio:.2f},{cf_period})",
         "现金流严重度": cf_severity,
         "FCF预警": _fcf_warning,
     }
