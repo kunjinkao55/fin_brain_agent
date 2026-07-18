@@ -15,7 +15,7 @@ import json, time
 from langchain_core.callbacks import BaseCallbackHandler
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="FinBrain", layout="wide")
+st.set_page_config(page_title="FinBrain", layout="wide", initial_sidebar_state="expanded")
 
 # ---- 工具调用追踪器 ----
 class ToolCallTracker(BaseCallbackHandler):
@@ -42,42 +42,364 @@ class ToolCallTracker(BaseCallbackHandler):
             self.records[-1]["status"] = "error"
             self.records[-1]["error"] = str(error)[:80]
 
-# ========== 暗色主题 ==========
+# ========== Kimi 风格暗色主题（主色保持红色 #cc3333） ==========
 st.markdown("""
 <style>
-  .stApp { background: #111; }
-  p, span, div, label, h1, h2, h3, h4, li { color: #ddd !important; }
-  header { background: #1a1a1a !important; }
-  header * { color: #ccc !important; }
-  section[data-testid="stSidebar"] { background: #1a1a1a !important; }
-  section[data-testid="stSidebar"] * { color: #bbb !important; }
-  section[data-testid="stSidebar"] h3 { color: #cc3333 !important; }
-  button { background: #cc3333 !important; color: #fff !important; border: none !important; }
-  input, textarea { background: #222 !important; color: #ddd !important; border: 1px solid #444 !important; }
-  .stChatMessage { background: #1a1a1a !important; }
-  .stTabs [role="tablist"], .stTabs button { background: #1a1a1a !important; }
-  .stTabs button[aria-selected="true"] { border-bottom: 2px solid #cc3333 !important; }
-  .stDataFrame, .stTable { background: #1a1a1a !important; }
-  .report-block { background: #1a1a1a; border-left: 3px solid #cc3333; padding: 20px;
-                  border-radius: 4px; }
-  .report-block pre { background: transparent; color: #ddd; font-family: Consolas,monospace;
-                      font-size: 13px; line-height: 1.7; white-space: pre-wrap;
-                      margin: 0; padding: 0; border: none; }
-  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 20px; }
-  .card .title { font-size: 13px; color: #888; }
-  .card .value { font-size: 28px; font-weight: 700; color: #cc3333; }
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+  .stApp {
+      background: linear-gradient(135deg, #0a0a0a 0%, #111111 50%, #0d0d0d 100%) !important;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+  }
+  p, label, h1, h2, h3, h4, li {
+      color: #e8e8e8 !important;
+      font-family: 'Inter', sans-serif !important;
+  }
+  div, span {
+      font-family: 'Inter', sans-serif !important;
+  }
+  h1, h2, h3 { font-weight: 600 !important; letter-spacing: -0.02em !important; }
+
+  /* 头部 */
+  header { background: rgba(10,10,10,0.85) !important; backdrop-filter: blur(20px) !important; }
+  header h1, header h2, header h3, header p, header span { color: #e8e8e8 !important; }
+
+  /* 侧边栏固定：默认展开、禁止折叠、折叠按钮隐藏 */
+  section[data-testid="stSidebar"] {
+      background: rgba(12,12,12,0.92) !important;
+      backdrop-filter: blur(24px) !important;
+      border-right: 1px solid rgba(255,255,255,0.06) !important;
+      width: 280px !important;
+      min-width: 280px !important;
+      max-width: 280px !important;
+      transform: none !important;
+      transition: none !important;
+  }
+  /* 隐藏侧边栏折叠/展开按钮，避免用户误点收起 */
+  button[data-testid="stSidebarCollapseButton"],
+  button[data-testid="stSidebarExpandButton"],
+  [data-testid="stSidebarCollapsedControl"],
+  [data-testid="stSidebarCollapsedControl"] button,
+  button[data-testid="baseButton-headerNoPadding"] {
+      display: none !important;
+      visibility: hidden !important;
+      opacity: 0 !important;
+      width: 0 !important;
+      height: 0 !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      pointer-events: none !important;
+  }
+  /* 强制主内容区让出固定侧边栏宽度 */
+  .stApp [data-testid="stAppViewContainer"] > .main {
+      margin-left: 280px !important;
+  }
+  /* 当侧边栏被意外折叠时，强制重新展开（防某些版本行为） */
+  section[data-testid="stSidebar"][aria-expanded="false"] {
+      width: 280px !important;
+      min-width: 280px !important;
+      max-width: 280px !important;
+  }
+
+  /* 侧边栏内部文字颜色 */
+  section[data-testid="stSidebar"] .stRadio label,
+  section[data-testid="stSidebar"] p,
+  section[data-testid="stSidebar"] span,
+  section[data-testid="stSidebar"] div,
+  section[data-testid="stSidebar"] label {
+      color: #a0a0a0 !important;
+  }
+  section[data-testid="stSidebar"] h1,
+  section[data-testid="stSidebar"] h2,
+  section[data-testid="stSidebar"] h3 { color: #e8e8e8 !important; }
+  section[data-testid="stSidebar"] .stRadio label {
+      padding: 8px 12px !important;
+      border-radius: 10px !important;
+      transition: all 0.2s ease !important;
+  }
+  section[data-testid="stSidebar"] .stRadio label:hover {
+      background: rgba(204,51,51,0.10) !important;
+      color: #cc3333 !important;
+  }
+  section[data-testid="stSidebar"] .stRadio label span {
+      color: #e0e0e0 !important;
+  }
+
+  /* 按钮 */
+  button[kind="primary"] {
+      background: linear-gradient(135deg, #cc3333 0%, #a82a2a 100%) !important;
+      color: #fff !important;
+      border: none !important;
+      border-radius: 10px !important;
+      font-weight: 500 !important;
+      box-shadow: 0 4px 15px rgba(204,51,51,0.25) !important;
+      transition: all 0.2s ease !important;
+  }
+  button[kind="primary"]:hover {
+      transform: translateY(-1px) !important;
+      box-shadow: 0 6px 20px rgba(204,51,51,0.35) !important;
+  }
+  button[kind="secondary"] {
+      background: rgba(255,255,255,0.06) !important;
+      color: #e0e0e0 !important;
+      border: 1px solid rgba(255,255,255,0.08) !important;
+      border-radius: 10px !important;
+      transition: all 0.2s ease !important;
+  }
+  button[kind="secondary"]:hover {
+      background: rgba(255,255,255,0.10) !important;
+      border-color: rgba(204,51,51,0.3) !important;
+  }
+
+  /* 输入框 */
+  input, textarea, .stTextInput input, .stTextArea textarea {
+      background: rgba(25,25,25,0.8) !important;
+      color: #e8e8e8 !important;
+      border: 1px solid rgba(255,255,255,0.08) !important;
+      border-radius: 12px !important;
+      font-family: 'Inter', sans-serif !important;
+  }
+  input:focus, textarea:focus, .stTextInput input:focus, .stTextArea textarea:focus {
+      border-color: #cc3333 !important;
+      box-shadow: 0 0 0 3px rgba(204,51,51,0.15) !important;
+  }
+
+  /* 聊天消息 */
+  .stChatMessage {
+      background: rgba(25,25,25,0.7) !important;
+      backdrop-filter: blur(12px) !important;
+      border-radius: 16px !important;
+      border: 1px solid rgba(255,255,255,0.05) !important;
+      margin: 10px 0 !important;
+      padding: 16px !important;
+  }
+  .stChatMessage [data-testid="stChatMessageAvatar"] { color: #cc3333 !important; }
+  .stChatMessage p, .stChatMessage span { color: #e0e0e0 !important; }
+
+  /* Tabs */
+  .stTabs [role="tablist"] {
+      background: rgba(20,20,20,0.6) !important;
+      border-radius: 12px !important;
+      padding: 4px !important;
+      border: 1px solid rgba(255,255,255,0.05) !important;
+  }
+  .stTabs button {
+      background: transparent !important;
+      border-radius: 8px !important;
+      color: #999 !important;
+      border: none !important;
+  }
+  .stTabs button[aria-selected="true"] {
+      background: rgba(204,51,51,0.12) !important;
+      color: #cc3333 !important;
+      font-weight: 600 !important;
+  }
+
+  /* DataFrame / Table */
+  .stDataFrame, .stTable, [data-testid="stDataFrameResizable"] {
+      background: rgba(20,20,20,0.6) !important;
+      border-radius: 12px !important;
+      border: 1px solid rgba(255,255,255,0.05) !important;
+  }
+  .stDataFrame th, .stDataFrame td { color: #e0e0e0 !important; border-color: rgba(255,255,255,0.05) !important; }
+  .stDataFrame th { background: rgba(30,30,30,0.8) !important; }
+
+  /* 报告块 */
+  .report-block {
+      background: rgba(20,20,20,0.75) !important;
+      backdrop-filter: blur(12px) !important;
+      border-left: 3px solid #cc3333 !important;
+      border-radius: 16px !important;
+      padding: 24px !important;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.25) !important;
+  }
+  .report-block pre {
+      background: transparent !important;
+      color: #e0e0e0 !important;
+      font-family: 'JetBrains Mono', 'Consolas', monospace !important;
+      font-size: 13px !important;
+      line-height: 1.75 !important;
+      white-space: pre-wrap !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      border: none !important;
+  }
+
+  /* 卡片 */
+  .card {
+      background: rgba(25,25,25,0.7) !important;
+      backdrop-filter: blur(10px) !important;
+      border: 1px solid rgba(255,255,255,0.06) !important;
+      border-radius: 16px !important;
+      padding: 20px !important;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2) !important;
+      transition: transform 0.2s ease !important;
+  }
+  .card:hover { transform: translateY(-2px) !important; }
+  .card .title { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 500; }
+  .card .value { font-size: 32px; font-weight: 700; color: #cc3333; margin-top: 6px; }
   .card .value.green { color: #4caf50; }
-  .card .sub { font-size: 12px; color: #999; }
+  .card .sub { font-size: 12px; color: #777; margin-top: 4px; }
+
+  /* Metric Box (Market page) */
+  .metric-box {
+      background: rgba(25,25,25,0.7) !important;
+      backdrop-filter: blur(10px) !important;
+      border: 1px solid rgba(255,255,255,0.06) !important;
+      border-radius: 16px !important;
+      padding: 18px !important;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2) !important;
+  }
+  .metric-box .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 500; }
+  .metric-box .value { font-size: 28px; font-weight: 700; color: #e8e8e8; margin-top: 6px; }
+  .metric-box .sub { font-size: 12px; color: #777; margin-top: 4px; }
+
+  /* 选择器 / 下拉 */
+  .stSelectbox div[data-baseweb="select"],
+  .stMultiSelect div[data-baseweb="select"] {
+      background: rgba(25,25,25,0.8) !important;
+      border-radius: 12px !important;
+      border: 1px solid rgba(255,255,255,0.08) !important;
+  }
+  .stSelectbox div[data-baseweb="select"] > div,
+  .stMultiSelect div[data-baseweb="select"] > div { color: #e8e8e8 !important; }
+
+  /* Expander */
+  .stExpander {
+      background: rgba(20,20,20,0.6) !important;
+      border-radius: 12px !important;
+      border: 1px solid rgba(255,255,255,0.05) !important;
+  }
+  .stExpander summary { color: #e0e0e0 !important; font-weight: 500 !important; }
+  .stExpander summary:hover { color: #cc3333 !important; }
+
+  /* 底部聊天栏 */
+  #chat-bottom-bar {
+      position: fixed !important;
+      bottom: 0 !important; left: 0 !important; right: 0 !important;
+      z-index: 9999 !important;
+      background: rgba(10,10,10,0.92) !important;
+      backdrop-filter: blur(24px) !important;
+      border-top: 1px solid rgba(255,255,255,0.08) !important;
+      padding: 16px 24px 20px 24px !important;
+      box-shadow: 0 -8px 32px rgba(0,0,0,0.3) !important;
+      transition: left 0.2s !important;
+  }
+  #chat-bottom-bar input {
+      background: rgba(25,25,25,0.9) !important;
+      border: 1px solid rgba(255,255,255,0.08) !important;
+      border-radius: 14px !important;
+      height: 48px !important;
+      font-size: 15px !important;
+  }
+  #chat-bottom-bar input:focus {
+      border-color: #cc3333 !important;
+      box-shadow: 0 0 0 3px rgba(204,51,51,0.15) !important;
+  }
+  #chat-bottom-bar form button {
+      background: linear-gradient(135deg, #cc3333 0%, #a82a2a 100%) !important;
+      border-radius: 12px !important;
+      width: 48px !important; height: 48px !important;
+      font-size: 18px !important;
+      box-shadow: 0 4px 15px rgba(204,51,51,0.25) !important;
+  }
+
+  /* 信息框 */
+  .stAlert {
+      border-radius: 12px !important;
+      border: 1px solid rgba(255,255,255,0.06) !important;
+  }
+  .stAlert [data-testid="stAlertContent"] { color: #e0e0e0 !important; }
+  .stInfo { background: rgba(59,130,246,0.08) !important; border-left: 3px solid #3b82f6 !important; }
+  .stSuccess { background: rgba(76,175,80,0.08) !important; border-left: 3px solid #4caf50 !important; }
+  .stWarning { background: rgba(255,193,7,0.08) !important; border-left: 3px solid #ffc107 !important; }
+  .stError { background: rgba(244,67,54,0.08) !important; border-left: 3px solid #f44336 !important; }
+
+  /* 分割线 */
+  hr {
+      border-color: rgba(255,255,255,0.06) !important;
+      margin: 24px 0 !important;
+  }
+
+  /* 滚动条 */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #0a0a0a; }
+  ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #cc3333; }
+
   footer { visibility: hidden; }
   div[data-testid="stToolbar"] { display: none; }
+</style>
+""", unsafe_allow_html=True)
+
+# 兜底：确保侧边栏始终固定展开（配合 CSS 隐藏折叠按钮）
+st.markdown("""
+<script>
+(function() {
+    function lockSidebar() {
+        var sidebar = document.querySelector('[data-testid="stSidebar"]');
+        if (sidebar) {
+            sidebar.style.setProperty('width', '280px', 'important');
+            sidebar.style.setProperty('min-width', '280px', 'important');
+            sidebar.style.setProperty('max-width', '280px', 'important');
+            sidebar.style.setProperty('transform', 'none', 'important');
+            sidebar.style.setProperty('transition', 'none', 'important');
+            sidebar.setAttribute('aria-expanded', 'true');
+        }
+        var main = document.querySelector('.main');
+        if (main) main.style.setProperty('margin-left', '280px', 'important');
+        var toggles = document.querySelectorAll(
+            'button[data-testid="stSidebarCollapseButton"], ' +
+            'button[data-testid="stSidebarExpandButton"], ' +
+            '[data-testid="stSidebarCollapsedControl"], ' +
+            '[data-testid="stSidebarCollapsedControl"] button, ' +
+            'button[data-testid="baseButton-headerNoPadding"]'
+        );
+        toggles.forEach(function(el) {
+            el.style.setProperty('display', 'none', 'important');
+            el.style.setProperty('visibility', 'hidden', 'important');
+            el.style.setProperty('opacity', '0', 'important');
+            el.style.setProperty('pointer-events', 'none', 'important');
+        });
+    }
+    lockSidebar();
+    setTimeout(lockSidebar, 300);
+    setTimeout(lockSidebar, 1000);
+})();
+</script>
+""", unsafe_allow_html=True)
+
+# Logo 区域
+st.markdown("""
+<style>
+  .kimi-logo {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 0 20px 0; margin-bottom: 8px;
+  }
+  .kimi-logo .logo-mark {
+      width: 32px; height: 32px; border-radius: 10px;
+      background: linear-gradient(135deg, #cc3333 0%, #a82a2a 100%);
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-weight: 700; font-size: 16px; font-family: 'Inter', sans-serif;
+      box-shadow: 0 4px 12px rgba(204,51,51,0.3);
+  }
+  .kimi-logo .logo-text { font-size: 20px; font-weight: 700; color: #e8e8e8; letter-spacing: -0.02em; }
+  .kimi-logo .logo-sub { font-size: 12px; color: #777; margin-top: 2px; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ========== 侧边栏 ==========
 with st.sidebar:
-    st.markdown("### FinBrain")
-    st.caption("AI-Powered Investment Research")
+    st.markdown('''
+    <div class="kimi-logo">
+        <div class="logo-mark">F</div>
+        <div>
+            <div class="logo-text">FinBrain</div>
+            <div class="logo-sub">AI-Powered Research</div>
+        </div>
+    </div>
+    ''', unsafe_allow_html=True)
     st.divider()
     page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Knowledge", "Evaluation", "Backtest", "Settings"], label_visibility="collapsed")
     st.divider()
@@ -96,7 +418,7 @@ with st.sidebar:
         st.session_state.pop("thread_id", None)
     ])
     st.divider()
-    st.caption("2026 FinBrain v0.2")
+    st.caption("FinBrain v0.3")
 
 
 # ========== 公共 ==========
@@ -277,9 +599,14 @@ if page == "Market":
         if update_time:
             title_text += f"<br><sup>数据日期: {data_date} | 更新时间: {update_time}</sup>"
         fig.update_layout(
-            title=title_text, height=max(600, len(names)*20),
-            margin=dict(l=10, r=100, t=50, b=10), paper_bgcolor="#111", plot_bgcolor="#111",
-            font=dict(color="#ddd"), xaxis=dict(title=x_title, showgrid=True, gridcolor="#333"), yaxis=dict(showgrid=False))
+            title=dict(text=title_text, font=dict(size=14, color="#e8e8e8", family="Inter, sans-serif")),
+            height=max(600, len(names)*20),
+            margin=dict(l=10, r=100, t=60, b=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#b0b0b0", family="Inter, sans-serif"),
+            xaxis=dict(title=x_title, showgrid=True, gridcolor="rgba(255,255,255,0.05)", linecolor="rgba(255,255,255,0.08)", tickfont=dict(color="#888")),
+            yaxis=dict(showgrid=False, tickfont=dict(color="#b0b0b0")),
+            hoverlabel=dict(bgcolor="rgba(20,20,20,0.9)", font_color="#e8e8e8", bordercolor="rgba(255,255,255,0.1)")
+        )
         st.plotly_chart(fig, use_container_width=True, key=f"kline_{key_suffix}")
 
     _draw_sector_chart(sector_data, "", "total")
@@ -400,17 +727,6 @@ if page == "Chat":
 
     # JS：把底部栏从 Streamlit 嵌套容器中移到 body 级别，实现真正的 fixed 定位
     st.markdown("""
-    <style>
-    #chat-bottom-bar {
-        position: fixed;
-        bottom: 0; left: 0; right: 0;
-        background: #111;
-        padding: 12px 20px 16px 20px;
-        z-index: 9999;
-        border-top: 1px solid #333;
-        transition: left 0.2s;
-    }
-    </style>
     <div id="chat-bottom-bar">
     """, unsafe_allow_html=True)
 
