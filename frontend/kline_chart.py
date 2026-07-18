@@ -210,19 +210,21 @@ def build_kline_chart(symbol: str, name: str, timeframe: str) -> go.Figure | Non
 
         title = f"{name} {cfg['label']}"
         fig.update_layout(
-            yaxis=dict(title="价格", domain=[0.25, 1.0], showgrid=True, gridcolor="#333"),
-            yaxis2=dict(title="成交量", domain=[0, 0.20], showgrid=False),
-            xaxis=dict(rangeslider=dict(visible=False)),
+            yaxis=dict(title="价格", domain=[0.25, 1.0], showgrid=True, gridcolor="rgba(255,255,255,0.05)", linecolor="rgba(255,255,255,0.08)", tickfont=dict(color="#888")),
+            yaxis2=dict(title="成交量", domain=[0, 0.20], showgrid=False, tickfont=dict(color="#888")),
+            xaxis=dict(rangeslider=dict(visible=False), linecolor="rgba(255,255,255,0.08)", tickfont=dict(color="#888")),
         )
 
     # ---- 公共样式 ----
     fig.update_layout(
-        title=title,
-        height=480, margin=dict(l=10, r=10, t=40, b=10),
-        paper_bgcolor="#111", plot_bgcolor="#111",
-        font=dict(color="#ddd", size=11),
-        xaxis=dict(showgrid=True, gridcolor="#333"),
+        title=dict(text=title, font=dict(size=15, color="#e8e8e8", family="Inter, sans-serif")),
+        height=520, margin=dict(l=10, r=10, t=50, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#b0b0b0", size=11, family="Inter, sans-serif"),
+        xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", linecolor="rgba(255,255,255,0.08)", tickfont=dict(color="#888")),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", linecolor="rgba(255,255,255,0.08)", tickfont=dict(color="#888")),
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
+        hoverlabel=dict(bgcolor="rgba(20,20,20,0.9)", font_color="#e8e8e8", bordercolor="rgba(255,255,255,0.1)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10, color="#b0b0b0")),
     )
     return fig
