@@ -728,17 +728,29 @@ def data_collector_node(state: FinBrainState) -> dict:
             val = get_valuation(code); _tools.append(("估值", "✅"))
             price = fetch_stock_price(code); _tools.append(("行情", "✅"))
             ind = get_industry_info(code); _tools.append(("行业", "✅"))
-            cs_data = {"profit": fin.get("profit",[]), "cashflow": fin.get("cashflow",[]),
+            announcements = get_recent_announcements(code, 20); _tools.append(("公告", "✅"))
+            # 业绩快报回灌：公告快报的扣非/营收/归母补入利润表最新行，评分与LLM都用最新期间
+            from backend.tools import merge_flash_into_profit
+            _flash = None
+            for _a in (announcements.get("列表", []) if isinstance(announcements, dict) else []):
+                if isinstance(_a, dict) and _a.get("快报数据"):
+                    _flash = _a["快报数据"]
+                    break
+            profit_rows = fin.get("profit", [])
+            if _flash and profit_rows:
+                merge_flash_into_profit(profit_rows, _flash)
+            cs_data = {"profit": profit_rows, "cashflow": fin.get("cashflow",[]),
                        "balance": fin.get("balance",[]), "valuation": val,
                        "price": dict(price) if isinstance(price, dict) else price,
                        "industry": ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else ""}
+            if _flash:
+                cs_data["flash"] = _flash
             scores = calculate_scores(cs_data); _tools.append(("评分", "✅"))
-            announcements = get_recent_announcements(code, 20); _tools.append(("公告", "✅"))
             name = price.get("name", code) if isinstance(price, dict) else code
             return {"代码": code, "名称": name, "行情": price,
                     "行业": ind.get("行业", ind.get("industry_name", "")) if isinstance(ind, dict) else "",
                     "公告": announcements,
-                    "财报": {"利润表": fin.get("profit",[])[:4], "现金流": fin.get("cashflow",[])[:2]},
+                    "财报": {"利润表": profit_rows[:4], "现金流": fin.get("cashflow",[])[:2]},
                     "估值": val.get("data",[])[:2] if isinstance(val, dict) else [],
                     "预计算分数": scores, "_tools": _tools}
         except Exception as e:
@@ -828,8 +840,37 @@ def analyst_node(state: FinBrainState) -> dict:
     # 清理 collected_data 中的内部标记头，避免干扰 LLM
     _clean_collected = re.sub(r'^\[INDUSTRY\][^\n]*\n', '', collected, flags=re.MULTILINE)
     _clean_collected = re.sub(r'^\[TOOLS\][^\n]*\n', '', _clean_collected, flags=re.MULTILINE)
+
+    # 业绩快报高优块：快报数据必须出现在 prompt 最前，防止 LLM 忽略公告列表中的快报
+    _flash_block = ""
+    try:
+        _coll_json = json.loads(_clean_collected)
+        _coll_items = _coll_json if isinstance(_coll_json, list) else [_coll_json]
+        from backend.tools import _format_flash_hint
+        for _ci in _coll_items:
+            if not isinstance(_ci, dict):
+                continue
+            _anns = _ci.get("公告", {})
+            for _a in (_anns.get("列表", []) if isinstance(_anns, dict) else []):
+                if isinstance(_a, dict) and _a.get("快报数据"):
+                    _hint = _format_flash_hint(_a["快报数据"])
+                    if _hint:
+                        _flash_block += f"\n  {_ci.get('名称', _ci.get('代码', '?'))}: {_hint}"
+    except Exception:
+        pass
+    if _flash_block:
+        _flash_block = (
+            "\n[!!! 最新业绩快报 — 数据优先级最高，覆盖季报/年报数据 !!!]" + _flash_block +
+            "\n[强制规则] ①快报已覆盖的报告期，禁止再写「等待中报/半年报/年报确认拐点后再决策」；"
+            "②成长性判断、情景估值EPS假设、情景概率必须引用快报数据；"
+            "③若Q1单季数据与快报趋势冲突（如Q1扣非暴跌但快报扣非转正），以快报为准，"
+            "并将单季异常解释为季节性/基数扰动；④情景概率需反映快报已证伪的部分"
+            "（如快报扣非已转正，则「全年利润大幅下滑」的悲观情景概率应下调）。\n"
+        )
+
     prompt = (
-        f"用户问题: {state['user_question']}\n\n"
+        f"用户问题: {state['user_question']}\n"
+        f"{_flash_block}\n"
         f"=== 已搜集数据 ===\n{_clean_collected}\n"
         f"{industry_rag}"
         f"\n[任务] 基于以上数据和行业分析模板，撰写完整的分析报告JSON。"
@@ -1252,6 +1293,35 @@ def _validate_scenarios(item: dict):
     item["_scenario_check"] = check
 
 
+def _detect_timeliness_conflict(item: dict) -> str | None:
+    """代码级时效性检查：业绩快报已发布，但操作建议/综合结论仍在等待对应财报期。
+    返回冲突描述（供 _code_issues），无冲突返回 None。"""
+    _anns = item.get("公告", {})
+    flash_periods = [_a.get("快报数据", {}).get("报告期", "")
+                     for _a in (_anns.get("列表", []) if isinstance(_anns, dict) else [])
+                     if isinstance(_a, dict) and _a.get("快报数据")]
+    if not flash_periods and item.get("_flash_data"):
+        flash_periods = [item["_flash_data"].get("报告期", "")]
+    if not flash_periods:
+        return None
+    scan_text = (str(item.get("操作建议", "")) +
+                 json.dumps(item.get("综合结论", ""), ensure_ascii=False))
+    for fp in flash_periods:
+        if "半年度" in fp or "中报" in fp:
+            wks = ["中报", "半年报", "半年度报告"]
+        elif "三季度" in fp or "第三季度" in fp:
+            wks = ["三季报"]
+        elif "年度" in fp:
+            wks = ["年报"]
+        else:
+            wks = []
+        for wk in wks:
+            if (re.search(rf'(等待|静待|等到|观望至)[^。；\n]{{0,15}}{wk}', scan_text) or
+                    re.search(rf'{wk}[^。；\n]{{0,8}}(确认拐点|再决策|后再|验证)', scan_text)):
+                return f"{fp}业绩快报已发布，但报告仍建议等待{wk}确认"
+    return None
+
+
 def reporter_node(state: FinBrainState) -> dict:
     """代码生成评分卡（对齐表格）+ _get_llm()生成叙述"""
     from backend.tools import format_report
@@ -1363,11 +1433,26 @@ def reporter_node(state: FinBrainState) -> dict:
             val = get_valuation(sym)
             price = fetch_stock_price(sym)
             ind = get_industry_info(sym)
+            # 公告统一在顶部抓取：业绩快报数据需回灌评分引擎，定增检测在下游复用
+            from backend.tools import get_recent_announcements as _gra
+            ann_data = _gra(sym, 20)
+            flash_data = None
+            for _a in (ann_data.get("列表", []) if isinstance(ann_data, dict) else []):
+                if isinstance(_a, dict) and _a.get("快报数据"):
+                    flash_data = _a["快报数据"]
+                    break
             cs_data = {}
             if isinstance(fin, dict) and "profit" in fin:
                 cs_data["profit"] = fin.get("profit", [])
                 cs_data["cashflow"] = fin.get("cashflow", [])
                 cs_data["balance"] = fin.get("balance", [])
+            if flash_data:
+                cs_data["flash"] = flash_data
+                item["_flash_data"] = flash_data  # 供下游时效性检查/展示复用
+                # 快报扣非回灌利润表最新行（datacenter快报行缺扣非字段，公告快报有）
+                from backend.tools import merge_flash_into_profit
+                if cs_data.get("profit"):
+                    merge_flash_into_profit(cs_data["profit"], flash_data)
             if isinstance(val, dict):
                 cs_data["valuation"] = val
             if isinstance(price, dict):
@@ -1399,15 +1484,18 @@ def reporter_node(state: FinBrainState) -> dict:
             val_data = val.get("data", []) if isinstance(val, dict) else []
             annuals = [v for v in val_data if (v.get("日期") or v.get("date") or "").endswith("-12-31")]
             latest_val = annuals[0] if annuals else (val_data[0] if val_data else {})
-            # TTM EPS: 年报净利 - 去年Q1 + 最新Q1
+            # TTM EPS: 最新年报净利 - 去年同期净利 + 最新同期净利（Q1/中报/三季报通用）
             profit_data = fin.get("profit", []) if isinstance(fin, dict) else []
             annuals_prof = [p for p in profit_data if p.get("报告期") == "年报"]
-            q1s = [p for p in profit_data if p.get("报告期") == "一季报"]
             ann_net = float(annuals_prof[0].get("归母净利润") or annuals_prof[0].get("扣非净利润") or 0) if annuals_prof else 0
             ttm_net = ann_net
-            if len(q1s) >= 2:
-                ttm_net = ann_net + float(q1s[0].get("归母净利润") or q1s[0].get("扣非净利润") or 0) \
-                                   - float(q1s[1].get("归母净利润") or q1s[1].get("扣非净利润") or 0)
+            if profit_data:
+                _lp = profit_data[0].get("报告期", "")
+                if _lp != "年报":
+                    _same = [p for p in profit_data if p.get("报告期") == _lp]
+                    if len(_same) >= 2:
+                        ttm_net = ann_net + float(_same[0].get("归母净利润") or _same[0].get("扣非净利润") or 0) \
+                                           - float(_same[1].get("归母净利润") or _same[1].get("扣非净利润") or 0)
             total_shares = float(latest_val.get("总股本", 0) or 0)
             eps_ttm = ttm_net / total_shares if total_shares > 0 and ttm_net > 0 else 0
             if eps_ttm <= 0:
@@ -1474,15 +1562,18 @@ def reporter_node(state: FinBrainState) -> dict:
             if code_pb <= 0 and bps > 0:
                 code_pb = stock_price / bps
             mktcap = total_shares * stock_price / 1e8 if total_shares > 0 else 0
-            # 前瞻PE: 当前价 / (最新季报净利 × 4 / 总股本)。
+            # 前瞻PE: 当前价 / (最新期间净利 × 年化系数 / 总股本)。
+            # 年化系数期间感知：一季报×4 / 中报×2 / 三季报×4/3。
             # 季节性失真防护：Q1净利占年报比例过低的公司（利润集中在下半年），
             # 简单年化会产生数百倍的失真PE（如986倍），此时禁用前瞻PE，引导参考TTM PE。
             latest_q = profit_data[0] if profit_data else {}
             latest_q_net = float(latest_q.get("归母净利润") or latest_q.get("扣非净利润") or 0)
-            fwd_eps = (latest_q_net * 4) / total_shares if total_shares > 0 else 0
+            _lp_q = latest_q.get("报告期", "")
+            _ann_factor = {"一季报": 4, "半年报": 2, "三季报": 4 / 3}.get(_lp_q, 4)
+            fwd_eps = (latest_q_net * _ann_factor) / total_shares if total_shares > 0 else 0
             fwd_pe = stock_price / fwd_eps if fwd_eps > 0 else 0
             fwd_pe_note = ""
-            if latest_q.get("报告期") == "一季报" and ann_net > 0 and 0 < latest_q_net < ann_net * 0.15:
+            if _lp_q == "一季报" and ann_net > 0 and 0 < latest_q_net < ann_net * 0.15:
                 fwd_pe = 0
                 fwd_pe_note = f"前瞻PE已禁用: Q1归母净利{latest_q_net/1e8:.2f}亿仅占年报{ann_net/1e8:.1f}亿的{latest_q_net/ann_net*100:.0f}%, 简单年化严重失真, 请使用TTM PE"
 
@@ -1640,9 +1731,8 @@ def reporter_node(state: FinBrainState) -> dict:
                 fund_amount = 0.0
                 dil_pct = ""
                 try:
-                    from backend.tools import get_recent_announcements as _gra
                     import re as _re2
-                    ann = _gra(sym, 20)
+                    ann = ann_data if (isinstance(ann_data, dict) and ann_data.get("列表")) else _gra(sym, 20)
                     titles_all = " ".join([a.get("标题","") for a in ann.get("列表",[])])
                     zj_match = _re2.search(r'(发行A股|非公开发行|定向增发|募集资金|发行股份)', titles_all)
 
@@ -2107,6 +2197,10 @@ def reporter_node(state: FinBrainState) -> dict:
         _sc_check = item.get("_scenario_check", {})
         if _sc_check and not _sc_check.get("monotonic_ok", True):
             _code_issues.append("❌ 情景估值价格倒挂(悲观/基准/乐观单调性破坏)")
+        # 时效性矛盾：业绩快报已发布，但操作建议/综合结论仍在等待对应财报期
+        _tl = _detect_timeliness_conflict(item)
+        if _tl:
+            _code_issues.append(f"❌ 时效性矛盾: {_tl}")
 
     _skip_auditor = len(_code_issues) == 0
     if _skip_auditor:

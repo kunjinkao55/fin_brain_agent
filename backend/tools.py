@@ -370,6 +370,28 @@ def get_financial_statements(symbol: str) -> dict:
             "cashflow": pick(cashflow_data, CASHFLOW_COLS),
             "name": balance_data[0].get("SECURITY_NAME_ABBR", ""),
         }
+        # 业绩快报datacenter(RPT_FCI_PERFORMANCEE)：快报发布次日即入库，比三大报表快4-6周。
+        # 若其最新期间比利润表更新，合成headline行前置插入（扣非字段缺失，由公告快报补齐）。
+        try:
+            perf_rows = fetch_report("RPT_FCI_PERFORMANCEE")
+            if perf_rows:
+                newest = perf_rows[0]
+                rd = (newest.get("REPORT_DATE") or "")[:10]
+                if rd and newest.get("PARENT_NETPROFIT") is not None:
+                    profit_list = result["profit"]
+                    if not profit_list or profit_list[0].get("date", "") < rd:
+                        _PERIOD_MAP = {"03-31": "一季报", "06-30": "半年报",
+                                       "09-30": "三季报", "12-31": "年报"}
+                        profit_list.insert(0, {
+                            "date": rd,
+                            "报告期": _PERIOD_MAP.get(rd[5:], "季报"),
+                            "营业总收入": newest.get("TOTAL_OPERATE_INCOME"),
+                            "归母净利润": newest.get("PARENT_NETPROFIT"),
+                            "扣非净利润": None,
+                            "_快报源": True,
+                        })
+        except Exception:
+            pass  # 快源失败不影响主报表
         cache.set("financial_statements", symbol, result)
         return result
 
@@ -999,6 +1021,9 @@ def format_report(analysis: dict) -> str:
                 if fv > 0 and pess_price > fv * 2:
                     lines.append(f"    * 情景估值由趋势研判生成，最低情景({pess_price}元)仍显著高于量化合理价值({fv:.0f}元)，"
                                  f"反映了市场情绪和成长预期——非基本面锚点，仅供参考。")
+                elif fv > 0 and pess_price > fv:
+                    lines.append(f"    * 注意: 情景悲观价({pess_price}元)高于量化合理价值({fv:.1f}元)——"
+                                 f"两套框架锚点不同(趋势情景中枢 vs 保守PE锚)，差异解读见[框架分歧]段落。")
             except: pass
 
         # ---- 对比分析 ----
@@ -1416,6 +1441,65 @@ def get_concept_ranking(top_n: int = 20) -> dict:
 #  确定性评分引擎（替代 LLM 主观打分）
 # ============================================================
 
+def _period_rank(period: str) -> int:
+    """财报期间序号：一季报<中报/半年度<三季报<年报。用于判断业绩快报是否比结构化数据更新鲜。"""
+    if not period:
+        return 0
+    if "一季报" in period or "一季度" in period or "第一季度" in period:
+        return 1
+    if "中报" in period or "半年度" in period or "半年" in period:
+        return 2
+    if "三季报" in period or "三季度" in period or "第三季度" in period:
+        return 3
+    if "年报" in period or "年度" in period:
+        return 4
+    return 0
+
+
+def _flash_period_label(period: str) -> str:
+    """快报报告期描述 → 利润表标准期间标签"""
+    r = _period_rank(period)
+    return {1: "一季报", 2: "半年报", 3: "三季报", 4: "年报"}.get(r, "")
+
+
+def merge_flash_into_profit(profit_list: list, flash: dict) -> list:
+    """把公告快报数据回灌利润表：
+    1) 快报期间与利润表最新行一致 → 补齐缺失的扣非/归母/营收字段（datacenter快报行缺扣非）
+    2) 快报期间比利润表最新行更新 → 按快报合成新行前置插入
+    返回修改后的 profit_list（原地修改）。"""
+    if not flash or not isinstance(profit_list, list):
+        return profit_list
+    label = _flash_period_label(flash.get("报告期", ""))
+    if not label:
+        return profit_list
+
+    def _yi(key):
+        v = flash.get(key)
+        return v * 1e8 if isinstance(v, (int, float)) else None
+
+    f_rev = _yi("营收(亿元)")
+    f_gm = _yi("归母净利润(亿元)")
+    f_kf = _yi("扣非净利润(亿元)")
+
+    if profit_list and profit_list[0].get("报告期") == label:
+        row = profit_list[0]
+        if f_kf is not None and row.get("扣非净利润") is None:
+            row["扣非净利润"] = f_kf
+        if f_gm is not None and row.get("归母净利润") is None:
+            row["归母净利润"] = f_gm
+        if f_rev is not None and row.get("营业总收入") is None:
+            row["营业总收入"] = f_rev
+        return profit_list
+
+    if not profit_list or _period_rank(label) > _period_rank(profit_list[0].get("报告期", "")):
+        profit_list.insert(0, {
+            "date": "", "报告期": label,
+            "营业总收入": f_rev, "归母净利润": f_gm, "扣非净利润": f_kf,
+            "_快报源": True,
+        })
+    return profit_list
+
+
 def calculate_scores(financial_data: dict) -> dict:
     """纯函数，根据财报数据计算6维评分。数据不足时该维度自动标N/A。"""
     scores = {}
@@ -1523,7 +1607,36 @@ def calculate_scores(financial_data: dict) -> dict:
         # === 季报YoY：最新动向（势头）===
         latest = profit_data[0]
         latest_period = latest.get("报告期", "")
-        if latest_period != "年报":
+        # 业绩快报修正：快报覆盖期间比最新结构化季报更新鲜时，以快报为势头信号
+        # （否则"Q1扣非-86%但半年度快报扣非+11%"时，评分仍停留在Q1的失真状态）
+        flash = financial_data.get("flash") or {}
+        flash_period = flash.get("报告期", "")
+        use_flash = bool(flash) and _period_rank(flash_period) > _period_rank(latest_period)
+        if use_flash:
+            f_rev = flash.get("营收同比(%)")
+            f_net = flash.get("扣非同比(%)")
+            if f_net is None:
+                f_net = flash.get("归母同比(%)")
+            if f_net is not None:
+                if f_rev is not None:
+                    basis_parts.append(f"快报[{flash_period}]:营收{f_rev:+.0f}%,扣非{f_net:+.0f}%")
+                else:
+                    basis_parts.append(f"快报[{flash_period}]:扣非{f_net:+.0f}%")
+                # 势头修正：年报增速 vs 快报增速（替代季报增速）
+                if a_net_g > 0 and f_net > 0:
+                    if f_net >= a_net_g:
+                        g_score = min(10, g_score + 2)  # 加速
+                        basis_parts.append("趋势:加速↑(快报)")
+                    else:
+                        basis_parts.append("趋势:延续→(快报)")
+                elif a_net_g > 0 and f_net < 0:
+                    g_score = max(0, g_score - 3)
+                    basis_parts.append("趋势:拐点恶化⚠️(快报)")
+                elif a_net_g < 0 and f_net > 0:
+                    g_score = min(10, g_score + 3)  # 年报跌但快报转正→拐点改善
+                    basis_parts.append("趋势:拐点改善↑(快报)")
+                # 年报/快报均负：不修正
+        elif latest_period != "年报":
             q_same = [p for p in profit_data if p.get("报告期") == latest_period]
             if len(q_same) >= 2:
                 q_cur, q_prev = q_same[0], q_same[1]
@@ -1646,20 +1759,23 @@ def calculate_scores(financial_data: dict) -> dict:
         "电子": 30, "半导体": 40, "计算机": 35, "通信": 22, "传媒": 20,
         "新能源": 25, "军工": 40, "机械": 22, "建材": 15, "建筑": 10,
         "交运": 15, "公用事业": 18, "环保": 20, "商贸": 18, "纺织": 18,
+        "IT服务": 32, "IT服务Ⅱ": 32, "软件开发": 35, "互联网服务": 30,
     }
     price_info = financial_data.get("price", {})
     pe = float(price_info.get("per", 0) or 0) if isinstance(price_info, dict) else 0
     # PE未从外部获取时，自算 = 股价 / TTM_EPS（滚动12个月）
     if pe <= 0:
         stock_price = float(price_info.get("price", 0) or 0) if isinstance(price_info, dict) else 0
-        # TTM净利润: 最新年报净利 - 去年Q1净利 + 最新Q1净利
-        q1s = [p for p in profit_data if p.get("报告期") == "一季报"]
+        # TTM净利润 = 最新年报净利 - 去年同期净利 + 最新同期净利（Q1/中报/三季报通用）
         ann_net = float(annuals[0].get("归母净利润") or annuals[0].get("扣非净利润") or 0) if annuals else 0
-        if len(q1s) >= 2:
-            ttm_net = ann_net + float(q1s[0].get("归母净利润") or q1s[0].get("扣非净利润") or 0) \
-                               - float(q1s[1].get("归母净利润") or q1s[1].get("扣非净利润") or 0)
-        else:
-            ttm_net = ann_net
+        ttm_net = ann_net
+        if profit_data:
+            _lp = profit_data[0].get("报告期", "")
+            if _lp != "年报":
+                _same = [p for p in profit_data if p.get("报告期") == _lp]
+                if len(_same) >= 2:
+                    ttm_net = ann_net + float(_same[0].get("归母净利润") or _same[0].get("扣非净利润") or 0) \
+                                       - float(_same[1].get("归母净利润") or _same[1].get("扣非净利润") or 0)
         total_shares = _find_val("总股本")
         eps_ttm = ttm_net / total_shares if total_shares > 0 and ttm_net > 0 else 0
         if eps_ttm <= 0:

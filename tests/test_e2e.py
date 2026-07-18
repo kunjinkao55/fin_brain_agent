@@ -466,6 +466,146 @@ class TestReportQualityGuards(unittest.TestCase):
         self.assertIn('"EPS"', _FORMAT_MANDATORY)
         self.assertIn('"PE"', _FORMAT_MANDATORY)
 
+    def test_period_rank(self):
+        """财报期间序号：一季报<中报<三季报<年报"""
+        from backend.tools import _period_rank
+        self.assertLess(_period_rank("一季报"), _period_rank("2026年半年度"))
+        self.assertLess(_period_rank("2026年半年度"), _period_rank("三季报"))
+        self.assertLess(_period_rank("三季报"), _period_rank("年报"))
+        self.assertEqual(_period_rank("中报"), _period_rank("半年度"))
+
+    def test_flash_feeds_growth_score(self):
+        """快报比最新季报新鲜时，成长性必须用快报做趋势修正（拐点改善）"""
+        from backend.tools import calculate_scores
+        cs = {
+            "profit": [
+                {"报告期": "一季报", "营业总收入": 13.44e8, "扣非净利润": 352_0000},
+                {"报告期": "年报", "营业总收入": 100e8, "扣非净利润": 6.6e8},
+                {"报告期": "一季报", "营业总收入": 13.87e8, "扣非净利润": 2600_0000},
+                {"报告期": "年报", "营业总收入": 98e8, "扣非净利润": 7.6e8},
+            ],
+            "cashflow": [], "balance": [],
+            "valuation": {"data": [{"日期": "2025-12-31", "ROE(%)": 10, "毛利率(%)": 17,
+                          "净利率(%)": 6, "每股收益": 0.55, "每股净资产": 5.41,
+                          "总股本": 12e8, "资产负债率(%)": 52}]},
+            "price": {"price": 14.1}, "industry": "IT服务Ⅱ",
+            # 半年度快报：扣非同比+11.2%（年报-13%为负 → 拐点改善）
+            "flash": {"报告期": "2026年半年度", "营收(亿元)": 34.33, "营收同比(%)": -2.59,
+                      "归母净利润(亿元)": 2.31, "归母同比(%)": -12.97,
+                      "扣非净利润(亿元)": 2.29, "扣非同比(%)": 11.18},
+        }
+        g = calculate_scores(cs)["成长性"]
+        self.assertIn("快报", g["依据"])
+        self.assertIn("拐点改善", g["依据"])
+        # 年报底色1分 + 拐点改善+3 = 4分；若仍用Q1(-86%)则只有1分
+        self.assertGreaterEqual(g["得分"], 3)
+
+    def test_flash_ignored_when_older(self):
+        """快报期间不新鲜于最新结构化数据时不得使用"""
+        from backend.tools import calculate_scores
+        cs = {
+            "profit": [
+                {"报告期": "三季报", "营业总收入": 80e8, "扣非净利润": 5e8},
+                {"报告期": "年报", "营业总收入": 100e8, "扣非净利润": 6.6e8},
+                {"报告期": "三季报", "营业总收入": 75e8, "扣非净利润": 5.5e8},
+                {"报告期": "年报", "营业总收入": 98e8, "扣非净利润": 7.6e8},
+            ],
+            "cashflow": [], "balance": [],
+            "valuation": {"data": [{"日期": "2025-12-31", "ROE(%)": 10, "毛利率(%)": 17,
+                          "净利率(%)": 6, "每股收益": 0.55, "每股净资产": 5.41,
+                          "总股本": 12e8, "资产负债率(%)": 52}]},
+            "price": {"price": 14.1}, "industry": "IT服务Ⅱ",
+            "flash": {"报告期": "2026年半年度", "扣非同比(%)": 11.18},  # 半年度 < 三季报
+        }
+        g = calculate_scores(cs)["成长性"]
+        self.assertNotIn("快报", g["依据"])
+
+    def test_timeliness_conflict_detector(self):
+        """代码级时效性检查：快报已出+报告仍等待对应财报期 → 必须检出"""
+        from backend.agent import _detect_timeliness_conflict
+        item_wait = {
+            "公告": {"列表": [{"标题": "x", "快报数据": {"报告期": "2026年半年度"}}]},
+            "操作建议": "建议等待中报确认拐点后再决策",
+        }
+        self.assertIsNotNone(_detect_timeliness_conflict(item_wait))
+        # 无快报 → 不检出
+        item_no_flash = {"公告": {"列表": []}, "操作建议": "建议等待中报确认拐点后再决策"}
+        self.assertIsNone(_detect_timeliness_conflict(item_no_flash))
+        # 有快报但无等待措辞 → 不检出
+        item_ok = {
+            "公告": {"列表": [{"标题": "x", "快报数据": {"报告期": "2026年半年度"}}]},
+            "操作建议": "基于快报数据，扣非已转正，可轻仓试探",
+        }
+        self.assertIsNone(_detect_timeliness_conflict(item_ok))
+
+    def test_it_services_industry_pe_anchor(self):
+        """IT服务行业必须有独立PE基准（不再fallback到默认18）"""
+        from backend.scoring_config import get_valuation
+        cfg = get_valuation()
+        self.assertIn("IT服务Ⅱ", cfg["industry_pe"])
+        self.assertGreater(cfg["industry_pe"]["IT服务Ⅱ"], cfg["default_ind_pe"])
+
+    def test_pessimistic_above_fair_value_bridge_note(self):
+        """情景悲观价>量化合理价值时，报告必须出现桥接说明"""
+        from backend.tools import format_report
+        mock = {
+            "代码": "600131", "名称": "测试",
+            "投资评级": {"评级": "SELL", "合理价值": 6.9, "当前价格": 14.1},
+            "情景估值": {
+                "悲观": {"价格": 8.4, "EPS": 0.42, "PE": 20, "假设": "x", "概率": "30%"},
+                "基准": {"价格": 12.5, "EPS": 0.5, "PE": 25, "假设": "x", "概率": "50%"},
+                "乐观": {"价格": 17.4, "EPS": 0.58, "PE": 30, "假设": "x", "概率": "20%"},
+                "概率加权价值": 12.25,
+            },
+        }
+        report = format_report(mock)
+        self.assertIn("两套框架锚点不同", report)
+
+    def test_merge_flash_into_profit_fill_kf(self):
+        """快报回灌：同期间行缺扣非时必须补齐"""
+        from backend.tools import merge_flash_into_profit
+        profit = [{"date": "2026-06-30", "报告期": "半年报",
+                   "营业总收入": 34.33e8, "归母净利润": 2.31e8, "扣非净利润": None, "_快报源": True},
+                  {"date": "2025-06-30", "报告期": "半年报",
+                   "营业总收入": 35.25e8, "归母净利润": 2.66e8, "扣非净利润": 2.06e8}]
+        flash = {"报告期": "2026年半年度", "扣非净利润(亿元)": 2.29}
+        merge_flash_into_profit(profit, flash)
+        self.assertEqual(profit[0]["扣非净利润"], 2.29e8)
+        self.assertEqual(len(profit), 2)  # 不新增行
+
+    def test_merge_flash_into_profit_synthesize(self):
+        """快报回灌：快报期间更新鲜时必须合成新行"""
+        from backend.tools import merge_flash_into_profit
+        profit = [{"date": "2026-03-31", "报告期": "一季报",
+                   "营业总收入": 13.44e8, "归母净利润": 0.04e8, "扣非净利润": 0.035e8}]
+        flash = {"报告期": "2026年半年度", "营收(亿元)": 34.33,
+                 "归母净利润(亿元)": 2.31, "扣非净利润(亿元)": 2.29}
+        merge_flash_into_profit(profit, flash)
+        self.assertEqual(len(profit), 2)
+        self.assertEqual(profit[0]["报告期"], "半年报")
+        self.assertEqual(profit[0]["扣非净利润"], 2.29e8)
+        self.assertTrue(profit[0]["_快报源"])
+
+    def test_merge_flash_not_older(self):
+        """快报期间不新鲜于利润表最新行时不得插入"""
+        from backend.tools import merge_flash_into_profit
+        profit = [{"date": "2026-09-30", "报告期": "三季报",
+                   "营业总收入": 80e8, "归母净利润": 5e8, "扣非净利润": 4.8e8}]
+        flash = {"报告期": "2026年半年度", "扣非净利润(亿元)": 2.29}
+        merge_flash_into_profit(profit, flash)
+        self.assertEqual(len(profit), 1)
+
+    def test_financial_statements_fast_source(self):
+        """RPT_FCI快源：600131利润表最新行应覆盖2026中报（正式披露前由快报合成）"""
+        from backend.tools import get_financial_statements
+        fin = get_financial_statements("600131")
+        profit = fin.get("profit", [])
+        self.assertGreater(len(profit), 0)
+        self.assertGreaterEqual(profit[0].get("date", ""), "2026-06-30")
+        self.assertEqual(profit[0].get("报告期"), "半年报")
+        self.assertAlmostEqual(profit[0]["归母净利润"] / 1e8, 2.31, places=1)
+
+
 
 def run_all():
     """运行全部测试并输出结果"""
