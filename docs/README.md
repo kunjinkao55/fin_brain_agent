@@ -162,6 +162,7 @@ Three configurable tiers (FREE/PREMIUM/INSTITUTIONAL) with pluggable premium dat
 - Announcement scanning (20 items, 3-level priority, dilution detection with auto-correction, earnings flash report content extraction)
 - Sector fund flow and market breadth monitoring
 - Sector momentum scoring (fund flow + relative strength + concentration, 4-tier temperature gauge)
+- Market sentiment reference: market breadth + individual price change + short-term heat indicators
 
 **Analysis Layer**
 - 10-step investment framework (company → moat → cycle → financials → growth → expectations → scenarios → catalysts → decision)
@@ -180,6 +181,7 @@ Three configurable tiers (FREE/PREMIUM/INSTITUTIONAL) with pluggable premium dat
 - 4-level escalation (warning → surgical fix → analyst retry → circuit breaker)
 - Processing marker system to prevent double-processing across retries
 - 3-slot LLM fallback chain (slot 1 required, slot 2/3 optional)
+- **Market sentiment reference**: market breadth + individual price change + short-term heat (limit-up / dragon-tiger), used as a timing/pace reference, not a valuation input
 
 **Output Layer**
 - Structured markdown report with scoring card, valuation chain, and audit summary

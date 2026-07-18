@@ -822,6 +822,24 @@ def format_report(analysis: dict) -> str:
             if weighted: lines.append(f"    加权总分: {weighted}/100  置信度: {conf}")
             lines.append(f"    * 估值基于财报数据计算，非实时定价。不构成买卖建议。")
 
+        # ---- 市场情绪参考（代码计算，仅作决策参考，不参与估值） ----
+        sentiment = analysis.get("市场情绪", {})
+        if sentiment and isinstance(sentiment, dict):
+            lines.append("")
+            lines.append(f"  [市场情绪参考] 仅作节奏参考，不纳入估值")
+            score = sentiment.get("综合情绪得分", 0)
+            label = sentiment.get("情绪标签", "")
+            breadth = sentiment.get("市场广度", {})
+            stock_chg = sentiment.get("个股涨跌", {})
+            heat = sentiment.get("短线热度", {})
+            suggestion = sentiment.get("对操作建议", "")
+            lines.append(f"    综合情绪: {score:+.2f} ({label})")
+            lines.append(f"    市场广度: 上涨比例 {breadth.get('上涨比例', 'N/A')}")
+            lines.append(f"    个股涨跌: {stock_chg.get('说明', 'N/A')}")
+            lines.append(f"    短线热度: {heat.get('备注', '无')}")
+            if suggestion: lines.append(f"    情绪建议: {suggestion}")
+            lines.append(f"    * 情绪指标基于当日行情数据，可能随市场波动快速变化，请勿作为独立决策依据。")
+
         # 估值方法
         val_method = analysis.get("估值方法", "")
         if val_method:
@@ -2136,6 +2154,11 @@ def get_intraday(symbol: str) -> dict:
 
 def get_market_breadth() -> dict:
     """获取全A股/行业/概念的涨跌家数统计"""
+    # 先查缓存
+    from backend import cache
+    cached = cache.get("market_breadth", "all")
+    if cached:
+        return cached
     try:
         headers = {"User-Agent": _USER_AGENT}
         ctx = _SSL_CTX
@@ -2168,10 +2191,149 @@ def get_market_breadth() -> dict:
         if total == 0:
             return {"error": "未获取到市场数据"}
 
-        return {
+        result = {
             "全A": {"上涨": up_count, "下跌": down_count, "平盘": flat_count, "总计": total},
             "上涨比例": f"{up_count/total*100:.1f}%",
         }
+        cache.set("market_breadth", "all", result)
+        return result
 
     except Exception as e:
         return {"error": f"市场全景查询失败: {str(e)}"}
+
+
+def market_sentiment_score(symbol: str,
+                           price_data: dict = None,
+                           market_breadth_data: dict = None,
+                           limit_up_data: dict = None,
+                           dragon_tiger_data: dict = None) -> dict:
+    """
+    综合市场情绪评分，作为投资决策的参考项（不参与估值计算）。
+
+    评分维度：
+    - 市场广度（40%）：全市场上涨比例
+    - 个股涨跌（40%）：目标股票相对昨收涨跌幅
+    - 短线热度（20%）：是否涨停/龙虎榜
+
+    返回 -1 ~ +1 的综合情绪得分，及分项说明与操作建议。
+    """
+    from backend import cache
+
+    # 缓存最终得分
+    cached = cache.get("market_sentiment", symbol)
+    if cached:
+        return cached
+
+    # 1. 市场广度得分
+    breadth_score = 0.0
+    breadth_note = "数据缺失"
+    if market_breadth_data is None:
+        market_breadth_data = get_market_breadth()
+    if isinstance(market_breadth_data, dict) and "error" not in market_breadth_data:
+        up_ratio_str = market_breadth_data.get("上涨比例", "0%")
+        breadth_note = up_ratio_str
+        try:
+            up_ratio = float(up_ratio_str.replace("%", "")) / 100
+            if up_ratio >= 0.7:
+                breadth_score = 1.0
+            elif up_ratio >= 0.55:
+                breadth_score = 0.5
+            elif up_ratio <= 0.3:
+                breadth_score = -1.0
+            elif up_ratio <= 0.45:
+                breadth_score = -0.5
+            else:
+                breadth_score = 0.0
+        except (ValueError, TypeError):
+            pass
+
+    # 2. 个股涨跌幅得分
+    stock_score = 0.0
+    stock_note = "数据缺失"
+    if price_data and isinstance(price_data, dict) and "error" not in price_data:
+        try:
+            price = float(price_data.get("price", 0) or 0)
+            yesterday = float(price_data.get("yesterday_close", 0) or 0)
+            stock_note = f"当前{price} / 昨收{yesterday}"
+            if yesterday > 0:
+                chg = (price - yesterday) / yesterday
+                if chg >= 0.05:
+                    stock_score = 1.0
+                elif chg >= 0.02:
+                    stock_score = 0.5
+                elif chg <= -0.05:
+                    stock_score = -1.0
+                elif chg <= -0.02:
+                    stock_score = -0.5
+                else:
+                    stock_score = 0.0
+        except (ValueError, TypeError):
+            pass
+
+    # 3. 短线热度
+    heat_score = 0.0
+    heat_notes = []
+    if limit_up_data is None:
+        limit_up_data = get_limit_up_pool(top_n=30)
+    if isinstance(limit_up_data, dict) and "error" not in limit_up_data and "列表" in limit_up_data:
+        for r in limit_up_data.get("列表", []):
+            if r.get("代码") == symbol:
+                heat_score = 1.0
+                heat_notes.append("当日涨停")
+                break
+    if not heat_notes:
+        if dragon_tiger_data is None:
+            dragon_tiger_data = get_dragon_tiger_list()
+        if isinstance(dragon_tiger_data, dict) and "error" not in dragon_tiger_data and "列表" in dragon_tiger_data:
+            for r in dragon_tiger_data.get("列表", []):
+                if r.get("代码") == symbol:
+                    heat_score = 0.8
+                    heat_notes.append("当日龙虎榜")
+                    break
+
+    # 综合得分
+    overall = breadth_score * 0.4 + stock_score * 0.4 + heat_score * 0.2
+    overall = round(max(-1.0, min(1.0, overall)), 2)
+
+    # 情绪标签
+    if overall >= 0.8:
+        label = "极度乐观"
+    elif overall >= 0.4:
+        label = "偏热"
+    elif overall >= 0.1:
+        label = "温和偏暖"
+    elif overall <= -0.8:
+        label = "极度悲观"
+    elif overall <= -0.4:
+        label = "偏冷"
+    elif overall <= -0.1:
+        label = "温和偏冷"
+    else:
+        label = "中性"
+
+    def _suggestion(score: float) -> str:
+        if score >= 0.8:
+            return "市场情绪极度乐观，注意追高风险；若基本面支持，可持仓但避免新开重仓。"
+        elif score >= 0.4:
+            return "市场情绪偏暖，基本面买点附近可考虑分批建仓。"
+        elif score >= 0.1:
+            return "市场情绪温和偏暖，可按估值锚点正常执行。"
+        elif score <= -0.8:
+            return "市场情绪极度悲观，若基本面未恶化，可能是左侧布局窗口，但需控制仓位。"
+        elif score <= -0.4:
+            return "市场情绪偏冷，建议耐心观察，等待情绪企稳或基本面催化。"
+        elif score <= -0.1:
+            return "市场情绪温和偏冷，不追涨，等待更明确信号。"
+        else:
+            return "市场情绪中性，按基本面估值锚点执行，不因为情绪改变决策。"
+
+    result = {
+        "综合情绪得分": overall,
+        "情绪标签": label,
+        "市场广度": {"上涨比例": breadth_note, "得分": breadth_score},
+        "个股涨跌": {"说明": stock_note, "得分": stock_score},
+        "短线热度": {"备注": "、".join(heat_notes) if heat_notes else "无", "得分": heat_score},
+        "对操作建议": _suggestion(overall),
+    }
+    cache.set("market_sentiment", symbol, result)
+    return result
