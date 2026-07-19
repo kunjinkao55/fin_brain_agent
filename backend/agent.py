@@ -1638,19 +1638,39 @@ def _detect_capital_issues(symbol: str, collected: str) -> list[str]:
                             f"估值与情景 EPS 仅供参考，建议以券商/交易所实时数据为准。"
                         )
 
-        # 2. 从公告标题检测股本变动/权益分派
+        # 2. 从公告标题检测股本变动/权益分派/H股/增发/可转债等
+        capital_keywords = (
+            "10转", "10送", "权益分派", "除权", "除息", "总股本", "送转", "转增", "派息",
+            "H股", "可转债", "增发", "定增", "配股", "回购", "股权激励", "限制性股票",
+            "股票期权", "发行", "上市", "招股", "全球发售"
+        )
         anns = item.get("公告", {})
+        capital_event_found = False
         if isinstance(anns, dict):
             for _a in anns.get("列表", []):
                 if not isinstance(_a, dict):
                     continue
                 title = _a.get("标题", "")
-                if any(kw in title for kw in ("10转", "10送", "权益分派", "除权", "除息", "总股本", "送转", "转增", "派息")):
+                if any(kw in title for kw in capital_keywords):
                     warnings.append(
-                        f"[数据质量⚠️] 近期公告含股本变动/权益分派相关事项：{title[:50]}...，"
-                        f"免费数据源可能未反映除权后最新股本，定量估值需谨慎。"
+                        f"[数据质量⚠️] 近期公告含股本/融资/权益分派相关事项：{title[:50]}...，"
+                        f"免费数据源可能未反映最新股本或摊薄影响，定量估值（PE/PB/EPS/合理价值）建议以券商/交易所实时数据为准。"
                     )
+                    capital_event_found = True
                     break
+
+        # 3. 高成长公司更可能出现送转股/除权，给出额外提示
+        if not capital_event_found and len(profit_rows) >= 2:
+            try:
+                latest_rev = float(profit_rows[0].get("营业总收入", 0) or 0)
+                prev_rev = float(profit_rows[1].get("营业总收入", 0) or 0)
+                if prev_rev > 0 and latest_rev / prev_rev > 1.5:
+                    warnings.append(
+                        "[数据质量⚠️] 该公司营收增速极高（>50%），历史上可能伴随高送转/股本扩张，"
+                        "免费数据源的股本/EPS/PE/PB 可能存在除权延迟，定量估值请以券商/交易所实时数据为准。"
+                    )
+            except Exception:
+                pass
     except Exception:
         pass
     return warnings
@@ -1660,6 +1680,7 @@ def reporter_node(state: FinBrainState) -> dict:
     """代码生成评分卡（对齐表格）+ _get_llm()生成叙述"""
     from backend.tools import format_report
     raw = state.get("analysis", "")
+    collected = state.get("collected_data", "")
     # 提取估值框架信息（在剥离前）
     _val_framework = ""
     _vfm = re.search(r'\[估值框架:\s*([^\]]+)\]', raw)
