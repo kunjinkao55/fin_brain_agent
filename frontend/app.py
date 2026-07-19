@@ -273,35 +273,46 @@ st.markdown("""
   .stExpander summary { color: #e0e0e0 !important; font-weight: 500 !important; }
   .stExpander summary:hover { color: #cc3333 !important; }
 
-  /* 底部聊天栏 */
-  #chat-bottom-bar {
-      position: fixed !important;
-      bottom: 0 !important; left: 0 !important; right: 0 !important;
-      z-index: 9999 !important;
-      background: rgba(10,10,10,0.92) !important;
-      backdrop-filter: blur(24px) !important;
-      border-top: 1px solid rgba(255,255,255,0.08) !important;
-      padding: 16px 24px 20px 24px !important;
-      box-shadow: 0 -8px 32px rgba(0,0,0,0.3) !important;
-      transition: left 0.2s !important;
-  }
-  #chat-bottom-bar input {
+  /* Streamlit 原生底部输入框统一风格 */
+  [data-testid="stChatInput"] {
       background: rgba(25,25,25,0.9) !important;
       border: 1px solid rgba(255,255,255,0.08) !important;
       border-radius: 14px !important;
       height: 48px !important;
       font-size: 15px !important;
+      /* 缩小宽度，为右侧模式切换按钮留空间 */
+      width: calc(100% - 120px) !important;
   }
-  #chat-bottom-bar input:focus {
+  [data-testid="stChatInput"] input:focus {
       border-color: #cc3333 !important;
       box-shadow: 0 0 0 3px rgba(204,51,51,0.15) !important;
   }
-  #chat-bottom-bar form button {
+  /* 输入框右侧模式切换按钮，与输入框同高 */
+  [data-testid="stPopover"] > button {
       background: linear-gradient(135deg, #cc3333 0%, #a82a2a 100%) !important;
+      border: none !important;
       border-radius: 12px !important;
-      width: 48px !important; height: 48px !important;
-      font-size: 18px !important;
+      height: 48px !important;
+      width: 110px !important;
+      color: #fff !important;
+      font-weight: 600 !important;
+      font-size: 14px !important;
       box-shadow: 0 4px 15px rgba(204,51,51,0.25) !important;
+      /* 绝对定位到输入框右侧 */
+      position: fixed !important;
+      bottom: 16px !important;
+      right: 24px !important;
+      z-index: 10000 !important;
+  }
+  [data-testid="stPopover"] > button:hover {
+      background: linear-gradient(135deg, #d94444 0%, #b83333 100%) !important;
+  }
+  /* 隐藏 popover 的默认容器位置 */
+  [data-testid="stPopover"] > div:first-child {
+      position: fixed !important;
+      bottom: 0 !important;
+      right: 0 !important;
+      z-index: 10000 !important;
   }
 
   /* 信息框 */
@@ -709,7 +720,7 @@ if page == "Chat":
     # ---- 底部留白（防止内容被固定输入栏遮挡） ----
     st.markdown('<div style="height:90px"></div>', unsafe_allow_html=True)
 
-    # ---- 输入行：固定于画面最下方 ----
+    # ---- 输入行：Streamlit 原生固定底部输入框 + 右侧模式切换 ----
     current_mode = st.session_state.get("mode", "Chat")
     _MODE_META = {
         "Chat":           {"icon": "💬", "label": "闲聊"},
@@ -718,66 +729,18 @@ if page == "Chat":
     }
     cur = _MODE_META[current_mode]
 
-    def _chat_send():
-        """发送回调：设置待处理消息，输入框由 clear_on_submit 自动清空"""
-        prompt = st.session_state.get("chat_text_input", "").strip()
-        if not prompt:
-            return
-        st.session_state["_pending_chat"] = prompt
+    # st.chat_input 自动固定在页面底部；用 CSS 缩小宽度，右侧放模式切换
+    prompt = st.chat_input("Ask FinBrain...")
 
-    # JS：把底部栏从 Streamlit 嵌套容器中移到 body 级别，实现真正的 fixed 定位
-    st.markdown("""
-    <div id="chat-bottom-bar">
-    """, unsafe_allow_html=True)
-
-    # 显式模式标签 + 表单
-    st.caption(f"当前模式: **{cur['icon']} {cur['label']}**")
-    ci, cm = st.columns([7.8, 1.6])
-    with ci:
-        with st.form("chat_form", clear_on_submit=True):
-            st.text_input("Message", placeholder="Ask FinBrain... (Enter to send)",
-                          label_visibility="collapsed", key="chat_text_input")
-            if st.form_submit_button("➤"):
-                _chat_send()
+    # 模式切换：放在 chat_input 右侧，用 CSS 绝对定位
+    with st.popover(f"{cur['icon']} {cur['label']}", use_container_width=False):
+        for mode, meta in _MODE_META.items():
+            bt = "primary" if current_mode == mode else "secondary"
+            if st.button(f"{meta['icon']} {meta['label']}", use_container_width=True, type=bt, key=f"pop_mode_{mode}"):
+                st.session_state.mode = mode
                 st.rerun()
-    with cm:
-        popover_label = "切换"
-        with st.popover(popover_label, use_container_width=True):
-            for mode, meta in _MODE_META.items():
-                bt = "primary" if current_mode == mode else "secondary"
-                if st.button(f"{meta['icon']} {meta['label']}", use_container_width=True, type=bt, key=f"pop_mode_{mode}"):
-                    st.session_state.mode = mode
-                    st.rerun()
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # JS：把底部栏移到 body 级别固定定位
-    st.markdown("""
-    <script>
-    (function() {
-        var bar = document.getElementById('chat-bottom-bar');
-        if (!bar || bar.parentElement === document.body) return;
-        document.body.appendChild(bar);
-        var sidebar = document.querySelector('[data-testid="stSidebar"]');
-        if (sidebar) bar.style.left = sidebar.offsetWidth + 'px';
-        // 只在侧边栏折叠/展开时更新一次，不用高频observer
-        var observer = new MutationObserver(function(mutations) {
-            for (var m of mutations) {
-                if (m.target.getAttribute('aria-expanded') !== null || m.target.className.indexOf('collapsed') >= 0) {
-                    if (sidebar) bar.style.left = sidebar.offsetWidth + 'px';
-                }
-            }
-        });
-        var stApp = document.querySelector('.stApp');
-        if (stApp) observer.observe(stApp, {attributes:true, subtree:true, attributeFilter:['class','aria-expanded']});
-    })();
-    </script>
-    """, unsafe_allow_html=True)
-
-    # ---- 处理待发送消息 ----
-    if st.session_state.get("_pending_chat"):
-        prompt = st.session_state.pop("_pending_chat")
-
+    if prompt:
         with st.chat_message("user"): st.text(prompt)
 
         with st.chat_message("assistant"):

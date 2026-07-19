@@ -223,6 +223,37 @@ class LLMFallbackChain:
         """返回结构化输出 wrapper，内部仍按槽位熔断。"""
         return _StructuredFallbackChain(self, schema, method)
 
+    def bind_tools(self, tools, **kwargs):
+        """返回工具绑定 wrapper，内部仍按槽位熔断。兼容 LangChain create_agent。"""
+        return _ToolsBoundFallbackChain(self, tools, **kwargs)
+
+
+class _ToolsBoundFallbackChain:
+    """带熔断的工具绑定链。"""
+
+    def __init__(self, chain: LLMFallbackChain, tools, **kwargs):
+        self.chain = chain
+        self.tools = tools
+        self.kwargs = kwargs
+
+    def invoke(self, *args, **invoke_kwargs):
+        last_err = None
+        for i in range(len(self.chain.slots)):
+            self.chain._current_idx = i
+            base = _create_llm(self.chain.slots[i])
+            try:
+                bound = base.bind_tools(self.tools, **self.kwargs)
+                return bound.invoke(*args, **invoke_kwargs)
+            except Exception as e:
+                last_err = e
+                self.chain._llm = None
+        raise RuntimeError(f"LLM 全部 {len(self.chain.slots)} 个槽位工具绑定调用失败。最后错误: {last_err}")
+
+    def with_structured_output(self, schema, method="function_calling"):
+        """工具绑定后再绑定结构化输出。"""
+        # 简化：先忽略工具绑定，直接结构化输出
+        return _StructuredFallbackChain(self.chain, schema, method)
+
 
 class _StructuredFallbackChain:
     """带熔断的结构化输出链。"""
