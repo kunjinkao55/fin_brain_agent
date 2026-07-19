@@ -128,6 +128,71 @@ def _create_llm(slot: dict):
         raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
+def _normalize_llm_output(data: dict):
+    """修复 LLM 输出中常见的 schema 不匹配。"""
+    # 情景估值中可能嵌套概率加权价值，应提到顶层
+    scenarios = data.get("情景估值")
+    if isinstance(scenarios, dict):
+        for key in list(scenarios.keys()):
+            if key not in ("悲观", "基准", "乐观"):
+                data.setdefault(key, scenarios.pop(key))
+    # 估值水位数值转字符串
+    valuation = data.get("估值水位")
+    if isinstance(valuation, dict):
+        for k in ("PE", "PB", "市值", "前瞻PE"):
+            v = valuation.get(k)
+            if v is not None and not isinstance(v, str):
+                valuation[k] = str(v)
+    # 估值参考数值转字符串
+    val_ref = data.get("估值参考")
+    if isinstance(val_ref, dict):
+        for k, v in list(val_ref.items()):
+            if v is not None and not isinstance(v, str):
+                val_ref[k] = str(v)
+    # 递归修复子对象
+    for k, v in list(data.items()):
+        if isinstance(v, dict):
+            _normalize_llm_output(v)
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    _normalize_llm_output(item)
+
+
+def _parse_structured(content: str, schema):
+    """从 LLM 文本输出中提取 JSON 并校验为 Pydantic schema。失败返回 None。"""
+    if not content:
+        return None
+    text = content.strip()
+    # 1) markdown 代码块
+    m = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    if m:
+        text = m.group(1).strip()
+    # 2) 直接 JSON 解析
+    data = None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # 3) 扫描第一个 { 或 [
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(text):
+            if ch in '[{':
+                try:
+                    data, _ = decoder.raw_decode(text[i:])
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if data is None or not isinstance(data, dict):
+        return None
+    # 4) 修复常见 LLM 输出错误
+    _normalize_llm_output(data)
+    # 5) Pydantic 校验
+    try:
+        return schema.model_validate(data)
+    except Exception:
+        return None
+
+
 class LLMFallbackChain:
     """LLM 多槽位熔断链：invoke 失败时自动切换下一个槽位。"""
 
@@ -168,19 +233,29 @@ class _StructuredFallbackChain:
         self.method = method
 
     def invoke(self, *args, **kwargs):
+        methods = [self.method]
+        if "function_calling" not in methods:
+            methods.append("function_calling")
+        if "json_mode" not in methods:
+            methods.append("json_mode")
+
         last_err = None
         for i in range(len(self.chain.slots)):
             self.chain._current_idx = i
-            try:
-                base = _create_llm(self.chain.slots[i])
-                structured = base.with_structured_output(self.schema, method=self.method)
-                return structured.invoke(*args, **kwargs)
-            except Exception as e:
-                last_err = e
-                self.chain._llm = None
+            base = _create_llm(self.chain.slots[i])
+            for method in methods:
+                try:
+                    structured = base.with_structured_output(self.schema, method=method)
+                    return structured.invoke(*args, **kwargs)
+                except Exception as e:
+                    last_err = e
+                    self.chain._llm = None
         # 全部槽位结构化失败：回退到原始文本输出并手动解析
-        raw = self.chain.invoke(*args, **kwargs)
-        content = raw.content if hasattr(raw, 'content') else str(raw)
+        try:
+            raw = self.chain.invoke(*args, **kwargs)
+            content = raw.content if hasattr(raw, 'content') else str(raw)
+        except Exception as e:
+            raise RuntimeError(f"结构化输出失败，且原始文本回退也失败: {e}; 最后结构化错误: {last_err}")
         parsed = _parse_structured(content, self.schema)
         if parsed is not None:
             return parsed
@@ -864,7 +939,7 @@ def data_collector_node(state: FinBrainState) -> dict:
     _tool_traces = []  # 收集所有工具调用记录
 
     # 预取全局情绪数据，避免每个股票重复调用
-    from backend.tools import market_sentiment_score, get_limit_up_pool, get_dragon_tiger_list
+    from backend.tools import market_sentiment_score, get_market_breadth, get_limit_up_pool, get_dragon_tiger_list
     _breadth = get_market_breadth()
     _limit_up = get_limit_up_pool(top_n=30)
     _dragon = get_dragon_tiger_list()
@@ -946,6 +1021,7 @@ def data_collector_node(state: FinBrainState) -> dict:
 
 def analyst_node(state: FinBrainState) -> dict:
     """分析数据，LLM专注叙事。行业模板通过RAG注入。"""
+    global _llm_failures
     import re
     collected = state.get("collected_data", "")
     symbols = re.findall(r'"代码":\s*"(\d{6})"', collected)

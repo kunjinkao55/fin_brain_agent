@@ -48,10 +48,10 @@ class Scenario(BaseModel):
 
 class ValuationLevel(BaseModel):
     """估值水位"""
-    PE: Optional[str] = None
-    PB: Optional[str] = None
-    市值: Optional[str] = None
-    前瞻PE: Optional[str] = None
+    PE: Optional[Any] = None
+    PB: Optional[Any] = None
+    市值: Optional[Any] = None
+    前瞻PE: Optional[Any] = None
 
 
 class Conclusion(BaseModel):
