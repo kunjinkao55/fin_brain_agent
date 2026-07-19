@@ -324,6 +324,7 @@ class FinBrainState(TypedDict):
     analysis: str
     report: str
     processing_log: list  # 流水线日志: [{phase, summary, detail}]
+    sentiment_map: dict    # 代码层计算的市场情绪 {symbol: sentiment_dict}
 
 # ============================================================
 #  @tool 工具定义（7个，不变）
@@ -932,6 +933,7 @@ def data_collector_node(state: FinBrainState) -> dict:
         collected = result["messages"][-1].content
         return {
             "collected_data": collected,
+            "sentiment_map": {},
             "processing_log": [{"phase": "Data", "summary": f"LLM Collected ({len(collected)} chars)", "detail": collected[:3000]}]
         }
 
@@ -1010,8 +1012,14 @@ def data_collector_node(state: FinBrainState) -> dict:
         _tool_str = " ".join(f"{t}({s})" for t, s in _all_tools)
         collected = f'[TOOLS] {_tool_str}\n' + collected
     _tool_actions = [{"tool": t, "status": s} for t, s in _all_tools]
+    _sentiment_map = {
+        r["代码"]: r["市场情绪"]
+        for r in results
+        if isinstance(r, dict) and r.get("代码") and "市场情绪" in r and "error" not in r
+    }
     return {
         "collected_data": collected,
+        "sentiment_map": _sentiment_map,
         "processing_log": [{"phase": "Data", "summary": f"预取{len(symbols)}只股票",
                             "status": "SUCCESS" if not errors else "PARTIAL",
                             "latency_ms": round(elapsed), "symbols": symbols,
@@ -2346,17 +2354,18 @@ def reporter_node(state: FinBrainState) -> dict:
         if sym:
             _fix_and_decide(data, sym)
 
-    # === 注入市场情绪参考（从 collected_data 提取，作为报告参考项）===
-    _sentiment_map = {}
-    try:
-        _collected_clean = re.sub(r'^\[(INDUSTRY|TOOLS)\][^\n]*\n', '', collected, flags=re.MULTILINE)
-        _collected_list = json.loads(_collected_clean)
-        if isinstance(_collected_list, list):
-            for _r in _collected_list:
-                if isinstance(_r, dict) and _r.get("代码") and "市场情绪" in _r:
-                    _sentiment_map[_r["代码"]] = _r["市场情绪"]
-    except Exception:
-        pass
+    # === 注入市场情绪参考（优先从 state.sentiment_map 读取，再回退到解析 collected_data）===
+    _sentiment_map = state.get("sentiment_map", {}) or {}
+    if not _sentiment_map:
+        try:
+            _collected_clean = re.sub(r'^\[(INDUSTRY|TOOLS)\][^\n]*\n', '', collected, flags=re.MULTILINE)
+            _collected_list = json.loads(_collected_clean)
+            if isinstance(_collected_list, list):
+                for _r in _collected_list:
+                    if isinstance(_r, dict) and _r.get("代码") and "市场情绪" in _r:
+                        _sentiment_map[_r["代码"]] = _r["市场情绪"]
+        except Exception:
+            pass
     _items_to_inject = data if isinstance(data, list) else [data]
     for _it in _items_to_inject:
         if isinstance(_it, dict):
@@ -2938,6 +2947,7 @@ def ask(question: str, history: list = None) -> str:
             "analysis": "",
             "report": "",
             "processing_log": [],
+            "sentiment_map": {},
         }, config=cfg)
         return result.get("report") or result["messages"][-1].content
     else:

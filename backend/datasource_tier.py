@@ -20,6 +20,8 @@ from enum import IntEnum
 from functools import wraps
 from typing import Any, Callable, Optional
 
+from backend.data_slots import query_data_slot, CATEGORY_MAP, list_configured_slots
+
 
 class DataSourceTier(IntEnum):
     """数据源等级。数值越大能力越强，高级别包含低级别所有能力。"""
@@ -78,17 +80,16 @@ def require_tier(min_tier: DataSourceTier) -> bool:
     return tier >= min_tier
 
 
-# ---- 预定义的高级插槽函数（当前为空实现，接入数据源后替换）----
+# ---- 预定义的高级插槽函数（通过 backend.data_slots 统一调度）----
 
 @premium_slot(fallback=None)
 def get_management_profile(symbol: str) -> Optional[dict]:
     """
     [PREMIUM] 管理层画像 — 实控人背景、核心团队履历、历史信披与分红记录。
-    数据源: Wind 终端 / Choice  / 企查查API
+    数据源: Wind 终端 / Choice / 企查查API / Tushare(部分)
     返回: {"实控人": str, "实控人类型": str, "核心团队": list, "信披评级": str, "分红连续性": str}
     """
-    # TODO: 接入 Wind/Choice API
-    raise NotImplementedError("管理层数据需要配置 Wind/Choice/企查查API")
+    return query_data_slot(CATEGORY_MAP["管理层画像"], symbol)
 
 
 @premium_slot(fallback=None)
@@ -98,8 +99,7 @@ def get_institutional_holdings(symbol: str) -> Optional[dict]:
     数据源: Wind 终端 / 东方财富Choice
     返回: {"机构持仓比例": float, "近季度变动": list, "大宗交易": list}
     """
-    # TODO: 接入 Wind/Choice API
-    raise NotImplementedError("机构持仓数据需要配置 Wind/Choice API")
+    return query_data_slot(CATEGORY_MAP["机构持仓"], symbol)
 
 
 @premium_slot(fallback=None)
@@ -109,8 +109,7 @@ def get_industry_supply_chain(symbol: str) -> Optional[dict]:
     数据源: Wind 产业链 / Bloomberg SPLC
     返回: {"上游集中度": str, "下游客户": list, "替代品风险": str}
     """
-    # TODO: 接入 Wind/Bloomberg API
-    raise NotImplementedError("产业链数据需要配置 Wind/Bloomberg API")
+    return query_data_slot(CATEGORY_MAP["产业链图谱"], symbol)
 
 
 @premium_slot(fallback=None)
@@ -120,8 +119,7 @@ def get_esg_and_governance(symbol: str) -> Optional[dict]:
     数据源: MSCI ESG / Bloomberg / 商道融绿
     返回: {"ESG评级": str, "董事会独立性": str, "关联交易": list}
     """
-    # TODO: 接入 Bloomberg/MSCI API
-    raise NotImplementedError("ESG数据需要配置 Bloomberg/MSCI API")
+    return query_data_slot(CATEGORY_MAP["ESG与治理"], symbol)
 
 
 @premium_slot(fallback=None)
@@ -131,8 +129,7 @@ def get_alternative_data(symbol: str) -> Optional[dict]:
     数据源: Quandl / Thinknum / 自定义爬虫
     返回: {"数据来源": str, "信号": list, "时效": str}
     """
-    # TODO: 接入另类数据提供商
-    raise NotImplementedError("另类数据需要配置 Quandl/Thinknum/爬虫")
+    return query_data_slot(CATEGORY_MAP["另类数据"], symbol)
 
 
 # ---- 插槽注册表 ----
@@ -161,14 +158,14 @@ def _report_tier():
         DataSourceTier.PREMIUM: "+管理层画像+机构持仓+产业链图谱+深度行业数据",
         DataSourceTier.INSTITUTIONAL: "+ESG治理+另类数据+供应链+实时Level2",
     }
-    active_slots = [name for name, func in PREMIUM_SLOTS.items() if func() is not None]
-    missing_slots = [name for name, func in PREMIUM_SLOTS.items() if func() is None]
+    configured = list_configured_slots()
+    configured_names = [c["provider"] for c in configured]
 
     print(f"[FinBrain] 数据源等级: {tier.name} | 能力: {capabilities.get(tier, '?')}")
-    if active_slots:
-        print(f"[FinBrain] 已激活高级插槽: {', '.join(active_slots)}")
-    if missing_slots and tier >= DataSourceTier.PREMIUM:
-        print(f"[FinBrain] 未配置高级插槽: {', '.join(missing_slots)} (升级到对应等级后需手动配置)")
+    if configured_names:
+        print(f"[FinBrain] 已配置数据插槽: {' -> '.join(configured_names)}")
+    if tier >= DataSourceTier.PREMIUM and not configured_names:
+        print(f"[FinBrain] 当前等级为 {tier.name}，但未配置任何高级数据插槽 (DATA_SLOT_*)")
 
 
 _report_tier()

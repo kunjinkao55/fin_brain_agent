@@ -1588,8 +1588,110 @@ elif page == "Settings":
                 st.caption("未配置 (非财报数据不会交叉验证)")
 
         st.divider()
+        st.subheader("Data API Slots")
+        st.caption("Slot 1/2/3 为可选高级数据源。免费 API 失败时系统按顺序尝试高级插槽。Slot 1 不强制。")
+
+        data_providers = ["none", "tushare", "wind", "choice", "ifind", "bloomberg"]
+
+        def _read_data_slot(i: int) -> dict:
+            prefix = f"DATA_SLOT_{i}"
+            return {
+                "provider": os.getenv(f"{prefix}_PROVIDER", "").strip().lower(),
+                "api_key": os.getenv(f"{prefix}_API_KEY", "").strip(),
+                "base_url": os.getenv(f"{prefix}_BASE_URL", "").strip(),
+                "extra": os.getenv(f"{prefix}_EXTRA", "").strip(),
+            }
+
+        data_slots = []
+        for i in range(1, 4):
+            cur = _read_data_slot(i)
+            enabled = cur["provider"] != "" and cur["provider"] != "none"
+            with st.expander(f"Data Slot {i} {'✅' if enabled else '❌'}", expanded=enabled):
+                provider = st.selectbox(
+                    "Provider",
+                    data_providers,
+                    index=data_providers.index(cur["provider"]) if cur["provider"] in data_providers else 0,
+                    key=f"data_slot_{i}_provider",
+                )
+                api_key = st.text_input(
+                    "API Key",
+                    type="password",
+                    value=cur["api_key"],
+                    key=f"data_slot_{i}_apikey",
+                )
+                base_url = st.text_input(
+                    "Base URL (optional)",
+                    value=cur["base_url"],
+                    key=f"data_slot_{i}_baseurl",
+                )
+                extra = st.text_input(
+                    "Extra params (optional)",
+                    value=cur["extra"],
+                    key=f"data_slot_{i}_extra",
+                )
+                data_slots.append({
+                    "provider": provider,
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "extra": extra,
+                })
+
+        c_save, c_test = st.columns([1, 1])
+        with c_save:
+            if st.button("Save Data API Slots", type="primary", key="save_data_slots"):
+                try:
+                    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", ".env")
+                    lines = []
+                    if os.path.exists(env_path):
+                        with open(env_path, encoding="utf-8") as f:
+                            for line in f:
+                                if not line.startswith("DATA_SLOT_"):
+                                    lines.append(line.rstrip())
+                    for i, s in enumerate(data_slots, start=1):
+                        prefix = f"DATA_SLOT_{i}"
+                        if s["provider"] and s["provider"] != "none":
+                            lines.append(f"{prefix}_PROVIDER={s['provider']}")
+                            if s["api_key"]:
+                                lines.append(f"{prefix}_API_KEY={s['api_key']}")
+                            if s["base_url"]:
+                                lines.append(f"{prefix}_BASE_URL={s['base_url']}")
+                            if s["extra"]:
+                                lines.append(f"{prefix}_EXTRA={s['extra']}")
+                            os.environ[f"{prefix}_PROVIDER"] = s["provider"]
+                            os.environ[f"{prefix}_API_KEY"] = s["api_key"]
+                            os.environ[f"{prefix}_BASE_URL"] = s["base_url"]
+                            os.environ[f"{prefix}_EXTRA"] = s["extra"]
+                        else:
+                            for suffix in ["_PROVIDER", "_API_KEY", "_BASE_URL", "_EXTRA"]:
+                                key = f"{prefix}{suffix}"
+                                if key in os.environ:
+                                    del os.environ[key]
+                    with open(env_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+                    st.success("Data API Slots saved. Restart to apply.")
+                except Exception as e:
+                    st.error(f"保存失败: {e}")
+
+        with c_test:
+            if st.button("Test Tushare", key="test_tushare"):
+                try:
+                    from backend.data_slots import TushareProvider
+                    cfg = {
+                        "api_key": os.getenv("DATA_SLOT_1_API_KEY", ""),
+                        "base_url": os.getenv("DATA_SLOT_1_BASE_URL", ""),
+                        "extra": os.getenv("DATA_SLOT_1_EXTRA", ""),
+                    }
+                    p = TushareProvider(cfg)
+                    if p.connected:
+                        st.success("Tushare API Key 可连接")
+                    else:
+                        st.error("Tushare 连接失败，请检查 Slot 1 的 API Key")
+                except Exception as e:
+                    st.error(f"Tushare 测试失败: {e}")
+
+        st.divider()
         st.caption("当前数据源状态:")
-        st.code(f"Stock Price:  {cur_stock}\nFinancials:   {cur_fin}\nIndustry:     {cur_ind}\nFund Flow:    {cur_fund}\nWeb Search:   {cur_ws_provider} ({'已配置' if cur_ws_key else '未配置'})", language=None)
+        st.code(f"Stock Price:  {cur_stock}\nFinancials:   {cur_fin}\nIndustry:     {cur_ind}\nFund Flow:    {cur_fund}\nWeb Search:   {cur_ws_provider} ({'已配置' if cur_ws_key else '未配置'})\nData Slots:   {', '.join(s['provider'] for s in [_read_data_slot(i) for i in range(1,4)] if s['provider'] and s['provider'] != 'none') or '未配置'}", language=None)
 
     with tab4:
         st.subheader("Deployment Mode")

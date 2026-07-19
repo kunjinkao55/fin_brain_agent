@@ -93,6 +93,39 @@ def _record_success(tool_name: str):
         _fail_counts[tool_name] = 0
 
 
+# ---- 数据插槽回退：免费源失败时尝试高级数据源 ----
+def _is_result_ok(result: dict, required_keys: list[str] | None = None) -> bool:
+    """判断一个数据结果是否可用。"""
+    if not isinstance(result, dict):
+        return False
+    if result.get("error"):
+        return False
+    if required_keys:
+        for k in required_keys:
+            if k not in result or result[k] in (None, "", []):
+                return False
+    return True
+
+
+def _try_with_data_slots(symbol: str, primary_result: dict, category: str,
+                         required_keys: list[str] | None = None) -> dict:
+    """免费源结果失败/缺失时，尝试 DATA_SLOT_* 高级数据源回退。"""
+    if _is_result_ok(primary_result, required_keys):
+        return primary_result
+    if _DATA_MODE == "remote":
+        # remote 模式下由服务端统一处理，客户端不额外调用
+        return primary_result
+    try:
+        from backend.data_slots import query_data_slot
+        fallback = query_data_slot(category, symbol)
+        if _is_result_ok(fallback, required_keys):
+            fallback["_fallback_from"] = "data_slots"
+            return fallback
+    except Exception:
+        pass
+    return primary_result
+
+
 _REMOTE_ROUTES = {
     "fetch_stock_price":      ("api/data/stock_price",      ["symbol"]),
     "fetch_stock_history":    ("api/data/stock_history",    ["symbol", "scale", "datalen"]),
@@ -176,25 +209,30 @@ _USER_AGENT = (
 # ============================================================
 
 def fetch_stock_price(symbol: str) -> dict:
-    """查询A股实时价格（数据源可配置）"""
+    """查询A股实时价格（数据源可配置，失败时回退到 DATA_SLOT）"""
     if _should_skip("stock_price"):
-        return {"error": "stock_price 已连续失败3次，本轮跳过（熔断）"}
+        result = {"error": "stock_price 已连续失败3次，本轮跳过（熔断）"}
+        return _try_with_data_slots(symbol, result, "stock_price", ["price"])
     dup = _dedup_check(symbol, "stock_price")
-    if dup: return dup
+    if dup:
+        return dup
     if _DATA_MODE == "remote":
         result = _remote_fetch("api/data/stock_price", {"symbol": symbol})
         _dedup_record(symbol, "stock_price", result)
         return result
+
     src = _get_source("stock_price")
     if src not in ("sina", "akshare"):
-        return _source_error(src, "仅支持 sina/akshare")
+        result = _source_error(src, "仅支持 sina/akshare")
+        return _try_with_data_slots(symbol, result, "stock_price", ["price"])
 
     if symbol.startswith(("60", "68")):
         full_code = f"sh{symbol}"
     elif symbol.startswith(("00", "30")):
         full_code = f"sz{symbol}"
     else:
-        return {"error": f"无法识别的股票代码: {symbol}"}
+        result = {"error": f"无法识别的股票代码: {symbol}"}
+        return _try_with_data_slots(symbol, result, "stock_price", ["price"])
 
     url = f"https://hq.sinajs.cn/list={full_code}"
 
@@ -207,19 +245,20 @@ def fetch_stock_price(symbol: str) -> dict:
     try:
         req = urllib.request.Request(url)
         req.add_header("Referer", "https://finance.sina.com.cn")
-        req.add_header("User-Agent",
-                       _USER_AGENT)
+        req.add_header("User-Agent", _USER_AGENT)
 
         with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
             text = resp.read().decode("gbk")
 
         match = re.search(r'"([^"]+)"', text)
         if not match:
-            return {"error": f"未找到股票数据: {text[:100]}"}
+            result = {"error": f"未找到股票数据: {text[:100]}"}
+            return _try_with_data_slots(symbol, result, "stock_price", ["price"])
 
         fields = match.group(1).split(",")
         if len(fields) < 32:
-            return {"error": f"返回数据字段不足: {len(fields)}"}
+            result = {"error": f"返回数据字段不足: {len(fields)}"}
+            return _try_with_data_slots(symbol, result, "stock_price", ["price"])
 
         result = {
             "name": fields[0],
@@ -231,12 +270,17 @@ def fetch_stock_price(symbol: str) -> dict:
             "time": f"{fields[30]} {fields[31]}",
         }
         cache.set("stock_price", symbol, result)
+        _record_success("stock_price")
         return result
 
     except urllib.error.URLError as e:
-        return {"error": f"网络请求失败: {str(e)}"}
+        _record_failure("stock_price")
+        result = {"error": f"网络请求失败: {str(e)}"}
+        return _try_with_data_slots(symbol, result, "stock_price", ["price"])
     except Exception as e:
-        return {"error": f"查询异常: {str(e)}"}
+        _record_failure("stock_price")
+        result = {"error": f"查询异常: {str(e)}"}
+        return _try_with_data_slots(symbol, result, "stock_price", ["price"])
 
 
 # ============================================================
@@ -396,7 +440,8 @@ def get_financial_statements(symbol: str) -> dict:
         return result
 
     except Exception as e:
-        return {"error": f"获取财报失败: {str(e)}"}
+        result = {"error": f"获取财报失败: {str(e)}"}
+        return _try_with_data_slots(symbol, result, "financials", ["balance", "profit", "cashflow"])
 
 
 # ============================================================
@@ -457,7 +502,8 @@ def get_valuation(symbol: str) -> dict:
         return result
 
     except Exception as e:
-        return {"error": f"获取估值失败: {str(e)}"}
+        result = {"error": f"获取估值失败: {str(e)}"}
+        return _try_with_data_slots(symbol, result, "valuation", ["data"])
 
 
 # ============================================================
@@ -525,7 +571,8 @@ def get_industry_info(symbol: str) -> dict:
         return result
 
     except Exception as e:
-        return {"error": f"获取行业信息失败: {str(e)}"}
+        result = {"error": f"获取行业信息失败: {str(e)}"}
+        return _try_with_data_slots(symbol, result, "industry_info", ["industry_name"])
 
 
 # ============================================================
@@ -670,10 +717,12 @@ def get_fund_flow(symbol: str) -> dict:
                         "成交额(元)": cols[9],
                     }
 
-        return {"error": f"未在资金流排名前5页找到 {symbol}"}
+        result = {"error": f"未在资金流排名前5页找到 {symbol}"}
+        return _try_with_data_slots(symbol, result, "fund_flow", ["净额(元)"])
 
     except Exception as e:
-        return {"error": f"资金流查询失败: {str(e)}"}
+        result = {"error": f"资金流查询失败: {str(e)}"}
+        return _try_with_data_slots(symbol, result, "fund_flow", ["净额(元)"])
 
 
 # ============================================================
