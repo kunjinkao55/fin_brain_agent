@@ -962,6 +962,10 @@ def format_report(analysis: dict) -> str:
             # 复合指标（非0-10分量表），展示但不参与维度合计
             _AGGREGATE_KEYS = {"加权总分", "综合评级", "置信度"}
             for dim, info in scores.items():
+                if not isinstance(info, dict):
+                    # 评分维度数据缺失或格式错误，防御性跳过
+                    lines.append(f"  {dim:<8}  {'N/A':>4}  {'-':<6}  数据缺失")
+                    continue
                 s_val = info.get("得分")
                 reason = info.get("依据", "")
                 is_aggregate = dim in _AGGREGATE_KEYS or (isinstance(s_val, (int, float)) and s_val > 10)

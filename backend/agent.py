@@ -259,7 +259,44 @@ class _StructuredFallbackChain:
         parsed = _parse_structured(content, self.schema)
         if parsed is not None:
             return parsed
+        # 即使无法解析为 schema，也返回规范化后的 JSON 文本，避免下游 reporter_node 空转
+        _fallback = _normalize_llm_output_from_text(content)
+        if _fallback is not None:
+            return _fallback
         raise RuntimeError(f"结构化输出失败，且手动解析也失败。最后错误: {last_err}")
+
+
+def _normalize_llm_output_from_text(text: str):
+    """从 LLM 原始文本提取 JSON 并规范化，不做 schema 校验。
+    返回 dict/list 或 None。用于结构化输出失败后的最终兜底。"""
+    if not text:
+        return None
+    text = text.strip()
+    m = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    if m:
+        text = m.group(1).strip()
+    data = None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(text):
+            if ch in '[{':
+                try:
+                    data, _ = decoder.raw_decode(text[i:])
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if data is None:
+        return None
+    # 递归规范化所有 dict
+    if isinstance(data, dict):
+        _normalize_llm_output(data)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                _normalize_llm_output(item)
+    return data
 
 
 def _get_llm():
@@ -1129,15 +1166,26 @@ def analyst_node(state: FinBrainState) -> dict:
             ])
             if isinstance(response, AnalystOutput):
                 analysis_text = response.model_dump_json(ensure_ascii=False)
+            elif isinstance(response, dict):
+                # 结构化输出失败后的规范化 JSON 回退
+                analysis_text = json.dumps(response, ensure_ascii=False)
             elif hasattr(response, 'content'):
                 parsed = _parse_structured(response.content, AnalystOutput)
                 analysis_text = parsed.model_dump_json(ensure_ascii=False) if parsed else response.content
             else:
                 analysis_text = str(response)
         _llm_failures = 0  # 成功→重置
-    except Exception:
+    except Exception as e:
         _llm_failures += 1
-        raise
+        # 最终兜底：直接调用原始 LLM，不做 schema 校验，确保流程不中断
+        try:
+            raw_response = _get_llm().invoke([
+                SystemMessage(content=ANALYST_PROMPT),
+                HumanMessage(content=prompt),
+            ])
+            analysis_text = raw_response.content
+        except Exception as fallback_e:
+            raise RuntimeError(f"analyst_node 结构化输出与原始回退均失败: {fallback_e}") from e
     prev_log = state.get("processing_log", [])
     prev_log.append({"phase": "Analysis", "summary": f"投资分析生成完成",
                      "status": "SUCCESS", "output_chars": len(analysis_text),
@@ -2486,7 +2534,7 @@ def reporter_node(state: FinBrainState) -> dict:
             val_notes.append("[校验⚠️] 有定增摊薄风险但评级为BUY——请确认合理价值已按摊薄系数下调")
 
         if val_notes:
-            item["校验"] = val_notes
+            item.setdefault("校验", []).extend(val_notes)
 
     # === 注入估值框架到 items（供 format_report 渲染）===
     if _val_framework:
