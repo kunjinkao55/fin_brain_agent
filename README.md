@@ -74,7 +74,7 @@ python run.py                    # CLI 交互模式
 # 或
 streamlit run frontend/app.py    # Web UI
 ```
-注：首次使用时需在配置界面对所有默认配置项进行"apply&save",以写入本地文件中
+注：首次使用时需在配置界面对所有默认配置项进行"apply&save",以写入本地配置文件中
 
 环境配置参考 `configs/.env.example`（如项目提供）或 `configs/.env`，主要变量：
 
