@@ -817,7 +817,7 @@ ANALYST_PROMPT = """[铁律 - 输出格式]
 - 绝对估值: PE/PB/PS在历史分位
 - 相对估值: 与同行业可比公司对比
 - ⚠️ PEG计算约束：计算PEG时使用的增速必须是"可持续增速"（近2-3年复合增速或机构一致预期），严禁用单季暴增数据（如Q1+265%）计算PEG。单季暴增→PEG虚低→估值看起来便宜→误导投资决策。如无法估算可持续增速，请明确标注"可持续增速未知，PEG暂不可用"而非硬套公式。
-- 情景估值: 悲观/基准/乐观三种情景，概率加权计算期望价值。⚠️ 核心约束1：EPS必须与增速自洽——悲观EPS ≤ 基准EPS ≤ 乐观EPS。⚠️ 核心约束2：PE必须随情景动态调整——市场悲观时PE同步压缩，乐观时PE同步扩张。悲观PE=基准PE×0.6~0.8(不低于行业PE中枢)，乐观PE=基准PE×1.1~1.3(不超过基准PE×1.5)。不得三种情景用同一个PE。⚠️ 核心约束3：每个情景必须输出结构化 EPS 和 PE 数值字段，且 价格 = EPS × PE（代码将强制校验算术一致性，不符者按 EPS×PE 重算）；概率合计必须为100%。
+- 情景估值: 悲观/基准/乐观三种情景，概率加权计算期望价值。⚠️ 核心约束1：EPS必须与增速自洽——悲观EPS ≤ 基准EPS ≤ 乐观EPS。⚠️ 核心约束2：PE必须随情景动态调整——市场悲观时PE同步压缩，乐观时PE同步扩张。悲观PE=基准PE×0.6~0.8(不低于行业PE中枢)，乐观PE=基准PE×1.1~1.3(不超过基准PE×1.5)。不得三种情景用同一个PE。⚠️ 核心约束3：每个情景必须输出结构化 EPS 和 PE 数值字段，且 价格 = EPS × PE（代码将强制校验算术一致性，不符者按 EPS×PE 重算）；概率合计必须为100%。⚠️ 核心约束4：情景估值中的 EPS 必须基于工具返回的"每股收益"和最新股本推导，禁止自行假设或编造股本；若发现工具股本可能滞后（如公告含送转股、权益分派、除权等），应明确标注"股本数据可能滞后，情景 EPS 仅供参考，建议以券商/交易所实时数据为准"。
 
 第9步 催化剂与风险（什么会推动股价）:
 - 未来12个月正面催化剂: 新品/政策/行业复苏/订单/业绩
@@ -1601,6 +1601,61 @@ def _detect_timeliness_conflict(item: dict) -> str | None:
     return None
 
 
+def _detect_capital_issues(symbol: str, collected: str) -> list[str]:
+    """检测股本/除权数据是否可能滞后。返回数据质量警告列表。"""
+    warnings = []
+    try:
+        _collected_clean = re.sub(r'^\[(INDUSTRY|TOOLS)\][^\n]*\n', '', collected, flags=re.MULTILINE)
+        _collected_list = json.loads(_collected_clean)
+        if not isinstance(_collected_list, list):
+            _collected_list = [_collected_list]
+        item = next((x for x in _collected_list if isinstance(x, dict) and x.get("代码") == symbol), None)
+        if not item:
+            return warnings
+
+        # 1. 检查 EPS × 总股本 与 归母净利润 是否匹配
+        val = item.get("估值", {})
+        latest_val = None
+        if isinstance(val, dict) and isinstance(val.get("data"), list) and val["data"]:
+            latest_val = val["data"][0]
+        fin = item.get("财报", {})
+        profit_rows = fin.get("利润表", []) if isinstance(fin, dict) else []
+        if latest_val and profit_rows:
+            eps = latest_val.get("每股收益")
+            total_shares = latest_val.get("总股本")
+            net_profit = profit_rows[0].get("归母净利润") if profit_rows else None
+            if eps and total_shares and net_profit:
+                # EPS 单位：元；总股本：股；净利润：元
+                eps = float(eps)
+                total_shares = float(total_shares)
+                net_profit = float(net_profit)
+                if eps > 0 and total_shares > 0 and net_profit > 0:
+                    implied_shares = net_profit / eps
+                    if abs(implied_shares - total_shares) / total_shares > 0.05:
+                        warnings.append(
+                            f"[数据质量⚠️] 工具返回股本约{total_shares/1e8:.2f}亿股，但按 EPS({eps}元)×净利({net_profit/1e8:.2f}亿)"
+                            f"隐含股本约{implied_shares/1e8:.2f}亿股，偏差较大。可能存在送转股/除权延迟，"
+                            f"估值与情景 EPS 仅供参考，建议以券商/交易所实时数据为准。"
+                        )
+
+        # 2. 从公告标题检测股本变动/权益分派
+        anns = item.get("公告", {})
+        if isinstance(anns, dict):
+            for _a in anns.get("列表", []):
+                if not isinstance(_a, dict):
+                    continue
+                title = _a.get("标题", "")
+                if any(kw in title for kw in ("10转", "10送", "权益分派", "除权", "除息", "总股本", "送转", "转增", "派息")):
+                    warnings.append(
+                        f"[数据质量⚠️] 近期公告含股本变动/权益分派相关事项：{title[:50]}...，"
+                        f"免费数据源可能未反映除权后最新股本，定量估值需谨慎。"
+                    )
+                    break
+    except Exception:
+        pass
+    return warnings
+
+
 def reporter_node(state: FinBrainState) -> dict:
     """代码生成评分卡（对齐表格）+ _get_llm()生成叙述"""
     from backend.tools import format_report
@@ -2354,6 +2409,16 @@ def reporter_node(state: FinBrainState) -> dict:
         if sym:
             _fix_and_decide(data, sym)
 
+    # === 数据质量：股本/除权一致性检查 ===
+    _items_for_quality = data if isinstance(data, list) else [data]
+    for _it in _items_for_quality:
+        if isinstance(_it, dict):
+            _sym = _it.get("代码", "")
+            if _sym:
+                _quality_notes = _detect_capital_issues(_sym, collected)
+                if _quality_notes:
+                    _it.setdefault("校验", []).extend(_quality_notes)
+
     # === 注入市场情绪参考（优先从 state.sentiment_map 读取，再回退到解析 collected_data）===
     _sentiment_map = state.get("sentiment_map", {}) or {}
     if not _sentiment_map:
@@ -2445,7 +2510,8 @@ def reporter_node(state: FinBrainState) -> dict:
             _unavail.update(item["_unavailable_premium"])
     if _unavail:
         _tier_line += f" | 未启用: {', '.join(sorted(_unavail))} (升级数据源后可激活)"
-    header = f"数据时效: {period_note}\n{_tier_line}\n{'=' * 64}\n\n"
+    _disclaimer = "* 免费 API 数据可能存在送转股/除权延迟、PE/PB 滞后等问题，定量估值请以券商/交易所实时数据为准。"
+    header = f"数据时效: {period_note}\n{_tier_line}\n{_disclaimer}\n{'=' * 64}\n\n"
 
     # _get_llm() 只在评分卡下面加一段叙述性结论
     # ---- Critic审查反馈注入 ----
