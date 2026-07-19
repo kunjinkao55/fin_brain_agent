@@ -37,6 +37,7 @@ if __name__ == "__main__":
                 result = graph.invoke({
                     "messages": lc_messages, "user_question": user_input,
                     "collected_data": "", "analysis": "", "report": "",
+                    "processing_log": [], "sentiment_map": {},
                 })
                 reply = result.get("report") or result["messages"][-1].content
             else:

@@ -199,9 +199,16 @@ pip install pdfplumber python-docx plotly streamlit py-mini-racer
 配置 `configs/.env`：
 
 ```env
-LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-chat
-DEEPSEEK_API_KEY=<your-api-key>
+# LLM（3-slot 熔断链：slot 1 必填，slot 2/3 可选）
+LLM_SLOT_1_PROVIDER=deepseek
+LLM_SLOT_1_MODEL=deepseek-chat
+LLM_SLOT_1_API_KEY=<your-api-key>
+LLM_SLOT_1_BASE_URL=https://api.deepseek.com
+
+# 高级数据源插槽（可选：免费 API 失败时按顺序回退）
+# DATA_SLOT_1_PROVIDER=tushare
+# DATA_SLOT_1_API_KEY=<your-tushare-token>
+
 FINBRAIN_DATA_TIER=FREE
 ```
 

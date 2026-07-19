@@ -19,6 +19,8 @@ def main():
             "collected_data": "",
             "analysis": "",
             "report": "",
+            "processing_log": [],
+            "sentiment_map": {},
         },
         {"configurable": {"thread_id": "xinyisheng_test"}},
     )

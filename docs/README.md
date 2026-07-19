@@ -291,6 +291,18 @@ LLM_SLOT_1_BASE_URL=https://api.deepseek.com
 # Data tier (FREE | PREMIUM | INSTITUTIONAL)
 FINBRAIN_DATA_TIER=FREE
 
+# Data API slots (optional fallback chain when free APIs fail)
+# DATA_SLOT_1_PROVIDER=tushare
+# DATA_SLOT_1_API_KEY=<your-tushare-token>
+# DATA_SLOT_1_BASE_URL=
+# DATA_SLOT_1_EXTRA=
+
+# DATA_SLOT_2_PROVIDER=wind
+# DATA_SLOT_2_API_KEY=<your-wind-account>
+
+# DATA_SLOT_3_PROVIDER=ifind
+# DATA_SLOT_3_API_KEY=<your-ifind-token>
+
 # Optional: Redis cache
 # REDIS_URL=redis://localhost:6379
 ```

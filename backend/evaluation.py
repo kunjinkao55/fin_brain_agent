@@ -29,7 +29,7 @@ def evaluate_stock(symbol: str, runs: int = 10) -> dict:
             t0 = time.time()
             r = graph.invoke(
                 {"messages": [], "user_question": f"分析{symbol}",
-                 "collected_data": "", "analysis": "", "report": "", "processing_log": []},
+                 "collected_data": "", "analysis": "", "report": "", "processing_log": [], "sentiment_map": {}},
                 {"configurable": {"thread_id": tid}}
             )
             latencies.append((time.time() - t0) * 1000)
