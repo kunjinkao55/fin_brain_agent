@@ -159,7 +159,7 @@ python tests/test_e2e.py
 2. **Human-in-the-Loop**：LangGraph `interrupt` 在交易执行前人工审批。
 3. **Streaming + 中间状态**：`stream()` / `astream_events` 实时展示节点进度。
 4. **条件分支**：数据不足回退重取、Critic 通过跳过 Repair。
-5. **模型 failover**：主模型失败自动切换备用模型。
+5. **模型 failover**：主模型失败自动切换备用模型。目前只对deepseek作为模型供应商跑通测试。
 6. **Structured Output / Guardrails**：`with_structured_output` 或 `response_format` 替代 prompt + json.loads。
 7. **Prompt Caching / Token 优化**：接入 Anthropic prompt caching / DeepSeek 上下文缓存。
 8. **精细化单元测试**：portfolio 交易逻辑、评分边界、datasource_tier fallback 等。
