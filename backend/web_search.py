@@ -6,11 +6,18 @@ FinBrain Web Search 模块 — 财经数据交叉验证。
 
 import os
 import json
+import ssl
 import logging
 import urllib.request
 import urllib.parse
 
 logger = logging.getLogger(__name__)
+
+# SSL 上下文：兼容自签名/过期证书的 API 端点
+# Tavily/Serper 等正规服务通常证书有效，但部分代理或企业网络环境需要放宽验证
+_WEB_SSL_CTX = ssl.create_default_context()
+_WEB_SSL_CTX.check_hostname = False
+_WEB_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 # ---- 已知 key 格式 ----
 _KEY_PATTERNS = {
@@ -150,7 +157,7 @@ def _tavily_search(api_key: str, url: str, query: str, n: int) -> list[dict]:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     })
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=_WEB_SSL_CTX) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return [{"title": r.get("title", ""), "url": r.get("url", ""),
              "snippet": r.get("content", ""), "score": r.get("score", 0)}
@@ -164,7 +171,7 @@ def _serper_search(api_key: str, url: str, query: str, n: int) -> list[dict]:
         "Content-Type": "application/json",
         "X-API-KEY": api_key,
     })
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=_WEB_SSL_CTX) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return [{"title": r.get("title", ""), "url": r.get("link", ""),
              "snippet": r.get("snippet", ""), "score": 1.0}
@@ -176,7 +183,7 @@ def _generic_search(api_key: str, url: str, query: str, n: int) -> list[dict]:
     params = urllib.parse.urlencode({"q": query, "limit": n, "api_key": api_key})
     full_url = f"{url}?{params}" if "?" not in url else f"{url}&{params}"
     req = urllib.request.Request(full_url, headers={"User-Agent": "FinBrain/1.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=_WEB_SSL_CTX) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     if "results" in data:
         return [{"title": r.get("title", ""), "url": r.get("url", r.get("link", "")),

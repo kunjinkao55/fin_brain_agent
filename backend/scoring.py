@@ -88,11 +88,13 @@ def compute_investment_rating(
     elif quality_mult < 0.5 and _cf_sev <= 2:  # ROE很低但现金流至少🟠
         quality_mult = max(quality_mult, 0.5)  # 抬底：现金流尚可则不过度折价
 
-    # 成长溢价：高增速公司应享有更高PE倍数（仅对S/A级成长股给予溢价，不对低增速惩罚）
+    # 成长溢价：高增速公司应享有更高PE倍数
+    # B级(≥5)有一定溢价；A级(≥7)更高；S级(≥9)顶级
     growth_score = _safe_score(financial_scores, "成长性")
     growth_pe_mult = 1.0
-    if growth_score >= 9:   growth_pe_mult = 1.8   # S级：超高速成长(如中际旭创265%增速)
-    elif growth_score >= 7: growth_pe_mult = 1.3   # A级：强劲成长
+    if growth_score >= 9:   growth_pe_mult = 1.8   # S级：超高速成长(+100%以上)
+    elif growth_score >= 7: growth_pe_mult = 1.3   # A级：强劲成长(+50%以上)
+    elif growth_score >= 5: growth_pe_mult = 1.1   # B级：温和成长(+20%以上)
 
     fair_pe = ind_pe * quality_mult * growth_pe_mult
     fair_value = round(eps * fair_pe, 2) if eps > 0 else 0
