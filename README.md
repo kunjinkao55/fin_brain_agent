@@ -83,6 +83,38 @@ streamlit run frontend/app.py    # Web UI
 - `LLM_PROVIDER=deepseek|openai|anthropic`：模型提供商
 - `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`：对应密钥
 
+### 多槽位 LLM 熔断链（新）
+
+支持 3 个 LLM 槽位配置，连续失败时自动切换：
+
+```env
+LLM_SLOT_1_PROVIDER=deepseek
+LLM_SLOT_1_MODEL=deepseek-chat
+LLM_SLOT_1_API_KEY=sk-xxx
+LLM_SLOT_1_BASE_URL=https://api.deepseek.com
+
+LLM_SLOT_2_PROVIDER=openai
+LLM_SLOT_2_MODEL=gpt-4o
+LLM_SLOT_2_API_KEY=sk-yyy
+
+LLM_SLOT_3_PROVIDER=anthropic
+LLM_SLOT_3_MODEL=claude-sonnet-5
+LLM_SLOT_3_API_KEY=sk-zzz
+```
+
+### 高级数据 API 插槽（新）
+
+免费 API 失败时自动回退付费数据源：
+
+```env
+DATA_SLOT_1_PROVIDER=tushare
+DATA_SLOT_1_API_KEY=your_tushare_token
+DATA_SLOT_1_BASE_URL=
+
+DATA_SLOT_2_PROVIDER=wind
+DATA_SLOT_2_API_KEY=
+```
+
 ---
 
 ## 测试
@@ -93,10 +125,10 @@ python tests/test_e2e.py
 
 当前测试覆盖：
 
-- **54 项 e2e 测试**（含编译、数据工具、评分一致性、估值、Harness 守卫、配置、输出一致性、报告质量守卫）
-- 关键真实数据冒烟：600131 业绩快报双通道接入、情景估值算术校验、成长性拐点改善
+- **89 项 e2e 测试**（含编译、数据工具、评分一致性、估值、Harness 守卫、配置、输出一致性、报告质量守卫、结构化输出、LangGraph 路由、LLM Fallback、市场情绪、数据插槽）
+- 关键真实数据冒烟：600131 业绩快报双通道接入、情景估值算术校验、成长性拐点改善、300502 数据质量警告
 
-最新验证结果：54/54 全部通过 ✅
+最新验证结果：89/89 全部通过 ✅
 
 ---
 
@@ -104,23 +136,26 @@ python tests/test_e2e.py
 
 ```
 ├── backend/               # 核心后端：Agent、工具、评分、RAG、API、缓存、调度
-│   ├── agent.py           # LangGraph 工作流编排
-│   ├── tools.py           # 数据抓取与格式化工具
+│   ├── agent.py           # LangGraph 工作流编排（含结构化输出、条件分支、数据质量校验）
+│   ├── schemas.py         # Pydantic 结构化输出模型
+│   ├── tools.py           # 数据抓取与格式化工具（含市场情绪、业绩快报双通道）
 │   ├── scoring.py         # 评分与估值引擎
 │   ├── scoring_config.py  # 评分配置与权重
 │   ├── accounting_rag.py  # RAG 知识库
+│   ├── data_slots.py      # 高级数据 API 插槽（Tushare/Wind/Choice/iFinD/Bloomberg）
+│   ├── datasource_tier.py # 数据源分层（FREE/PREMIUM/INSTITUTIONAL）
 │   ├── api.py             # FastAPI 数据服务
 │   ├── client.py          # 远程模式客户端
 │   ├── cache.py           # TTL 缓存
 │   ├── scheduler.py       # 定时数据预取
 │   └── portfolio.py       # 模拟盘/多账户
 ├── frontend/              # Streamlit 前端
-│   ├── app.py
+│   ├── app.py             # Chat 输入框固定底部、模式切换右侧、红色渐变风格
 │   └── kline_chart.py
-├── configs/               # 配置与 .env
-├── tests/                 # e2e 测试
+├── configs/               # 配置与 .env（被 .gitignore 忽略）
+├── tests/                 # e2e 测试（89 项）
 ├── docs/                  # 文档（技术教程、审计报告、README）
-├── data/                  # 数据文件与 RAG 向量库
+├── data/                  # 数据文件与 RAG 向量库（建议加入 .gitignore）
 └── run.py                 # CLI 启动入口
 ```
 
@@ -158,12 +193,23 @@ python tests/test_e2e.py
 1. **回测机制完善**：加入波动率、最大回撤、夏普比率、仓位加权。
 2. **Human-in-the-Loop**：LangGraph `interrupt` 在交易执行前人工审批。
 3. **Streaming + 中间状态**：`stream()` / `astream_events` 实时展示节点进度。
-4. **条件分支**：数据不足回退重取、Critic 通过跳过 Repair。
-5. **模型 failover**：主模型失败自动切换备用模型。目前只对deepseek作为模型供应商跑通测试。
-6. **Structured Output / Guardrails**：`with_structured_output` 或 `response_format` 替代 prompt + json.loads。
+4. ~~条件分支：数据不足回退重取、Critic 通过跳过 Repair~~ ✅ Phase 0 已完成
+5. ~~模型 failover：主模型失败自动切换备用模型~~ ✅ Phase 1 已完成
+6. ~~Structured Output / Guardrails：`with_structured_output` 或 `response_format` 替代 prompt + json.loads~~ ✅ Phase 0 已完成
 7. **Prompt Caching / Token 优化**：接入 Anthropic prompt caching / DeepSeek 上下文缓存。
-8. **精细化单元测试**：portfolio 交易逻辑、评分边界、datasource_tier fallback 等。
-9. **评估体系升级**：从“信号触发检测”扩展到“策略收益评估”与投资建议准确性。
+8. ~~精细化单元测试：portfolio 交易逻辑、评分边界、datasource_tier fallback 等~~ ✅ Phase 1 已完成
+9. **评估体系升级**：从"信号触发检测"扩展到"策略收益评估"与投资建议准确性。
+
+---
+
+## 已知问题与限制
+
+| 问题 | 影响 | 建议 |
+|------|------|------|
+| 免费 API 股本/除权滞后 | 300502 等高送转股 PE/PB/EPS 失真 | 已在代码层加 `[数据质量⚠️]` 警告；根治需接入付费数据源（Tushare/Wind/Choice） |
+| 股票名称匹配不精确 | "新易盛"可能匹配到包含"新易盛"的其他股票 | 优化 `fuzzy_search()` 排序逻辑，优先精确匹配 |
+| Analyst 结构化输出偶发失败 | 完整 graph 偶尔中断 | 已加 `_normalize_llm_output_from_text()` 兜底；可在 Prompt 中进一步约束 `情景估值` 只含悲观/基准/乐观 |
+| `data/raw/` 被 git 追踪 | 包含分析历史，无 API key 但有隐私风险 | 建议加入 `.gitignore` 并从历史中移除 |
 
 ---
 

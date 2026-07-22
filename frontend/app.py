@@ -500,13 +500,13 @@ def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str,
 
     # 追加工具调用痕迹到回复（Deep Analysis 报告已有 [调用证据]，仅 Chat/Phantom 追加）
     if mode != "Deep Analysis" and tracker.records:
-        tool_names = list(set(r.get("tool_name", "?") for r in tracker.records[:20]))
+        tool_names = list(set(r.get("tool", "?") for r in tracker.records[:20]))
         if tool_names:
             reply += f"\n\n[调用证据] 工具: {', '.join(tool_names)}"
     elif mode == "Deep Analysis" and tracker.records:
         # Deep Analysis 报告内已有 [调用证据]，但如果缺失则补上
         if "[调用证据]" not in str(reply):
-            tool_names = list(set(r.get("tool_name", "?") for r in tracker.records[:20]))
+            tool_names = list(set(r.get("tool", "?") for r in tracker.records[:20]))
             if tool_names:
                 reply += f"\n\n[调用证据] 工具: {', '.join(tool_names)}"
 

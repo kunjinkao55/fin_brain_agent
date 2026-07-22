@@ -868,6 +868,11 @@ def format_report(analysis: dict) -> str:
                 lines.append(f"  [投资决策] {level_icon} {level}  {price_str}  合理价值: {fair}  安全边际: {margin}")
             if gap: lines.append(f"    估值差距: {gap}")
             lines.append(f"    安全买入价: {buy_zone}  (需{rating.get('安全边际要求','?')}安全边际)")
+            # 双锚点：情景加权为主 + PE乘数法为参考地板
+            _pe_ref = rating.get("合理价值(PE乘数法)") if isinstance(rating, dict) else None
+            _val_note = rating.get("估值方法说明", "") if isinstance(rating, dict) else ""
+            if _pe_ref is not None:
+                lines.append(f"    📊 估值方法: 主锚点=情景概率加权（机构常用多情景DCF），参考地板=PE乘数法({_pe_ref}元)")
             if weighted: lines.append(f"    加权总分: {weighted}/100  置信度: {conf}")
             lines.append(f"    * 估值基于财报数据计算，非实时定价。不构成买卖建议。")
 
@@ -968,6 +973,12 @@ def format_report(analysis: dict) -> str:
                     continue
                 s_val = info.get("得分")
                 reason = info.get("依据", "")
+                # 防御：LLM 可能输出字符串得分，转换为数值
+                try:
+                    if isinstance(s_val, str):
+                        s_val = float(s_val.replace("分", "").strip()) if s_val.strip() else None
+                except (ValueError, AttributeError):
+                    s_val = None
                 is_aggregate = dim in _AGGREGATE_KEYS or (isinstance(s_val, (int, float)) and s_val > 10)
                 if s_val is None:
                     # 数据缺失，不参与计分
@@ -1646,6 +1657,33 @@ def calculate_scores(financial_data: dict) -> dict:
     gm = _find_val("毛利率(%)")
     nm = _find_val("净利率(%)")
 
+    # 结构突变检测：当最新季度数据与年报严重背离时（V型反转），用最新季度修正
+    # 典型案例：东山精密 FY2025 ROE=6.9% → Q1 2026 年化 ROE≈20%
+    if val_data and len(val_data) >= 2:
+        _q_latest = val_data[0]  # 最新季度
+        _q_date = _q_latest.get("日期") or _q_latest.get("date") or ""
+        if not _q_date.endswith("-12-31"):  # 非年报
+            try:
+                _q_roe = float(_q_latest.get("ROE(%)", 0) or 0)
+                _q_gm = float(_q_latest.get("毛利率(%)", 0) or 0)
+                _q_nm = float(_q_latest.get("净利率(%)", 0) or 0)
+                # 季度 ROE 年化（Q1×4，中报×2，三季报×4/3）
+                # 优先按报告期字段匹配，其次按日期月份推断
+                _q_period = _q_latest.get("报告期", "")
+                _ann_factor = {"一季报": 4, "半年报": 2, "三季报": 4/3, "一季度": 4}.get(_q_period, 0)
+                if _ann_factor == 0:
+                    # 报告期字段未匹配 → 按日期推断（03-31→Q1, 06-30→H1, 09-30→Q3）
+                    _mm = _q_date[5:7] if len(_q_date) >= 7 else ""
+                    _ann_factor = {"03": 4, "06": 2, "09": 4/3}.get(_mm, 1)
+                _q_roe_ann = _q_roe * _ann_factor
+                # 突变条件：年化 ROE 比年报 ROE 高出 2 倍以上，或毛利率提升超 30%
+                if (_q_roe_ann > roe * 2 and _q_roe_ann > 10) or (_q_gm > gm * 1.3 and _q_gm > 15):
+                    roe = _q_roe_ann  # 用年化 ROE 替代年报 ROE
+                    gm = _q_gm
+                    nm = _q_nm
+            except (ValueError, TypeError):
+                pass  # 季度数据提取失败，保持年报值
+
     if roe >= 50: pe_score = 10
     elif roe >= 30: pe_score = 9
     elif roe >= 20: pe_score = 7
@@ -1692,6 +1730,11 @@ def calculate_scores(financial_data: dict) -> dict:
 
         # === 季报YoY：最新动向（势头）===
         latest = profit_data[0]
+        # 业绩快报行（_快报源=True）插入到 position 0 时会破坏季度对比
+        # 如果首行是快报源，跳过它用真实季报行
+        _is_flash_row0 = latest.get("_快报源", False)
+        if _is_flash_row0 and len(profit_data) >= 2:
+            latest = profit_data[1]
         latest_period = latest.get("报告期", "")
         # 业绩快报修正：快报覆盖期间比最新结构化季报更新鲜时，以快报为势头信号
         # （否则"Q1扣非-86%但半年度快报扣非+11%"时，评分仍停留在Q1的失真状态）
@@ -1703,7 +1746,12 @@ def calculate_scores(financial_data: dict) -> dict:
             f_net = flash.get("扣非同比(%)")
             if f_net is None:
                 f_net = flash.get("归母同比(%)")
-            if f_net is not None:
+            # 业绩预告提取容错：-100 或 None 意味着 _flash_metric 解析失败（常见于中文标点）
+            # 此时忽略 flash 势头信号，回退到季报对比路径
+            _flash_unreliable = (f_net is None or f_net == -100 or f_net == -100.0)
+            if _flash_unreliable:
+                use_flash = False  # 回退到季报势头（下方 elif 分支）
+            elif f_net is not None:
                 if f_rev is not None:
                     basis_parts.append(f"快报[{flash_period}]:营收{f_rev:+.0f}%,扣非{f_net:+.0f}%")
                 else:
