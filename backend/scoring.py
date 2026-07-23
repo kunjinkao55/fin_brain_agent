@@ -65,11 +65,11 @@ def compute_investment_rating(
 
     # --- 3. 合理价值估算 ---
     val_cfg = get_valuation()
-    # 模糊匹配：API返回"银行Ⅱ"→映射表"银行"
+    # 模糊匹配：API返回"白色家电"→映射表"家电"
     ind_pe = val_cfg["industry_pe"].get(industry, 0)
     if ind_pe == 0 and industry:
         for k in sorted(val_cfg["industry_pe"], key=len, reverse=True):
-            if industry.startswith(k) or k.startswith(industry):
+            if k in industry or industry in k:
                 ind_pe = val_cfg["industry_pe"][k]
                 break
     if ind_pe == 0:
@@ -96,13 +96,13 @@ def compute_investment_rating(
     elif quality_mult < 0.5 and _cf_sev <= 2:  # ROE很低但现金流至少🟠
         quality_mult = max(quality_mult, 0.5)  # 抬底：现金流尚可则不过度折价
 
-    # 成长溢价：高增速公司应享有更高PE倍数
-    # B级(≥5)有一定溢价；A级(≥7)更高；S级(≥9)顶级
+    # 成长溢价/折价：高增速溢价，衰退折价
     growth_score = _safe_score(financial_scores, "成长性")
     growth_pe_mult = 1.0
     if growth_score >= 9:   growth_pe_mult = 1.8   # S级：超高速成长(+100%以上)
     elif growth_score >= 7: growth_pe_mult = 1.3   # A级：强劲成长(+50%以上)
     elif growth_score >= 5: growth_pe_mult = 1.1   # B级：温和成长(+20%以上)
+    elif growth_score <= 2: growth_pe_mult = 0.7   # C级衰退：营收/利润双降(-10%以上)，PE应打折
 
     fair_pe = ind_pe * quality_mult * growth_pe_mult
     fair_value = round(eps * fair_pe, 2) if eps > 0 else 0

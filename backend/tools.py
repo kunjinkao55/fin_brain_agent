@@ -1896,6 +1896,7 @@ def calculate_scores(financial_data: dict) -> dict:
         "IT服务": 32, "IT服务Ⅱ": 32, "软件开发": 35, "互联网服务": 30,
         "电池": 25, "乘用车": 18, "元件": 30, "光伏设备": 25,
         "通信设备": 22, "白酒Ⅱ": 28, "银行Ⅱ": 7, "股份制银行": 7,
+        "白色家电": 15, "家用电器": 15,
     }
     price_info = financial_data.get("price", {})
     pe = float(price_info.get("per", 0) or 0) if isinstance(price_info, dict) else 0
@@ -1927,11 +1928,11 @@ def calculate_scores(financial_data: dict) -> dict:
             pb = stock_price2 / bps
 
     industry = financial_data.get("industry", "")
-    # 模糊匹配：API返回"银行Ⅱ"→映射表"银行"，按最长前缀匹配
+    # 模糊匹配：API返回"白色家电"→映射表"家电"，按最长命中
     ind_pe = _INDUSTRY_PE.get(industry, 0)
     if ind_pe == 0 and industry:
         for k in sorted(_INDUSTRY_PE, key=len, reverse=True):
-            if industry.startswith(k) or k.startswith(industry):
+            if k in industry or industry in k:
                 ind_pe = _INDUSTRY_PE[k]
                 break
     if ind_pe == 0:
