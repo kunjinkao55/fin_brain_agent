@@ -1,0 +1,2 @@
+industry_name: [银行Ⅱ]
+char codes: 38134 34892 8545

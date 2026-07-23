@@ -412,7 +412,7 @@ with st.sidebar:
     </div>
     ''', unsafe_allow_html=True)
     st.divider()
-    page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Knowledge", "Evaluation", "Backtest", "Settings"], label_visibility="collapsed")
+    page = st.radio("", ["Market", "Chat", "Portfolio", "Analysis", "Knowledge", "Evaluation", "Backtest", "Commentary", "Settings"], label_visibility="collapsed")
     st.divider()
     # 会话持久化（LangGraph SqliteSaver + Streamlit session_state）
     import uuid
@@ -920,18 +920,22 @@ elif page == "Knowledge":
 
     from backend.accounting_rag import (
         list_kbs, list_documents, upload_document, delete_document,
-        search_kb, get_kb_stats, seed_accounting_kb,
+        search_kb, get_kb_stats, seed_accounting_kb, seed_slang_kb,
     )
 
     # ---- 确保预置知识已播种 ----
     if "kb_seeded" not in st.session_state:
         try:
-            result = seed_accounting_kb()
+            for seed_fn, name in [(seed_accounting_kb, "会计准则"), (seed_slang_kb, "炒股黑话")]:
+                try:
+                    r = seed_fn()
+                    if r["seeded"] > 0:
+                        st.toast(f"已初始化{name}知识库 ({r['seeded']}条)", icon="✅")
+                except Exception:
+                    pass
             st.session_state.kb_seeded = True
-            if result["seeded"] > 0:
-                st.toast(f"已初始化会计准则知识库 ({result['seeded']}条)", icon="✅")
         except Exception as e:
-            st.session_state.kb_seeded = True  # 不重试
+            st.session_state.kb_seeded = True
             st.warning(f"预置知识初始化: {e}")
 
     # ---- 知识库列表 (缓存30秒，避免每次rerun查询ChromaDB) ----
@@ -1309,6 +1313,50 @@ elif page == "Backtest":
             st.caption(f"{a['name']}: 现金{a.get('cash',0):,.0f} | "
                        f"持仓{a.get('positions',0)}只 | 总资产{tv:,.0f} | "
                        f"盈亏{pnl:+,.0f}")
+
+# ========== Commentary ==========
+elif page == "Commentary":
+    st.header("Commentary Generator")
+    st.caption("将 FinBrain 投资报告转写为适合同花顺社区的股评帖。纯 LLM，所有数据来自报告。")
+
+    from backend.agent import generate_commentary
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        report_input = st.text_area(
+            "粘贴 FinBrain 报告",
+            height=350,
+            placeholder="从 Chat 或 Analysis 页面复制生成的完整报告...",
+            key="cm_report",
+            help="报告越长，股评越详细。至少需要 200 字符。",
+        )
+    with c2:
+        st.markdown("""
+        <div style="background:rgba(25,25,25,0.7);border-radius:12px;padding:16px;margin-top:28px">
+        <p style="color:#cc3333;font-weight:600;font-size:14px">写作规范</p>
+        <p style="font-size:12px;color:#999;line-height:1.8">
+        纯自然语言<br>
+        无 markdown 格式<br>
+        无 emoji 表情<br>
+        无表格<br>
+        400-800 字<br>
+        数据来自报告<br>
+        不喊口号不推荐买卖
+        </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if st.button("Generate Commentary", type="primary", key="cm_btn", use_container_width=True,
+                 disabled=not report_input or len(report_input.strip()) < 200):
+        with st.spinner("AI 正在撰写股评..."):
+            try:
+                commentary = generate_commentary(report_input.strip())
+                st.divider()
+                st.subheader("Generated Commentary")
+                st.text_area("股评内容（可直接复制到同花顺社区）", value=commentary, height=280, key="cm_output")
+                st.caption(f"字数: {len(commentary)} | 可复制后直接粘贴到同花顺社区发帖")
+            except Exception as e:
+                st.error(f"生成失败: {e}")
 
 # ========== Settings ==========
 elif page == "Settings":

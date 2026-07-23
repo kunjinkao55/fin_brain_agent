@@ -97,7 +97,7 @@ def get_weights(company_type: str = "默认") -> dict:
 
 def get_safety_margin(company_type: str = "价值型") -> float:
     cfg = _load_config().get("安全边际", {})
-    base = cfg.get("基准", {}).get(company_type, 0.30)
+    base = cfg.get("基准", {}).get(company_type, 0.25)
     return base
 
 

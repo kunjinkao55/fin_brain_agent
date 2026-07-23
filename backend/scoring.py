@@ -65,7 +65,15 @@ def compute_investment_rating(
 
     # --- 3. 合理价值估算 ---
     val_cfg = get_valuation()
-    ind_pe = val_cfg["industry_pe"].get(industry, val_cfg["default_ind_pe"])
+    # 模糊匹配：API返回"银行Ⅱ"→映射表"银行"
+    ind_pe = val_cfg["industry_pe"].get(industry, 0)
+    if ind_pe == 0 and industry:
+        for k in sorted(val_cfg["industry_pe"], key=len, reverse=True):
+            if industry.startswith(k) or k.startswith(industry):
+                ind_pe = val_cfg["industry_pe"][k]
+                break
+    if ind_pe == 0:
+        ind_pe = val_cfg["default_ind_pe"]
     # 财务质量调整PE基准：ROE和负债率决定了企业应享有怎样的估值
     quality_mult = 1.0
     if roe > 35: quality_mult = 1.6       # 顶级盈利能力（茅台级）
@@ -103,7 +111,7 @@ def compute_investment_rating(
     base_margin = get_safety_margin(company_type)
     quality_adj = _quality_adjustment(roe, debt)
     safety_margin = base_margin + quality_adj
-    safety_margin = max(0.15, min(0.55, safety_margin))  # 限制在15%-55%
+    safety_margin = max(0.10, min(0.50, safety_margin))  # 限制在10%-50%
 
     # --- 5. 买入区间 ---
     buy_zone_upper = round(fair_value * (1 - safety_margin), 2) if fair_value > 0 else 0
