@@ -1341,7 +1341,12 @@ def analyst_node(state: FinBrainState) -> dict:
             elif hasattr(response, 'content'):
                 _analysis_fallback_used = True
                 parsed = _parse_structured(response.content, AnalystOutput)
-                analysis_text = parsed.model_dump_json(ensure_ascii=False) if parsed else response.content
+                if parsed:
+                    analysis_text = parsed.model_dump_json(ensure_ascii=False)
+                else:
+                    # 结构化解析失败 → 尝试 ast.literal_eval 兜底（LLM常输出Python单引号格式）
+                    _norm = _normalize_llm_output_from_text(response.content)
+                    analysis_text = json.dumps(_norm, ensure_ascii=False) if _norm else response.content
             else:
                 _analysis_fallback_used = True
                 analysis_text = json.dumps(response, ensure_ascii=False) if isinstance(response, dict) else str(response)
@@ -1614,7 +1619,11 @@ def repair_node(state: FinBrainState) -> dict:
                 repaired = repair_resp.model_dump_json(ensure_ascii=False)
             elif hasattr(repair_resp, 'content'):
                 parsed = _parse_structured(repair_resp.content, AnalystOutput)
-                repaired = parsed.model_dump_json(ensure_ascii=False) if parsed else repair_resp.content
+                if parsed:
+                    repaired = parsed.model_dump_json(ensure_ascii=False)
+                else:
+                    _norm = _normalize_llm_output_from_text(repair_resp.content)
+                    repaired = json.dumps(_norm, ensure_ascii=False) if _norm else repair_resp.content
             else:
                 repaired = json.dumps(repair_resp, ensure_ascii=False) if isinstance(repair_resp, dict) else str(repair_resp)
     except Exception:
@@ -2007,10 +2016,11 @@ def reporter_node(state: FinBrainState) -> dict:
                     continue
 
     # 数据质量检查：解析成功但内容过于稀疏（如空dict/list），视为解析失败
+    # 只检查代码——评分/亮点/风险为空时下游 _fix_and_decide 会用代码重算覆盖
     if data is not None:
         _items_check = data if isinstance(data, list) else [data]
         _meaningful = sum(1 for _it in _items_check
-                         if isinstance(_it, dict) and _it.get("代码") and _it.get("评分"))
+                         if isinstance(_it, dict) and _it.get("代码"))
         if len(_items_check) == 0 or _meaningful == 0:
             import logging as _logging
             _logging.getLogger("FinBrain.Reporter").warning(
@@ -2636,10 +2646,16 @@ def reporter_node(state: FinBrainState) -> dict:
             # 机构常用多情景加权估值，而非固定行业PE×质量乘数
             _scenarios = item.get("情景估值", {}) if isinstance(item, dict) else {}
             _sc_weighted = _scenarios.get("概率加权价值") if isinstance(_scenarios, dict) else None
+            # 容错：概率加权价值可能是字符串（如"137.20"或"137.20元"）
+            if isinstance(_sc_weighted, str):
+                try:
+                    _sc_weighted = float(_sc_weighted.replace("元", "").strip())
+                except (ValueError, TypeError):
+                    _sc_weighted = None
             if _sc_weighted is not None and isinstance(_sc_weighted, (int, float)) and _sc_weighted > 0:
                 _r = item.get("投资评级", {}) if isinstance(item, dict) else {}
                 _pe_fv = float(_r.get("合理价值", 0)) if isinstance(_r, dict) else 0
-                if _sc_weighted > _pe_fv * 1.5:  # 情景价值显著高于PE乘数法→双锚点
+                if _sc_weighted > _pe_fv:  # 情景价值只要高于PE乘数法就触发双锚点
                     _r["合理价值(PE乘数法)"] = _r.get("合理价值")
                     _r["合理价值"] = round(_sc_weighted, 2)
                     _r["估值方法说明"] = (
@@ -2653,11 +2669,13 @@ def reporter_node(state: FinBrainState) -> dict:
                         f"参考锚点(PE乘数法): {_pe_fv:.2f}元（保守地板价）。"
                         f"两套锚点差异反映了历史财务vs未来预期的张力——详见[框架分歧]。"
                     )
-                    # 用新合理价值重算安全边际和买入区间
+                    # 用新合理价值重算估值差距、实际安全边际、买入区间
                     try:
                         sp = float(_r.get("当前价格", stock_price)) if isinstance(_r, dict) and _r.get("当前价格") else stock_price
                         if sp > 0:
                             _r["估值差距"] = f"{(_sc_weighted - sp) / sp * 100:+.1f}%"
+                            # 实际安全边际 = (合理价值 - 当前价) / 合理价值（反映当前价距离合理价的缓冲空间）
+                            _r["实际安全边际"] = f"{(_sc_weighted - sp) / _sc_weighted * 100:.1f}%"
                             margin_str = str(_r.get("安全边际要求", "25%"))
                             margin_pct = float(margin_str.replace("%", "")) / 100 if "%" in margin_str else 0.25
                             _r["买入区间"] = f"≤{round(_sc_weighted * (1 - margin_pct), 2):.2f}元"
@@ -3505,6 +3523,73 @@ def ask(question: str, history: list = None) -> str:
 # ============================================================
 #  终端交互
 # ============================================================
+
+# ============================================================
+#  评论家 Agent — 报告转写为同花顺社区股评
+# ============================================================
+
+COMMENTATOR_PROMPT = """你是同花顺社区的资深股评作者，混迹股市十几年，说话自带老股民的腔调。你的任务是把 FinBrain 投资报告转写为一篇适合在同花顺社区发布的股评帖。
+
+写作规范：
+1. 所有数据必须来自输入报告，不得编造任何数字或事实
+2. 纯自然语言，禁止使用 markdown 格式（无 **、无 #、无 - 列表、无表格）
+3. 禁止使用 emoji 表情符号
+4. 行文流畅，像一位有经验的老股民在茶馆聊天，不是机器人在播报
+5. 结构建议：先点出股票名称和核心判断，再说关键财务数据支撑，接着讲亮点和风险，最后给出操作参考
+6. 篇幅控制在 400-800 字，重点突出，不罗列所有数据
+7. 语气客观理性，不喊口号（如"必涨""爆赚"），不推荐具体买卖
+8. 文末加一句免责："以上分析基于公开财务数据，不构成投资建议，股市有风险，投资需谨慎。"
+
+风格要求（重要）：
+- 适度使用老股民黑话增加亲切感：如"上车""下车""吃肉""吃面""站岗""割肉""躺平""抄底""追高""磨底""起飞""跳水"等
+- 把机构研报的抽象描述翻译成股民能听懂的话：ROE高→"赚钱能力强"；毛利率高→"利润空间厚"；现金流好→"真金白银进账"；估值高→"贵得离谱"；估值低→"白菜价"
+- 可以自嘲式幽默，如"现在追进去大概率要站岗""虽然不便宜但也不至于山顶吹风"
+- 黑话要自然融入，不能生硬堆砌，每段最多2-3个黑话词
+
+禁止输出的内容：
+- markdown 格式符号（**、#、-、| 等）
+- emoji 或特殊符号
+- 表格或多列对齐文本
+- "根据报告""FinBrain 显示"等元描述
+- 具体的买入价/止损价数字（那是个人操作，社区股评不应给精确价位）"""
+
+
+def generate_commentary(report_text: str) -> str:
+    """将 FinBrain 报告转写为同花顺社区股评。纯 LLM，不调工具。"""
+    if not report_text or len(report_text) < 200:
+        return "报告内容过短，无法生成股评。请先生成完整的 FinBrain 分析报告。"
+
+    # 截取报告核心部分（去掉头部元数据和尾部审计）
+    import re
+    core = report_text
+    m_start = re.search(r'FinBrain 投资研究', core)
+    m_end = re.search(r'\[校验审计\]|\[调用证据\]', core)
+    if m_start:
+        core = core[m_start.start():]
+    if m_end:
+        core = core[:m_end.start()]
+    core = core[:5000]
+
+    # 从 RAG 检索相关黑话，融入股评风格
+    slang_hints = ""
+    try:
+        from backend.accounting_rag import search_kb
+        keywords = " ".join(re.findall(r'[一-鿿]{2,4}', core[:1000])[:20])
+        slang_results = search_kb(keywords, "slang", top_k=4)
+        if slang_results:
+            slang_texts = [r["content"][:200] for r in slang_results if r.get("content")]
+            if slang_texts:
+                slang_hints = "\n可参考的炒股黑话（自然融入，不要生硬堆砌）：\n" + "\n".join(slang_texts)
+    except Exception:
+        pass
+
+    llm = _get_llm()
+    response = llm.invoke([
+        SystemMessage(content=COMMENTATOR_PROMPT),
+        HumanMessage(content=f"请将以下投资报告转写为同花顺社区股评：\n\n{core}{slang_hints}"),
+    ])
+    return response.content
+
 
 if __name__ == "__main__":
     import sys
