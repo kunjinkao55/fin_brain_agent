@@ -1106,85 +1106,209 @@ elif page == "Evaluation":
 
 # ========== Backtest ==========
 elif page == "Backtest":
-    st.header("Backtest Engine")
-    st.caption("用历史K线回测分析报告的交易建议。纯代码，不调LLM。")
+    st.header("Backtest Engine v2")
+    st.caption("用历史K线回测分析报告的交易建议。支持风险指标、基准对比、框架评估。")
 
-    from backend.backtest import extract_signal, run_backtest, batch_backtest
+    from backend.backtest import extract_signal, run_backtest, batch_backtest, evaluate_framework
     from backend.portfolio import list_accounts as _list_accts, delete_account as _del_acct, Portfolio
 
-    tab1, tab2 = st.tabs(["单报告回测", "批量回测 + 账户管理"])
+    tab1, tab2, tab3 = st.tabs(["单报告回测", "批量回测", "框架评估"])
 
     with tab1:
         st.subheader("粘贴报告文本")
-        report_text = st.text_area("报告内容", height=300, placeholder="粘贴 FinBrain 生成的完整报告...",
+        report_text = st.text_area("报告内容", height=280, placeholder="粘贴 FinBrain 生成的完整报告...",
                                    key="bt_report")
-        lookback = st.slider("回看天数", 30, 365, 180, key="bt_lookback")
+        c1, c2 = st.columns(2)
+        with c1: lookback = st.slider("回看天数", 30, 365, 180, key="bt_lookback")
+        with c2: use_bench = st.checkbox("沪深300基准对比", value=True, key="bt_bench")
         if st.button("Run Backtest", type="primary", key="bt_run") and report_text.strip():
             signal = extract_signal(report_text)
             if signal:
-                st.json(signal)
-                result = run_backtest(signal, lookback)
+                with st.expander("信号提取", expanded=False):
+                    st.json(signal)
+                result = run_backtest(signal, lookback, use_benchmark=use_bench)
                 if "error" in result:
                     st.error(result["error"])
                 else:
-                    c1, c2, c3 = st.columns(3)
-                    with c1: st.metric("触发", "✅" if result["triggered"] else "❌")
-                    with c2: st.metric("收益率", f"{result['return_pct']:+.1f}%")
+                    # 交易摘要
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1: st.metric("触发", "YES" if result["triggered"] else "NO")
+                    with c2: st.metric("收益率(扣费)", f"{result['return_pct']:+.1f}%")
                     with c3: st.metric("持仓天数", result["holding_days"])
-                    st.caption(f"入场: {result['entry_date']} @ {result['entry_price']} | "
-                               f"出场: {result['exit_date']} @ {result['exit_price']} | "
+                    with c4: st.metric("交易成本", f"{result.get('cost_pct', 0):.2f}%")
+                    st.caption(f"入场: {result['entry_date']} @ {result['entry_price']:.2f} | "
+                               f"出场: {result['exit_date']} @ {result['exit_price']:.2f} | "
                                f"原因: {result['exit_reason']}")
+
+                    # 风险指标
+                    metrics = result.get("metrics", {})
+                    if metrics:
+                        st.divider()
+                        st.subheader("风险指标")
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        with mc1: st.metric("年化收益", metrics.get("年化收益", "-"))
+                        with mc2: st.metric("夏普比率", metrics.get("夏普比率", "-"))
+                        with mc3: st.metric("最大回撤", metrics.get("最大回撤", "-"))
+                        with mc4: st.metric("Calmar", metrics.get("Calmar比率", "-"))
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        with mc1: st.metric("年化波动", metrics.get("年化波动率", "-"))
+                        with mc2: st.metric("日胜率", metrics.get("日胜率", "-"))
+                        with mc3: st.metric("盈亏比", metrics.get("盈亏比", "-"))
+                        with mc4: st.metric("累计收益", metrics.get("累计收益", "-"))
+                        if "超额收益(Alpha)" in metrics:
+                            st.divider()
+                            st.subheader("vs 沪深300")
+                            mc1, mc2 = st.columns(2)
+                            with mc1: st.metric("Alpha", metrics.get("超额收益(Alpha)", "-"))
+                            with mc2: st.metric("信息比率", metrics.get("信息比率", "-"))
+
+                    # 权益曲线
+                    equity = result.get("equity_curve", [])
+                    if len(equity) > 1:
+                        import plotly.graph_objects as go
+                        days = [e[0] for e in equity]
+                        vals = [e[1] for e in equity]
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=days, y=vals, mode='lines',
+                            line=dict(color='#cc3333', width=2),
+                            fill='tozeroy', fillcolor='rgba(204,51,51,0.1)',
+                            name='权益曲线'))
+                        fig.add_hline(y=1.0, line_dash="dash", line_color="gray", annotation_text="盈亏平衡")
+                        fig.update_layout(
+                            title="权益曲线", height=300, margin=dict(l=10,r=10,t=40,b=10),
+                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="#b0b0b0"), xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+                            yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", tickformat=".1%"),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
             else:
                 st.warning("未能从报告中提取交易信号（建仓价/止损/目标价）")
 
     with tab2:
         st.subheader("批量回测")
-        reports_input = st.text_area("多份报告（每份用---分隔）", height=200,
+        reports_input = st.text_area("多份报告（每份用---分隔）", height=180,
                                      placeholder="报告1\n---\n报告2\n---\n报告3",
                                      key="bt_batch")
+        c1, c2 = st.columns(2)
+        with c1: bt_lookback2 = st.slider("回看天数", 30, 365, 180, key="bt_lookback2")
+        with c2: bt_bench2 = st.checkbox("沪深300基准", value=False, key="bt_bench2")
         if st.button("Batch Backtest", type="primary", key="bt_batch_run") and reports_input.strip():
             reports = [r.strip() for r in reports_input.split("---") if r.strip()]
-            summary = batch_backtest(reports, lookback)
+            summary = batch_backtest(reports, bt_lookback2)
             if "error" in summary:
                 st.warning(summary["error"])
             else:
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 with c1: st.metric("总信号", summary["总信号数"])
-                with c2: st.metric("触发率", f"{summary['触发数']}/{summary['总信号数']}")
+                with c2: st.metric("触发率", summary["触发率"])
                 with c3: st.metric("胜率", f"{summary['胜率']}%")
                 with c4: st.metric("平均收益", f"{summary['平均收益']:+.1f}%")
+                with c5: st.metric("盈亏比", summary["盈亏比"])
                 c1, c2, c3 = st.columns(3)
                 with c1: st.metric("最大收益", f"{summary['最大收益']:+.1f}%")
                 with c2: st.metric("最大亏损", f"{summary['最大亏损']:+.1f}%")
-                with c3: st.metric("盈亏比", f"{summary['胜数']}:{summary['败数']}")
-                with st.expander("明细", expanded=False):
-                    st.dataframe(summary["明细"], use_container_width=True)
+                with c3: st.metric("胜/败", f"{summary['胜数']}/{summary['败数']}")
 
-        st.divider()
-        st.subheader("模拟账户管理")
-        accounts = _list_accts()
-        acc_names = [a["name"] for a in accounts]
-        c1, c2, c3 = st.columns([2, 1, 1])
-        with c1:
-            new_acc = st.text_input("新建账户", placeholder="value_strategy", key="bt_new_acc")
-        with c2:
-            if st.button("创建", key="bt_create") and new_acc.strip():
-                Portfolio(new_acc.strip())
-                st.rerun()
-        with c3:
-            del_acc = st.selectbox("删除", [""] + acc_names, key="bt_del_acc")
-            if st.button("确认删除", key="bt_del_btn") and del_acc:
-                _del_acct(del_acc)
-                st.rerun()
+                # 按评级统计
+                by_rating = summary.get("按评级", {})
+                if by_rating:
+                    st.divider()
+                    st.subheader("按评级分组")
+                    rating_data = []
+                    for rating, data in by_rating.items():
+                        rating_data.append({
+                            "评级": rating,
+                            "信号数": data["信号数"],
+                            "触发数": data["触发数"],
+                            "胜率": data["胜率"],
+                            "平均收益": data["平均收益"],
+                        })
+                    st.dataframe(rating_data, use_container_width=True, hide_index=True)
 
-        if accounts:
-            st.caption(f"共 {len(accounts)} 个账户")
-            for a in accounts:
-                tv = a.get("total_value", a.get("cash", 0))
-                pnl = tv - a.get("initial_cash", tv)
-                st.caption(f"{a['name']}: 现金{a.get('cash',0):,.0f} | "
-                           f"持仓{a.get('positions',0)}只 | 总资产{tv:,.0f} | "
-                           f"盈亏{pnl:+,.0f}")
+                with st.expander("交易明细", expanded=False):
+                    detail_data = []
+                    for r in summary["明细"]:
+                        m = r.get("metrics", {})
+                        detail_data.append({
+                            "代码": r.get("symbol", "?"),
+                            "评级": r.get("rating", "?"),
+                            "触发": "Y" if r.get("triggered") else "N",
+                            "入场价": r.get("entry_price", 0),
+                            "收益率": f"{r.get('return_pct', 0):+.1f}%",
+                            "持仓天": r.get("holding_days", 0),
+                            "出场原因": r.get("exit_reason", "-"),
+                            "夏普": m.get("夏普比率", "-"),
+                            "回撤": m.get("最大回撤", "-"),
+                        })
+                    st.dataframe(detail_data, use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.subheader("框架信度评估")
+        st.caption("回答核心问题：FinBrain 的评分/评级是否具有预测能力？高评分股票真跑赢了吗？")
+        eval_input = st.text_area(
+            "粘贴多份报告 + 生成时股价（格式：报告文本 ||| 股价）",
+            height=200,
+            placeholder="报告1文本... ||| 100.50\n---\n报告2文本... ||| 50.00\n---\n报告3文本... ||| 30.00",
+            key="bt_eval"
+        )
+        if st.button("Evaluate Framework", type="primary", key="bt_eval_btn") and eval_input.strip():
+            pairs = []
+            for chunk in eval_input.split("---"):
+                chunk = chunk.strip()
+                if "|||" in chunk:
+                    parts = chunk.split("|||", 1)
+                    try:
+                        pairs.append((parts[0].strip(), float(parts[1].strip())))
+                    except ValueError:
+                        pairs.append((chunk, 0))
+                elif chunk:
+                    pairs.append((chunk, 0))
+            if pairs:
+                ev_result = evaluate_framework(pairs)
+                if "error" in ev_result:
+                    st.warning(ev_result["error"])
+                else:
+                    st.metric("信号总数", ev_result["信号总数"])
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.subheader("按评分分组")
+                        st.dataframe(
+                            [{"分组": k, **v} for k, v in ev_result["按评分"].items()],
+                            use_container_width=True, hide_index=True)
+                        st.metric("评分区分度", ev_result["评分区分度"],
+                                  delta="✅ 有效" if "有效" in str(ev_result["评分区分度"]) and "无效" not in str(ev_result["评分区分度"]) else "⚠️")
+                    with c2:
+                        st.subheader("按评级分组")
+                        st.dataframe(
+                            [{"分组": k, **v} for k, v in ev_result["按评级"].items()],
+                            use_container_width=True, hide_index=True)
+                        st.metric("评级区分度", ev_result["评级区分度"],
+                                  delta="✅ 有效" if "有效" in str(ev_result["评级区分度"]) and "无效" not in str(ev_result["评级区分度"]) else "⚠️")
+
+    st.divider()
+    st.subheader("模拟账户管理")
+    accounts = _list_accts()
+    acc_names = [a["name"] for a in accounts]
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        new_acc = st.text_input("新建账户", placeholder="value_strategy", key="bt_new_acc")
+    with c2:
+        if st.button("创建", key="bt_create") and new_acc.strip():
+            Portfolio(new_acc.strip())
+            st.rerun()
+    with c3:
+        del_acc = st.selectbox("删除", [""] + acc_names, key="bt_del_acc")
+        if st.button("确认删除", key="bt_del_btn") and del_acc:
+            _del_acct(del_acc)
+            st.rerun()
+    if accounts:
+        st.caption(f"共 {len(accounts)} 个账户")
+        for a in accounts:
+            tv = a.get("total_value", a.get("cash", 0))
+            pnl = tv - a.get("initial_cash", tv)
+            st.caption(f"{a['name']}: 现金{a.get('cash',0):,.0f} | "
+                       f"持仓{a.get('positions',0)}只 | 总资产{tv:,.0f} | "
+                       f"盈亏{pnl:+,.0f}")
 
 # ========== Settings ==========
 elif page == "Settings":
