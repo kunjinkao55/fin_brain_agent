@@ -114,13 +114,13 @@ def _create_llm(slot: dict):
     base_url = slot.get("base_url", "")
     if provider in ("deepseek", "openai"):
         from langchain_openai import ChatOpenAI
-        kwargs = {"model": model, "temperature": 0, "max_tokens": 4096, "streaming": True}
+        kwargs = {"model": model, "temperature": 0, "max_tokens": 8192, "streaming": True}
         if api_key: kwargs["api_key"] = api_key
         if base_url: kwargs["base_url"] = base_url
         return ChatOpenAI(**kwargs)
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        kwargs = {"model": model, "temperature": 0, "max_tokens": 4096, "streaming": True}
+        kwargs = {"model": model, "temperature": 0, "max_tokens": 8192, "streaming": True}
         if api_key: kwargs["api_key"] = api_key
         if base_url: kwargs["base_url"] = base_url
         return ChatAnthropic(**kwargs)
