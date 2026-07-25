@@ -37,6 +37,7 @@ def compute_investment_rating(
     roe: float,              # ROE(%)
     debt: float,             # 资产负债率(%)
     bps: float = 0.0,        # 每股净资产（用于买入价PB地板）
+    bps_adjusted: float = 0.0,  # 股本变动事件后调整口径BPS（FIX-02，优先于bps）
 ) -> dict:
     """
     根据公司类型动态赋权，计算综合评分 + 合理价值 + 安全边际 + 投资评级。
@@ -105,7 +106,10 @@ def compute_investment_rating(
     elif growth_score <= 2: growth_pe_mult = 0.7   # C级衰退：营收/利润双降(-10%以上)，PE应打折
 
     fair_pe = ind_pe * quality_mult * growth_pe_mult
-    fair_value = round(eps * fair_pe, 2) if eps > 0 else 0
+    # FIX-02（托伦斯A10）：合理价值必须用"显示口径"的EPS计算，
+    # 保证 估值明细.公式 中显示的因子乘积可复算出同一结果（显示=复算）。
+    _eps_display = round(eps, 2) if eps else 0
+    fair_value = round(_eps_display * fair_pe, 2) if _eps_display > 0 else 0
 
     # --- 4. 安全边际 ---
     base_margin = get_safety_margin(company_type)
@@ -118,10 +122,12 @@ def compute_investment_rating(
     _pb_floor_note = ""
     # PB地板：质量乘数×安全边际双重折让可能把买入价压到远低于每股净资产（如0.57倍PB），
     # 实操上几乎不可能触发。当前PB≥1时（破净股如银行豁免），买入价不得低于0.8倍每股净资产。
-    if bps > 0 and buy_zone_upper > 0 and stock_price > 0 and stock_price / bps >= 1:
-        _pb_floor = round(bps * 0.8, 2)
+    # FIX-02：股本变动后（IPO/定增）使用调整口径BPS（含募集净额）。
+    _bps_eff = bps_adjusted if bps_adjusted > 0 else bps
+    if _bps_eff > 0 and buy_zone_upper > 0 and stock_price > 0 and stock_price / _bps_eff >= 1:
+        _pb_floor = round(_bps_eff * 0.8, 2)
         if buy_zone_upper < _pb_floor:
-            _pb_floor_note = f"买入价触及PB地板(0.8×每股净资产{bps:.2f}元)，{buy_zone_upper}→{_pb_floor}元"
+            _pb_floor_note = f"买入价触及PB地板(0.8×每股净资产{_bps_eff:.2f}元)，{buy_zone_upper}→{_pb_floor}元"
             buy_zone_upper = _pb_floor
 
     # --- 6. 投资评级 ---
@@ -152,8 +158,7 @@ def compute_investment_rating(
     elif weighted >= 55: confidence = "B (中)"
     else: confidence = "C (低)"
 
-    # 估值计算链（透明化）+ 前瞻敏感性
-    _eps_display = round(eps, 2) if eps else 0
+    # 估值计算链（透明化）+ 前瞻敏感性（_eps_display 已在合理价值处统一定义）
     valuation_chain = {
         "EPS(TTM)": _eps_display,
         "行业PE中枢": ind_pe,

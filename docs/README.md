@@ -209,7 +209,7 @@ Key outputs:
 
 **Example: 大唐发电 (601991) — Thermal Power**
 
-Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → auto-adjusted fair value, scenario prices, and forward PE by coefficient 0.874 → all dependent fields recalculated. Audit passed all 8 checks.
+Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → dilution coefficient computed from event parameters (corporate action classification, no hardcoded factor) → fair value, scenario prices, and forward PE auto-adjusted, all dependent fields recalculated. Audit passed all 12 checks.
 
 ---
 
@@ -249,7 +249,7 @@ Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → auto-ad
 | Frontend | Streamlit + Plotly |
 | Cache | Local memory (TTL) / Redis (configurable) |
 | Data Tier | FREE / PREMIUM / INSTITUTIONAL (pluggable premium slots) |
-| Testing | 68 e2e tests (compilation, data tools, scoring consistency, output compliance, report quality guards, structured output, graph routing, LLM fallback) |
+| Testing | 98 tests — 72 e2e (compilation, data tools, scoring consistency, output compliance, report quality guards, structured output, graph routing, LLM fallback) + 26 golden regression |
 
 ---
 
@@ -352,7 +352,7 @@ finbrain/
 │   ├── app.py                  # Streamlit UI (7 pages)
 │   └── kline_chart.py          # K-line chart module
 ├── tests/
-│   └── test_e2e.py             # 54 e2e tests
+│   └── test_e2e.py             # 72 e2e tests
 ├── docs/                       # Documentation
 └── data/
     ├── uploads/                # User-uploaded documents

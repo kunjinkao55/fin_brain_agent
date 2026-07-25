@@ -14,6 +14,10 @@ import logging
 import pandas as pd
 import akshare as ak
 
+# FIX-01/02 股本SSOT：TTM EPS 统一入口；FIX-06 涨跌停规则引擎
+from backend.share_registry import compute_ttm_eps
+from backend.trading_rules import is_limit_up as _rules_is_limit_up
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -1133,16 +1137,22 @@ def format_report(analysis: dict) -> str:
             for w in watch:
                 lines.append(f"    - {w}")
 
-        # ---- 定增信息（代码修正痕迹，供审计参考）----
-        zj_info = analysis.get("定增信息", {})
-        if isinstance(zj_info, dict) and zj_info.get("摊薄调整系数"):
+        # ---- 股本与募资信息（FIX-03：按事件类型渲染，IPO≠定增；代码修正痕迹，供审计参考）----
+        gb_info = analysis.get("股本与募资信息", {})
+        if isinstance(gb_info, dict) and gb_info.get("文本"):
             lines.append("")
-            lines.append(f"  [定增信息] 代码已自动修正: 发行{zj_info.get('发行股数','?')}, "
-                         f"摊薄{zj_info.get('摊薄比例','?')}, "
-                         f"调整系数{zj_info.get('摊薄调整系数','?')}")
-            if zj_info.get("募资金额"):
-                lines[-1] += f", 募资{zj_info['募资金额']}"
-            lines[-1] += f" — {zj_info.get('说明','')}"
+            lines.append(f"  [股本与募资信息] {gb_info['文本']}")
+        else:
+            # 兼容旧键（历史 item 结构）
+            zj_info = analysis.get("定增信息", {})
+            if isinstance(zj_info, dict) and zj_info.get("摊薄调整系数"):
+                lines.append("")
+                lines.append(f"  [股本与募资信息] 代码已自动修正: 发行{zj_info.get('发行股数','?')}, "
+                             f"摊薄{zj_info.get('摊薄比例','?')}, "
+                             f"调整系数{zj_info.get('摊薄调整系数','?')}")
+                if zj_info.get("募资金额"):
+                    lines[-1] += f", 募资{zj_info['募资金额']}"
+                lines[-1] += f" — {zj_info.get('说明','')}"
 
         # ---- 近期公告 ----
         announcements = analysis.get("公告", {}).get("列表", []) if isinstance(analysis.get("公告"), dict) else []
@@ -1294,12 +1304,9 @@ def get_limit_up_pool(top_n: int = 30) -> dict:
             except (ValueError, TypeError):
                 continue
 
-            # 涨停板阈值：主板≥9.9%，双创≥19.9%，排除只触及未封死的
-            if chg >= 19.9:
-                pass  # 20cm涨停
-            elif 9.9 <= chg < 10.5:
-                pass  # 10cm涨停(含少量溢价)
-            else:
+            # FIX-06：涨跌停判定走交易规则引擎（板块×上市天数×ST），
+            # 替代硬编码 9.9/19.9 阈值；北交所30%、主板10%、双创20% 由引擎按代码前缀区分
+            if not _rules_is_limit_up(code, name, chg):
                 continue
             if "ST" in name or "N" in name:
                 continue
@@ -1384,11 +1391,33 @@ def _flash_metric(clean: str, keywords: list, exclude_before: str = None):
 
 
 def _extract_flash_report(clean: str, title: str = "") -> dict | None:
-    """从业绩快报/业绩预告正文提取结构化数据。返回 None 表示未提取到任何有效数字。"""
+    """从业绩快报/业绩预告正文提取结构化数据。返回 None 表示未提取到任何有效数字。
+
+    FIX-09：业绩预告（区间型、非实际值）走 new_listing.parse_performance_forecast，
+    返回带 "_预告" 标记的区间数据——不会回灌利润表（merge_flash_into_profit 跳过），
+    仅用于公告提示与情景估值联动。"""
     data = {}
     m = re.search(r'(20\d{2}\s*年\s*(?:半年度|一季度|第一季度|前三季度|第三季度|年度)?)', title)
     if m:
         data["报告期"] = m.group(1).replace(" ", "")
+
+    # 业绩预告：区间表述专用解析器（"营收3.83~3.98亿"、"增长25%~30%"、"净利润下滑约30%"）
+    if "预告" in title:
+        from backend.new_listing import parse_performance_forecast
+        fc = parse_performance_forecast(clean, title)
+        if not fc:
+            return None
+        data["_预告"] = True
+        data["预告类型"] = fc.get("forecast_type", "不确定")
+        if fc.get("rev_min_yi") is not None:
+            data["营收区间(亿元)"] = (fc["rev_min_yi"], fc.get("rev_max_yi"))
+        if fc.get("rev_growth_min") is not None:
+            data["营收同比区间"] = (fc["rev_growth_min"], fc.get("rev_growth_max"))
+        if fc.get("np_growth_min") is not None:
+            data["归母同比区间"] = (fc["np_growth_min"], fc.get("np_growth_max"))
+        data["forecast"] = fc
+        return data
+
     rev, rev_yoy = _flash_metric(clean, ["营业总收入", "营业收入"])
     if rev is not None: data["营收(亿元)"] = rev
     if rev_yoy is not None: data["营收同比(%)"] = rev_yoy
@@ -1408,6 +1437,22 @@ def _extract_flash_report(clean: str, title: str = "") -> dict | None:
 
 def _format_flash_hint(flash: dict) -> str:
     """把快报数据格式化成一行提示，供公告列表渲染。"""
+    # FIX-09：业绩预告渲染区间（"预告: 营收3.83~3.98亿(+25.0%~+30.0%), 归母净利-30.0%"）
+    if flash.get("_预告"):
+        parts = []
+        if flash.get("营收区间(亿元)"):
+            lo, hi = flash["营收区间(亿元)"]
+            parts.append(f"营收{lo}~{hi}亿" if hi and hi != lo else f"营收约{lo}亿")
+        if flash.get("营收同比区间"):
+            lo, hi = flash["营收同比区间"]
+            parts.append(f"({lo*100:+.0f}%~{hi*100:+.0f}%)" if hi and hi != lo else f"({lo*100:+.0f}%)")
+        if flash.get("归母同比区间"):
+            lo, hi = flash["归母同比区间"]
+            parts.append(f"归母净利{lo*100:+.0f}%~{hi*100:+.0f}%" if hi and hi != lo
+                         else f"归母净利{lo*100:+.0f}%")
+        period = f"[{flash['报告期']}]" if flash.get("报告期") else ""
+        ftype = flash.get("预告类型", "")
+        return f"预告{period}{ftype}: " + " ".join(parts) if parts else ""
     parts = []
     for key, yoy_key, label in [("营收(亿元)", "营收同比(%)", "营收"),
                                 ("归母净利润(亿元)", "归母同比(%)", "归母净利"),
@@ -1419,6 +1464,28 @@ def _format_flash_hint(flash: dict) -> str:
             parts.append(s)
     period = f"[{flash['报告期']}]" if flash.get("报告期") else ""
     return f"快报{period}: " + ", ".join(parts) if parts else ""
+
+
+def fetch_announcement_content(art_code: str) -> str:
+    """按 art_code 抓取公告正文（去HTML标签）。主用 np-cnotice 内容接口，失败回退旧接口。
+    供 get_recent_announcements 与外部模块（事件分类器/次新股数据包）复用。失败返回 ""。"""
+    if not art_code:
+        return ""
+    for detail_url in (
+        f'https://np-cnotice-stock.eastmoney.com/api/content/ann?art_code={art_code}&client_source=web&page_index=1',
+        f'https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={art_code}',
+    ):
+        try:
+            req2 = urllib.request.Request(detail_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req2, timeout=8, context=_SSL_CTX) as resp2:
+                detail = json.loads(resp2.read().decode("utf-8"))
+            text = str(detail.get("data", {}).get("notice_content",
+                    detail.get("data", {}).get("content", "")))
+            if text:
+                return re.sub(r'<[^>]+>', '', text)
+        except Exception:
+            continue
+    return ""
 
 
 def get_recent_announcements(symbol: str, count: int = 5) -> dict:
@@ -1434,35 +1501,20 @@ def get_recent_announcements(symbol: str, count: int = 5) -> dict:
 
         _DILUTION_KW = ["发行A股", "非公开发行", "定向增发", "募集资金", "发行股份"]
         _FLASH_KW = ["业绩快报", "业绩预告"]
+        _IPO_KW = ["上市公告书", "招股说明书"]  # FIX-03/08：IPO 事件参数与次新股数据包需要正文
         results = []
         for it in items[:count]:
             title = it.get("title","").replace("<em>","").replace("</em>","")
-            entry = {"日期": it.get("notice_date","")[:10], "标题": title}
-            # 对定增/发行类、业绩快报/预告类公告抓取正文
-            if any(kw in title for kw in _DILUTION_KW + _FLASH_KW):
+            entry = {"日期": it.get("notice_date","")[:10], "标题": title,
+                     "art_code": it.get("art_code","")}  # art_code 供外部按需取全文
+            # 对定增/发行类、业绩快报/预告类、上市公告书/招股书类公告抓取正文
+            if any(kw in title for kw in _DILUTION_KW + _FLASH_KW + _IPO_KW):
                 art_code = it.get("art_code","")
                 if art_code:
                     try:
-                        # 主用 np-cnotice 内容接口（np-anotice/detail 已失效返回空），失败回退旧接口
-                        text = ""
-                        for detail_url in (
-                            f'https://np-cnotice-stock.eastmoney.com/api/content/ann?art_code={art_code}&client_source=web&page_index=1',
-                            f'https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={art_code}',
-                        ):
-                            try:
-                                req2 = urllib.request.Request(detail_url, headers={"User-Agent": "Mozilla/5.0"})
-                                with urllib.request.urlopen(req2, timeout=8, context=_SSL_CTX) as resp2:
-                                    detail = json.loads(resp2.read().decode("utf-8"))
-                                text = str(detail.get("data", {}).get("notice_content",
-                                        detail.get("data", {}).get("content", "")))
-                                if text:
-                                    break
-                            except Exception:
-                                continue
-                        if not text:
+                        clean = fetch_announcement_content(art_code)
+                        if not clean:
                             raise ValueError("正文为空")
-                        # 去HTML标签
-                        clean = re.sub(r'<[^>]+>', '', text)
                         if any(kw in title for kw in _DILUTION_KW):
                             # 提取关键数字
                             amounts = re.findall(r'(\d+\.?\d*)\s*[亿万]元', clean)
@@ -1573,6 +1625,9 @@ def merge_flash_into_profit(profit_list: list, flash: dict) -> list:
     2) 快报期间比利润表最新行更新 → 按快报合成新行前置插入
     返回修改后的 profit_list（原地修改）。"""
     if not flash or not isinstance(profit_list, list):
+        return profit_list
+    # FIX-09：业绩预告是预测值而非实际业绩，禁止回灌利润表（否则污染 TTM/评分）
+    if flash.get("_预告"):
         return profit_list
     label = _flash_period_label(flash.get("报告期", ""))
     if not label:
@@ -1912,20 +1967,12 @@ def calculate_scores(financial_data: dict) -> dict:
     if stock_price <= 0:
         stock_price = 0
     # TTM净利润 = 最新年报净利 - 去年同期净利 + 最新同期净利
+    # FIX-01：TTM/EPS 计算统一走股本SSOT的 compute_ttm_eps（与 reporter 同一口径）
     ann_net = float(annuals[0].get("归母净利润") or annuals[0].get("扣非净利润") or 0) if annuals else 0
-    ttm_net = ann_net
-    if profit_data:
-        _lp = profit_data[0].get("报告期", "")
-        # 跳过 flash 行
-        if profit_data[0].get("_快报源") and len(profit_data) >= 2:
-            _lp = profit_data[1].get("报告期", "")
-        if _lp != "年报":
-            _same = [p for p in profit_data if p.get("报告期") == _lp and not p.get("_快报源")]
-            if len(_same) >= 2:
-                ttm_net = ann_net + float(_same[0].get("归母净利润") or _same[0].get("扣非净利润") or 0) \
-                                   - float(_same[1].get("归母净利润") or _same[1].get("扣非净利润") or 0)
     total_shares = _find_val("总股本")
-    eps_ttm = ttm_net / total_shares if total_shares > 0 and ttm_net > 0 else 0
+    eps_ttm, ttm_net = compute_ttm_eps(profit_data, total_shares)
+    if ttm_net <= 0:
+        ttm_net = ann_net
     if eps_ttm <= 0:
         eps_ttm = _find_val("每股收益")
     pe = stock_price / eps_ttm if stock_price > 0 and eps_ttm > 0 else 0

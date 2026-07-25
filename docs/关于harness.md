@@ -21,23 +21,25 @@ Thinking
 
 当前系统中：
 
-代码检查：二元指标（通过/失败），9 项守卫检查，每项通过或不通过
+代码检查：二元指标（通过/失败），12 项守卫检查，每项通过或不通过
 Critic Agent：CriticOutput 中的问题列表长度、置信度
 Audit Agent：AuditOutput 中的问题数量、严重程度
 数据质量校验：警告数量
-测试体系：通过率（89/89）
+测试体系：通过率（98/98）
 但目前系统没有完整的量化评估体系。我可以解释当前已有的量化指标，以及可以如何进一步量化。
 
 让我整理一个详细的回答。
 
 FinBrain 每一步验证的量化评估分为 已有指标 和 可扩展指标 两类。当前系统已内置部分量化指标，但还有很大的完善空间（这也是 Phase 2 的目标之一）。
 
-一、代码级 9 项守卫检查：二元通过率
+一、代码级 12 项守卫检查：二元通过率
 当前实现：每项检查通过 ✅ 或失败 ❌，无中间状态。
 
 | 检查项 | 量化方式 | 当前状态 | |--------||----------| | 事件-估值联动 | 通过/失败 | ✅ 已实现 | | 评分-估值矛盾 | 通过/失败 | ✅ 已实现 | | 评级-操作一致 | 通过/失败 | ✅ 已实现 | |估值合理 | 通过/失败 | ✅ 已实现 | | 数据单位 | 通过/失败 | ✅ 已实现 | | 评分合计 | 通过/失败 | ✅ 已实现 | | 操作建议 | 通过/失败 | ✅ 已实现| 情景 EPS 单调性 | 通过/失败 | ✅ 已实现 | | 时效性矛盾 | 通过/失败 | ✅ 已实现 |
 
-输出：[校验审计] 8项守卫检查结果 表格，每项 ✅/⚠️/❌。
+输出：[校验审计] 12项守卫检查结果 表格，每项 ✅/⚠️/❌。
+
+注：2026-07-26 结构性修复（FIX-01~12）在原有守卫基础上新增口径配对、数字可回溯、一致性守卫、跨源比对 4 项（合计 12 项），并引入一致性不变量×6 与数字回溯验证。
 
 可扩展：为每项检查加入严重度评分（-5 分），如：
 
@@ -84,10 +86,10 @@ Critic 间一致性：三个 Critic 都发现同一问题 → 高置信；只有
 数据可信度评分：根据警告数量和类型，给数据源一个 0-100 的可信度评分
 历史准确性：跟踪数据质量警告的准确性（如警告后真实除权的比例）
 五、体系：通过率 + 覆盖率 + 耗时
-当前实现：89 项 e2e 测试，二元通过率。
+当前实现：98 项测试（72 e2e + 26 golden 回归），二元通过率。
 
 量化指标 当前状态 说明
-测试通过率 ✅ 已实现 89/89 = 100%
+测试通过率 ✅ 已实现 98/98 = 100%
 编译测试通过 ✅ 已实现 模块导入无循环依赖
 数据工具测试通过 ✅ 已实现 财报、估值、行情等抓取成功
 评分一致性测试 ✅ 已实现 代码评分与 LLM 评分边界
@@ -114,7 +116,7 @@ LLM Fallback 测试通过 ✅ 已实现 槽位熔断、bind_tools、with_structu
 七、当前系统的量化输出示例
 以 300502 报告为例：
 
-[校验审计] 8项守卫检查结果:
+[校验审计] 12项守卫检查结果:
 | 检查项 | 状态 | 说明 |
 ||:----:|------|
 | 事件-估值联动 | — | 无定增事件 |
@@ -174,7 +176,7 @@ Harness 在这里指的是 LLM 应用的"支架系统"——用代码、规则�
 \*\*结构化输出 Harness用 Pydantic schema 约束 LLM 输出，替代脆弱的 json.loads
 代码计算 Harness：财务指标、评分、估值由代码计算，LLM 只叙事
 多 Agent 审查 Harness：Critic 三路并行 + Audit 审计，用 LLM 审查 LLM
-确定性守卫 Harness：9 项代码检查，兜底数字准确性
+确定性守卫 Harness：12 项代码检查，兜底数字准确性
 条件分支 Harness：LangGraph 条件路由，数据不足重取，Critic 通过跳过 Repair
 Fallback Harness：多槽位 LLM 熔断链，单点失败不导致整个流程失败
 数据质量 Harness：检测股本/除权滞后，提醒用户数据可信度
@@ -191,12 +193,12 @@ Harness 类型 解决的问题 实现方式 效果
 结构化输出 Harness LLM 输出格式不稳定 Pydantic schema + with_structured_output 输出可预测、可解析
 代码计算 Harness LLM 算错财务数字 代码计算 PE/PB/EPS/评分 数字 100% 准确
 多 Agent 审查 Harness 单一 LLM 盲区 Critic 三路并行 + Audit 审计 多视角覆盖，减少漏检
-确定性守卫 Harness LLM 关键规则 9 项代码检查 兜底数字和逻辑一致性
+确定性守卫 Harness LLM 关键规则 12 项代码检查 兜底数字和逻辑一致性
 条件分支 Harness 流程僵化 LangGraph 条件路由 数据不足重取，Critic 通过跳过 Repair
 Fallback Harness 单点失败 3 槽位 LLM 熔断链 主模型挂掉自动切换备用
 数据质量 Harness 免费 API 数据滞后 \_detect_capital_issues() 提醒用户数据可信度
 时效性 Harness 忽略最新公告 代码检测业绩快报时效矛盾 避免"等半年报"但快报已出
-测试 Harness 无法验证系统可靠性 89 项 e2e 测试 真实数据冒烟 + 边界覆盖
+测试 Harness 无法验证系统可靠性 98 项测试（72 e2e + 26 golden 回归） 真实数据冒烟 + 边界覆盖
 二、为什么 Harness 是核心竞争力？
 
 1. LLM 本身不是壁垒
@@ -249,13 +251,13 @@ if critic_results.has_issues:
 report = repair_node(state, critic_results) # Repair 修复
 report = audit_node(report) # Audit 最终审计 4. 确定性守卫 Harness
 
-# 9 项代码检查，兜底数字和逻辑一致性
+# 12 项代码检查，兜底数字和逻辑一致性
 
 def code_guardrails(report):
 check_pe_eps_consistency(report) # PE × EPS = 价格
 check_score_sum(report) # 六维评分合计
 check_scenario_monotonicity(report) # 悲观 ≤ 基准 ≤ 乐观
-check_timeliness(report) # 业绩快报时效矛盾 # ... 共9 项 5. 条件分支 Harness
+check_timeliness(report) # 业绩快报时效矛盾 # ... 共12 项 5. 条件分支 Harness
 
 # LangGraph 条件路由，流程不是固定的
 
@@ -300,7 +302,7 @@ return LLMFallbackChain(slots) # 连续失败自动切换下一个
 3. 多 Agent 审查 Harness：Critic 三路并行（Logic/Finance/Industry）
    - Audit 审计用 LLM 审查 LLM，减少单一视角盲区
 
-4. 确定性守卫 Harness：9 项代码检查兜底数字和逻辑一致性，
+4. 确定性守卫 Harness：12 项代码检查兜底数字和逻辑一致性，
    如 PE × EPS = 价格、悲观 ≤ 基准 ≤ 乐观
 
 5. 分支 Harness：LangGraph 条件路由，数据不足重取，
@@ -309,7 +311,7 @@ return LLMFallbackChain(slots) # 连续失败自动切换下一个
 6. Fallback Harness：3 槽位 LLM 熔断链，主模型挂掉自动切换备用
 
 这套 Harness 让 FinBrain 的输出质量从'可用'提升到'可审计、
-可回测、可复制'，89 项 e2e 测试全部通过。"
+可回测、可复制'，98 项测试全部通过。"
 七、更新文档突出 Harness 核心点
 我建议更新 README 和 docs/代办.md，把 Harness 作为项目的核心定位。
 

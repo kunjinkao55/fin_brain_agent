@@ -118,12 +118,14 @@ def _local_reporter_postprocess(raw_analysis: str, data: list[dict]) -> str:
             if dim in pre_scores:
                 item.setdefault("评分", {})[dim] = pre_scores[dim]
 
-        # 估值水位
+        # 估值水位（FIX-01：EPS 与 reporter 统一走 TTM 口径，不再直接用数据源年报 EPS）
+        from backend.share_registry import compute_ttm_eps as _cttm
         latest_val = val_data[0] if val_data else {}
         stock_price = float(price_info.get("price", 0) or 0) if isinstance(price_info, dict) else 0
-        eps = float(latest_val.get("每股收益", 0) or 0)
-        bps = float(latest_val.get("每股净资产", 0) or 0)
         shares = float(latest_val.get("总股本", 0) or 0)
+        eps_ttm, _ttm_net = _cttm(fin_info.get("利润表", []), shares)
+        eps = eps_ttm if eps_ttm > 0 else float(latest_val.get("每股收益", 0) or 0)
+        bps = float(latest_val.get("每股净资产", 0) or 0)
         pe_val = stock_price / eps if eps > 0 else 0
         pb_val = stock_price / bps if bps > 0 else 0
         mktcap = shares * stock_price / 1e8 if shares > 0 else 0
@@ -158,6 +160,7 @@ def _local_reporter_postprocess(raw_analysis: str, data: list[dict]) -> str:
                 financial_scores={k: pre_scores.get(k, {}) for k in ["盈利能力","成长性","财务健康","估值合理"]},
                 llm_scores={"行业前景": llm_scores.get("行业前景",{}), "资金认可": llm_scores.get("资金认可",{})},
                 eps=eps, stock_price=stock_price, industry=industry, roe=roe, debt=debt,
+                bps=bps,  # FIX-01：补上传 BPS（PB地板此前在远程模式不生效）
             )
             item["投资评级"] = decision
         except Exception:

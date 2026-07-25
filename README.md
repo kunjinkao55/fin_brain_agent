@@ -120,15 +120,17 @@ DATA_SLOT_2_API_KEY=
 ## 测试
 
 ```bash
-python tests/test_e2e.py
+python tests/test_e2e.py                    # e2e 套件
+python tests/test_tuolunsi_regression.py    # 托伦斯(301583) golden 回归（FIX-01~12 验收）
 ```
 
 当前测试覆盖：
 
-- **89 项 e2e 测试**（含编译、数据工具、评分一致性、估值、Harness 守卫、配置、输出一致性、报告质量守卫、结构化输出、LangGraph 路由、LLM Fallback、市场情绪、数据插槽）
+- **72 项 e2e 测试**（含编译、数据工具、评分一致性、估值、Harness 守卫、配置、输出一致性、报告质量守卫、结构化输出、LangGraph 路由、LLM Fallback、市场情绪、数据插槽）
+- **26 项托伦斯 golden 回归**：18 项历史错误模式回放（股本 SSOT、口径配对、摊薄幂等、计算回溯、一致性不变量×6、涨跌停规则、次新股解析、跨源比对），自动检出率目标 ≥90%，当前 18/18
 - 关键真实数据冒烟：600131 业绩快报双通道接入、情景估值算术校验、成长性拐点改善、300502 数据质量警告
 
-最新验证结果：89/89 全部通过 ✅
+最新验证结果：72/72 + 26/26 全部通过 ✅
 
 ---
 
@@ -141,6 +143,12 @@ python tests/test_e2e.py
 │   ├── tools.py           # 数据抓取与格式化工具（含市场情绪、业绩快报双通道）
 │   ├── scoring.py         # 评分与估值引擎
 │   ├── scoring_config.py  # 评分配置与权重
+│   ├── share_registry.py  # 股本单一事实源(SSOT) + TTM/EPS 统一入口 + BPS口径配对（FIX-01/02）
+│   ├── corporate_actions.py # 公司行动事件分类器（IPO/定增/配股/送转，IPO绝不落入定增）（FIX-03）
+│   ├── calc_engine.py     # 计算登记表 + 报告数字回溯验证 + 单位规范 + 跨源比对（FIX-04/11/12）
+│   ├── trading_rules.py   # 涨跌停规则引擎（板块×上市天数×ST）（FIX-06）
+│   ├── consistency.py     # 跨模块一致性不变量×6 + 指标生命周期注册表（FIX-05/07）
+│   ├── new_listing.py     # 次新股数据包（上市日期/解禁/流通盘/客户集中度/业绩预告）（FIX-08/09）
 │   ├── accounting_rag.py  # RAG 知识库
 │   ├── data_slots.py      # 高级数据 API 插槽（Tushare/Wind/Choice/iFinD/Bloomberg）
 │   ├── datasource_tier.py # 数据源分层（FREE/PREMIUM/INSTITUTIONAL）
