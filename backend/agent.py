@@ -2012,11 +2012,20 @@ def reporter_node(state: FinBrainState) -> dict:
             except json.JSONDecodeError:
                 pass
 
+    # 方案0.5: ast.literal_eval 解析 Python 单引号格式
+    if data is None:
+        try:
+            import ast
+            data = ast.literal_eval(raw_stripped)
+        except (ValueError, SyntaxError):
+            pass
+
     # 方案1: 直接解析纯JSON
-    try:
-        data = json.loads(raw_stripped)
-    except json.JSONDecodeError:
-        pass
+    if data is None:
+        try:
+            data = json.loads(raw_stripped)
+        except json.JSONDecodeError:
+            pass
 
     # 方案2: 从 ```json 代码块提取
     if data is None:
@@ -2113,6 +2122,14 @@ def reporter_node(state: FinBrainState) -> dict:
 
     def _fix_and_decide(item: dict, sym: str):
         """对单只股票: (a)覆盖评分 (b)代码计算投资评级"""
+        # 机构共识在 try 外执行
+        ws_key = os.getenv("WEB_SEARCH_API_KEY", "")
+        if ws_key:
+            from backend.web_search import search_institutional_consensus
+            stock_name = item.get("名称", sym) if isinstance(item, dict) else sym
+            consensus = search_institutional_consensus(sym, stock_name)
+            if consensus["目标价"]["平均"] or consensus["净利润预测"].get("2026"):
+                item["机构共识"] = consensus
         try:
             fin = get_financial_statements(sym)
             val = get_valuation(sym)
@@ -2417,18 +2434,6 @@ def reporter_node(state: FinBrainState) -> dict:
                             f"回款风险与信用减值压力需重点关注（利润下滑主因可能是减值而非经营）"]
             except Exception:
                 pass
-
-            # Web Search 机构共识（仅 web_search 启用时）
-            ws_key = os.getenv("WEB_SEARCH_API_KEY", "")
-            if ws_key:
-                try:
-                    from backend.web_search import search_institutional_consensus
-                    stock_name = item.get("名称", sym) if isinstance(item, dict) else sym
-                    consensus = search_institutional_consensus(sym, stock_name)
-                    if consensus["目标价"]["平均"]:
-                        item["机构共识"] = consensus
-                except Exception:
-                    pass  # 搜索失败不阻塞
 
             # 成长-估值匹配检查：高增长+低PE → 强制上调
             rev_growth = float(re.search(r'营收[^+]*([+-]?\d+)', score_pe).group(1) or 0) if re.search(r'营收[^+]*([+-]?\d+)', score_pe) else 0
@@ -2969,6 +2974,20 @@ def reporter_node(state: FinBrainState) -> dict:
         for _it in _items:
             if isinstance(_it, dict):
                 _it["估值框架"] = _val_framework
+
+    # === 机构共识（顶层注入，优先同花顺直抓，失败回退Tavily） ===
+    _items_for_cons = data if isinstance(data, list) else [data]
+    for _it in _items_for_cons:
+        if isinstance(_it, dict) and _it.get("代码") and "机构共识" not in _it:
+            try:
+                from backend.web_search import search_institutional_consensus
+                _sym = _it["代码"]
+                _name = _it.get("名称", _sym)
+                _cons = search_institutional_consensus(_sym, _name)
+                if _cons["目标价"]["平均"] or _cons["净利润预测"].get("2026"):
+                    _it["机构共识"] = _cons
+            except Exception:
+                pass
 
     # === 渲染评分卡 ===
     compare_text = ""

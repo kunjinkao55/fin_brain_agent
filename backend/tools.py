@@ -1050,24 +1050,34 @@ def format_report(analysis: dict) -> str:
                 lines.append(f"    ⚠️ {fwd_note}")
         lines.append(f"    * 基于最新财报数据计算，非实时行情。日内股价波动会导致PE/PB/市值变化。请以交易软件实时数据为准。")
 
-        # ---- 机构共识 (Web Search) ----
+        # ---- 机构共识 ----
         consensus = analysis.get("机构共识", {})
         if consensus:
             tp = consensus.get("目标价", {})
             net = consensus.get("净利润预测", {})
             ratings = consensus.get("评级分布", {})
-            if tp.get("平均"):
+            has_target = bool(tp.get("平均"))
+            has_net = bool(net.get("2026"))
+            has_rating = any(ratings.get(k) for k in ["买入","增持","中性","减持"])
+            if has_target or has_net or has_rating:
                 lines.append("")
                 lines.append("  [机构共识]")
+            if has_target:
                 tp_str = f"目标价: 平均{tp['平均']}元"
                 if tp.get("最高"): tp_str += f" 最高{tp['最高']}元"
                 if tp.get("最低"): tp_str += f" 最低{tp['最低']}元"
                 if tp.get("机构数"): tp_str += f" ({tp['机构数']}家机构)"
                 lines.append(f"    {tp_str}")
-            if net.get("2026"):
-                lines.append(f"    2026净利润一致预期: {net['2026']}亿" +
-                            (f" ({net['机构数']}家机构)" if net.get("机构数") else ""))
-            if any(ratings.get(k) for k in ["买入","增持","中性","减持"]):
+            if has_net:
+                net_str = ""
+                for yr in sorted([k for k in net if k.isdigit()])[:3]:
+                    val = net.get(yr)
+                    if val:
+                        net_str += f" {yr}年EPS一致预期{val}元"
+                if net_str:
+                    inst_str = f" ({net['机构数']}家机构)" if net.get("机构数") else ""
+                    lines.append(f"    净利润预测:{net_str}{inst_str}")
+            if has_rating:
                 r_str = " ".join(f"{k}{ratings[k]}份" for k in ["买入","增持","中性","减持"] if ratings.get(k))
                 lines.append(f"    评级分布: {r_str}")
 
@@ -1509,29 +1519,27 @@ def get_stock_streak(symbol: str) -> dict:
 # ============================================================
 
 def get_concept_ranking(top_n: int = 20) -> dict:
-    """获取同花顺概念板块，按当日涨幅排序"""
+    """获取同花顺概念板块名称列表。数据源较慢（~2分钟），有1小时缓存。"""
+    from backend import cache
+    cached = cache.get("concept_ranking", "all")
+    if cached:
+        return cached
     try:
-        # 获取所有概念板块
         df = ak.stock_board_concept_name_ths()
         concepts = []
-        for _, row in df.iterrows():
-            try:
-                detail = ak.stock_board_concept_cons_ths(symbol=row["name"])
-                # 提取概念板块当日的涨跌幅等指标
-                concepts.append({
-                    "概念名称": row["name"],
-                    "代码": row["code"],
-                })
-            except Exception:
+        for _, row in df.head(top_n * 3).iterrows():
+            name = str(row.get("name", ""))
+            code = str(row.get("code", ""))
+            if not name or not code:
                 continue
-
-        if not concepts:
-            return {"error": "概念板块数据获取失败"}
-
-        return {"概念总数": len(concepts), "列表": concepts[:top_n]}
-
+            concepts.append({"概念名称": name, "代码": code})
+            if len(concepts) >= top_n:
+                break
+        result = {"概念总数": len(concepts), "列表": concepts}
+        cache.set("concept_ranking", "all", result)
+        return result
     except Exception as e:
-        return {"error": f"概念板块查询失败: {str(e)}"}
+        return {"error": f"概念板块查询失败（同花顺服务器响应慢，请稍后重试）: {str(e)[:100]}"}
 
 
 # ============================================================
@@ -1899,26 +1907,28 @@ def calculate_scores(financial_data: dict) -> dict:
         "白色家电": 15, "家用电器": 15,
     }
     price_info = financial_data.get("price", {})
-    pe = float(price_info.get("per", 0) or 0) if isinstance(price_info, dict) else 0
-    # PE未从外部获取时，自算 = 股价 / TTM_EPS（滚动12个月）
-    if pe <= 0:
-        stock_price = float(price_info.get("price", 0) or 0) if isinstance(price_info, dict) else 0
-        # TTM净利润 = 最新年报净利 - 去年同期净利 + 最新同期净利（Q1/中报/三季报通用）
-        ann_net = float(annuals[0].get("归母净利润") or annuals[0].get("扣非净利润") or 0) if annuals else 0
-        ttm_net = ann_net
-        if profit_data:
-            _lp = profit_data[0].get("报告期", "")
-            if _lp != "年报":
-                _same = [p for p in profit_data if p.get("报告期") == _lp]
-                if len(_same) >= 2:
-                    ttm_net = ann_net + float(_same[0].get("归母净利润") or _same[0].get("扣非净利润") or 0) \
-                                       - float(_same[1].get("归母净利润") or _same[1].get("扣非净利润") or 0)
-        total_shares = _find_val("总股本")
-        eps_ttm = ttm_net / total_shares if total_shares > 0 and ttm_net > 0 else 0
-        if eps_ttm <= 0:
-            eps_ttm = _find_val("每股收益")  # 回退到年报EPS
-        if stock_price > 0 and eps_ttm > 0:
-            pe = stock_price / eps_ttm
+    # PE 始终用 TTM 自算，不依赖外部 API（新浪/东财返回的年报 PE 对 V 型反转公司严重失真）
+    stock_price = float(price_info.get("price", 0) or 0) if isinstance(price_info, dict) else 0
+    if stock_price <= 0:
+        stock_price = 0
+    # TTM净利润 = 最新年报净利 - 去年同期净利 + 最新同期净利
+    ann_net = float(annuals[0].get("归母净利润") or annuals[0].get("扣非净利润") or 0) if annuals else 0
+    ttm_net = ann_net
+    if profit_data:
+        _lp = profit_data[0].get("报告期", "")
+        # 跳过 flash 行
+        if profit_data[0].get("_快报源") and len(profit_data) >= 2:
+            _lp = profit_data[1].get("报告期", "")
+        if _lp != "年报":
+            _same = [p for p in profit_data if p.get("报告期") == _lp and not p.get("_快报源")]
+            if len(_same) >= 2:
+                ttm_net = ann_net + float(_same[0].get("归母净利润") or _same[0].get("扣非净利润") or 0) \
+                                   - float(_same[1].get("归母净利润") or _same[1].get("扣非净利润") or 0)
+    total_shares = _find_val("总股本")
+    eps_ttm = ttm_net / total_shares if total_shares > 0 and ttm_net > 0 else 0
+    if eps_ttm <= 0:
+        eps_ttm = _find_val("每股收益")
+    pe = stock_price / eps_ttm if stock_price > 0 and eps_ttm > 0 else 0
     pb = float(price_info.get("pb", 0) or 0) if isinstance(price_info, dict) else 0
     # PB未获取时自算 = 股价 / 每股净资产
     if pb <= 0:
@@ -1990,7 +2000,11 @@ def identify_youzi(branch_name: str) -> list:
 
 
 def get_dragon_tiger_list(date: str = "") -> dict:
-    """获取今日龙虎榜数据，识别游资席位"""
+    """获取今日龙虎榜数据，识别游资席位（5分钟缓存）"""
+    from backend import cache
+    cached = cache.get("dragon_tiger_list", date or "today")
+    if cached:
+        return cached
     try:
         df = ak.stock_lhb_ggtj_sina()
         # 取最近30条
@@ -2007,7 +2021,9 @@ def get_dragon_tiger_list(date: str = "") -> dict:
                 "净买入额": str(row.get("净买入额", "")),
             })
 
-        return {"龙虎榜数量": len(results), "列表": results}
+        result = {"龙虎榜数量": len(results), "列表": results}
+        cache.set("dragon_tiger_list", date or "today", result)
+        return result
 
     except Exception as e:
         return {"error": f"龙虎榜查询失败: {str(e)}"}

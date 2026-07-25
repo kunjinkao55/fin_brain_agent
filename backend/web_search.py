@@ -192,8 +192,27 @@ def _generic_search(api_key: str, url: str, query: str, n: int) -> list[dict]:
     return [{"title": "搜索成功但格式未知", "snippet": str(data)[:500], "url": "", "score": 0}]
 
 
+def _fetch_consensus_ths(symbol: str) -> dict | None:
+    """从同花顺获取机构一致预期（免费，结构化，优先使用）。列位置: 0=年份,1=机构数,2=最小值,3=平均值,4=最大值,5=行业平均"""
+    try:
+        import akshare as ak
+        df = ak.stock_profit_forecast_ths(symbol=symbol)
+        if df is None or df.empty:
+            return None
+        result = {"来源": "同花顺(akshare)"}
+        for _, row in df.iterrows():
+            year = str(int(row.iloc[0]))
+            avg_eps = float(row.iloc[3]) if row.iloc[3] is not None else 0
+            inst_count = int(row.iloc[1]) if row.iloc[1] is not None else 0
+            if avg_eps > 0:
+                result[year] = {"EPS一致预期": round(avg_eps, 2), "机构数": inst_count}
+        return result if len(result) > 1 else None
+    except Exception:
+        return None
+
+
 def search_institutional_consensus(symbol: str, name: str) -> dict:
-    """搜索机构一致预期：目标价、净利润预测、评级分布。
+    """获取机构一致预期：优先同花顺直抓（免费+结构化），失败时回退Tavily搜索。
 
     返回结构化数据，供 Reporter 注入估值水位和对比分析。
     """
@@ -203,43 +222,61 @@ def search_institutional_consensus(symbol: str, name: str) -> dict:
         "评级分布": {"买入": None, "增持": None, "中性": None, "减持": None, "来源": ""},
     }
 
+    # === 方案A: 同花顺直抓（免费，结构化，优先） ===
+    import re
+    ths_data = _fetch_consensus_ths(symbol)
+    if ths_data:
+        # 按年份映射到结果字段
+        for yr_key in ths_data:
+            if not yr_key.isdigit():
+                continue
+            d = ths_data[yr_key]
+            eps_val = d.get("EPS一致预期")
+            inst_n = d.get("机构数", 0)
+            if eps_val:
+                result["净利润预测"][yr_key] = eps_val
+                if yr_key == "2026":
+                    result["净利润预测"]["机构数"] = inst_n
+        result["净利润预测"]["来源"] = ths_data.get("来源", "同花顺")
+
+        return result  # 直抓成功，不调Tavily
+
+    # === 方案B: Tavily搜索回退 ===
+    ws_key = __import__('os').getenv("WEB_SEARCH_API_KEY", "")
+    if not ws_key:
+        return result
+
     # 搜索1: 目标价
     r1 = search_financial(f"{name} {symbol} 机构目标价 一致预期", max_results=3)
     if r1 and r1[0].get("snippet"):
-        import re
         text = " ".join(r["snippet"] for r in r1)
-        # 平均目标价
-        avg_m = re.search(r'目标价[约均]?[为是]?\s*(\d+\.?\d*)\s*元', text)
+        avg_m = re.search(r'目标价[^\d]*(\d+\.?\d*)\s*元', text)
         if not avg_m:
-            avg_m = re.search(r'平均[目标价]*\s*(\d+\.?\d*)\s*元', text)
+            avg_m = re.search(r'平均[目标价]*[^\d]*(\d+\.?\d*)\s*元', text)
         if avg_m:
             result["目标价"]["平均"] = float(avg_m.group(1))
-        # 最高/最低
         hi_m = re.search(r'最高\s*(\d+\.?\d*)\s*元', text)
         lo_m = re.search(r'最低\s*(\d+\.?\d*)\s*元', text)
         if hi_m: result["目标价"]["最高"] = float(hi_m.group(1))
         if lo_m: result["目标价"]["最低"] = float(lo_m.group(1))
-        # 机构数
         n_m = re.search(r'(\d+)\s*家?机构', text)
         if n_m: result["目标价"]["机构数"] = int(n_m.group(1))
         result["目标价"]["来源"] = r1[0].get("url", "")
 
-    # 搜索2: 2026净利润一致预期（必须带年份限定，避免匹配到2025实际值）
-    r2 = search_financial(f"{name} {symbol} 2026年 净利润预测 机构一致预期 同比增长", max_results=3)
+    # 搜索2: 净利润
+    r2 = search_financial(f"{name} {symbol} 2026年 净利润预测 机构一致预期", max_results=3)
     if r2 and r2[0].get("snippet"):
         text = " ".join(r["snippet"] for r in r2)
-        # 只匹配明确标注"2026"或"预测"或"一致预期"上下文的数字
-        net_m = re.search(r'2026[年]?.*?净利润[预测计]?[约均]?[为是]?\s*(\d+\.?\d*)\s*亿', text)
+        net_m = re.search(r'2026[年]?[^\d]*净利润[^\d]*(\d+\.?\d*)\s*亿', text)
         if not net_m:
-            net_m = re.search(r'预测[净利润]*.*?2026[年]?[约均]?[为是]?\s*(\d+\.?\d*)\s*亿', text)
+            net_m = re.search(r'2026[年]?[^\d]*净利[^\d]*(\d+\.?\d*)\s*亿', text)
         if not net_m:
-            net_m = re.search(r'一致预期.*?(\d+\.?\d*)\s*亿', text)
+            net_m = re.search(r'预测[^\d]*净利润[^\d]*(\d+\.?\d*)\s*亿', text)
+        if not net_m:
+            net_m = re.search(r'一致预期[^\d]*(\d+\.?\d*)\s*亿', text)
         if net_m:
             val = float(net_m.group(1))
-            # 过滤：如果值等于典型2025实际值(如29.06)，且无"预测"上下文，跳过
-            if abs(val - 29.06) < 0.5 and "预测" not in text[:text.find(str(int(val)))]:
-                pass  # 疑似2025实际值，跳过
-            else:
+            if abs(val - 29.06) >= 0.5 or "预测" in text[:text.find(str(int(val)))]:
                 result["净利润预测"]["2026"] = val
         n_m = re.search(r'(\d+)\s*家?机构', text)
         if n_m: result["净利润预测"]["机构数"] = int(n_m.group(1))
