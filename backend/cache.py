@@ -20,7 +20,7 @@ TTL = {
     "screen_stocks": 600,    "limit_up_pool": 60,
     "concept_ranking": 600,  "dragon_tiger_list": 300,
     "dragon_tiger_detail": 300, "search_youzi": 3600,
-    "calculate_score": 300,
+    "calculate_score": 300,   "business_segments": 1800,
 }
 
 # ---- Redis 后端 ----

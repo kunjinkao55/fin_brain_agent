@@ -12,6 +12,43 @@ from backend.scoring_config import (get_weights, get_safety_margin, get_safety_a
 logger = logging.getLogger(__name__)
 
 
+def indicator_pe_matrix(rev_growth_pct: float | None,
+                        gm_trend_pp: float | None,
+                        capex_cfo: float | None) -> tuple[str, float, dict]:
+    """支柱三：估值锚定匹配矩阵——乘数绑定三硬核指标，而非行业名称。
+
+    指标分档：
+      收入增速:   >30%→高 | 10~30%→中 | <10%→低
+      毛利率趋势: 提升(>+0.5pp)→高 | 稳定→中 | 下滑(<-0.5pp)→低
+      CAPEX/CFO:  <0.5→高(轻资产) | 0.5~1.0→中 | >1.0→低(重资产吞噬)
+
+    档位规则：
+      高乘数(1.5): ≥2 项高档 且 毛利率趋势不为低
+      低乘数(0.6): ≥2 项低档
+      中乘数(1.0): 其他
+
+    指标缺失（None）按中性"中"处理。capex_cfo 仅在公司级可用，
+    板块级调用传 None。
+
+    :return: (band_label, mult, readings)
+    """
+    g_band = "中" if rev_growth_pct is None else (
+        "高" if rev_growth_pct > 30 else ("中" if rev_growth_pct >= 10 else "低"))
+    m_band = "中" if gm_trend_pp is None else (
+        "高" if gm_trend_pp > 0.5 else ("低" if gm_trend_pp < -0.5 else "中"))
+    c_band = "中" if capex_cfo is None else (
+        "高" if capex_cfo < 0.5 else ("低" if capex_cfo > 1.0 else "中"))
+    bands = [g_band, m_band, c_band]
+    readings = {"增速档": g_band, "毛利率趋势档": m_band, "资本开支档": c_band,
+                "收入增速%": rev_growth_pct, "毛利率趋势pp": gm_trend_pp,
+                "CAPEX/CFO": capex_cfo}
+    if bands.count("高") >= 2 and m_band != "低":
+        return "高乘数", 1.5, readings
+    if bands.count("低") >= 2:
+        return "低乘数", 0.6, readings
+    return "中乘数", 1.0, readings
+
+
 def _quality_adjustment(roe: float, debt: float) -> float:
     """根据财务质量微调安全边际（允许负向调整，优质公司可适当放宽）"""
     adj_cfg = get_safety_adjustments()
@@ -38,6 +75,8 @@ def compute_investment_rating(
     debt: float,             # 资产负债率(%)
     bps: float = 0.0,        # 每股净资产（用于买入价PB地板）
     bps_adjusted: float = 0.0,  # 股本变动事件后调整口径BPS（FIX-02，优先于bps）
+    matrix_mult: float = 0.0,   # 支柱三：乘数矩阵结果（>0 时替换 quality×growth 路径）
+    matrix_note: str = "",      # 矩阵读数说明（写入估值明细）
 ) -> dict:
     """
     根据公司类型动态赋权，计算综合评分 + 合理价值 + 安全边际 + 投资评级。
@@ -105,7 +144,13 @@ def compute_investment_rating(
     elif growth_score >= 5: growth_pe_mult = 1.1   # B级：温和成长(+20%以上)
     elif growth_score <= 2: growth_pe_mult = 0.7   # C级衰退：营收/利润双降(-10%以上)，PE应打折
 
-    fair_pe = ind_pe * quality_mult * growth_pe_mult
+    # 支柱三：乘数矩阵优先——三硬核指标（增速/毛利率趋势/CAPEX-CFO）齐全时，
+    # 乘数绑定经营实质而非行业标签；缺失时回退 quality×growth 传统路径。
+    _use_matrix = matrix_mult > 0
+    if _use_matrix:
+        fair_pe = ind_pe * matrix_mult
+    else:
+        fair_pe = ind_pe * quality_mult * growth_pe_mult
     # FIX-02（托伦斯A10）：合理价值必须用"显示口径"的EPS计算，
     # 保证 估值明细.公式 中显示的因子乘积可复算出同一结果（显示=复算）。
     _eps_display = round(eps, 2) if eps else 0
@@ -159,14 +204,25 @@ def compute_investment_rating(
     else: confidence = "C (低)"
 
     # 估值计算链（透明化）+ 前瞻敏感性（_eps_display 已在合理价值处统一定义）
-    valuation_chain = {
-        "EPS(TTM)": _eps_display,
-        "行业PE中枢": ind_pe,
-        "财务质量乘数": round(quality_mult, 2),
-        "成长溢价": round(growth_pe_mult, 2),
-        "最终PE": round(fair_pe, 1),
-        "公式": f"{_eps_display} × {ind_pe} × {quality_mult} × {growth_pe_mult} = {fair_value}",
-    }
+    if _use_matrix:
+        valuation_chain = {
+            "EPS(TTM)": _eps_display,
+            "行业PE中枢": ind_pe,
+            "乘数矩阵": matrix_mult,
+            "最终PE": round(fair_pe, 1),
+            "公式": f"{_eps_display} × {ind_pe} × {matrix_mult} = {fair_value}",
+        }
+        if matrix_note:
+            valuation_chain["乘数矩阵说明"] = matrix_note
+    else:
+        valuation_chain = {
+            "EPS(TTM)": _eps_display,
+            "行业PE中枢": ind_pe,
+            "财务质量乘数": round(quality_mult, 2),
+            "成长溢价": round(growth_pe_mult, 2),
+            "最终PE": round(fair_pe, 1),
+            "公式": f"{_eps_display} × {ind_pe} × {quality_mult} × {growth_pe_mult} = {fair_value}",
+        }
     # 前瞻敏感性：若EPS回到正常水平，合理价值会是多少
     if eps > 0 and _eps_display > 0:
         _eps_2x = round(_eps_display * 2, 2)

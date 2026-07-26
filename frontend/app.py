@@ -1317,7 +1317,7 @@ elif page == "Backtest":
 # ========== Commentary ==========
 elif page == "Commentary":
     st.header("Commentary Generator")
-    st.caption("将 FinBrain 投资报告转写为适合同花顺社区的股评帖。纯 LLM，所有数据来自报告。")
+    st.caption("将 FinBrain 投资报告转写为适合同花顺社区的股评帖。纯 LLM 转写，全部数字经代码校验可溯源至报告。")
 
     from backend.agent import generate_commentary
 

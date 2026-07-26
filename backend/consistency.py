@@ -255,8 +255,70 @@ def _inv6(item: dict, issues: list[Issue]) -> None:
             f"市场广度上涨比例仅{up_ratio}%，与综合情绪「{mood_text}」的偏暖表述背离"))
 
 
+# ---------------------------------------------------------------------------
+# INV-7 ~ INV-10（支柱五：逻辑一致性断路器）
+# ---------------------------------------------------------------------------
+
+def _inv7(item: dict, issues: list[Issue]) -> None:
+    """评级-增速一致性：SELL 但营收增速>30% → 高增长转型期静态PE卖出可能犯错。"""
+    rating = item.get("投资评级", {})
+    level = str(rating.get("评级", "")).upper() if isinstance(rating, dict) else ""
+    if level not in ("SELL", "AVOID"):
+        return
+    g = item.get("_rev_growth")
+    if g is None:
+        return
+    try:
+        g = float(g)
+    except (TypeError, ValueError):
+        return
+    if g > 30:
+        issues.append(Issue(
+            "INV-7", "warning",
+            f"评级{level}但营收增速{g:.0f}%>30%：高增长转型期使用静态PE卖出可能犯下致命错误，"
+            "建议人工复核（若为第二曲线/新业务驱动，应先做SOTP拆分再定评级）"))
+
+
+def _inv9(item: dict, issues: list[Issue]) -> None:
+    """估值-现金流匹配：合理价值隐含市值 > 10×经营现金流 且 ROIC<15% → 依赖再投资假设。"""
+    fair = _fair_value(item)
+    ctx = item.get("_share_ctx", {})
+    shares = ctx.get("总股本") if isinstance(ctx, dict) else None
+    cfo = item.get("_cfo_annual")
+    roic = item.get("_roic_proxy")
+    if not fair or not shares or not cfo or roic is None:
+        return
+    try:
+        shares = float(shares)
+        cfo = float(cfo)
+        roic = float(roic)
+    except (TypeError, ValueError):
+        return
+    if cfo <= 0 or shares <= 0:
+        return
+    implied_mcap = fair * shares
+    if implied_mcap > 10 * cfo and roic < 0.15:
+        issues.append(Issue(
+            "INV-9", "warning",
+            f"合理价值隐含市值{implied_mcap/1e8:.0f}亿 > 10×经营现金流({cfo/1e8:.2f}亿)，"
+            f"且ROIC仅{roic*100:.1f}%：估值严重依赖再投资假设，资本回报下降时价值将大幅缩水"))
+
+
+def _inv10(item: dict, issues: list[Issue]) -> None:
+    """历史锚定陷阱：周期属性强（cyclical>0.4）且合理价值基于 TTM EPS → 顶部/底部失真。"""
+    try:
+        cyc = float(item.get("_cyclical", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if cyc > 0.4 and _fair_value(item):
+        issues.append(Issue(
+            "INV-10", "warning",
+            f"周期属性({cyc*100:.0f}%)公司以TTM EPS锚定合理价值："
+            "周期顶部/底部利润失真将直接传导至估值，建议结合前瞻利润与PB底部复核"))
+
+
 def check_invariants(item: dict, report_text: str = "") -> list[Issue]:
-    """对报告 item 执行 6 条跨模块一致性不变量检查。
+    """对报告 item 执行 10 条跨模块一致性不变量检查（INV-1~6 + 支柱五断路器 INV-7~10）。
 
     尽量从 item 结构化字段取证；report_text 用于全文扫描类检查
     （INV-4 禁用指标引用、INV-5 全文唯一值），不传则跳过这两类。
@@ -264,31 +326,166 @@ def check_invariants(item: dict, report_text: str = "") -> list[Issue]:
     issues: list[Issue] = []
     if not isinstance(item, dict):
         return issues
-    try:
-        _inv1(item, issues)
-    except Exception:
-        pass
-    try:
-        _inv2(item, issues)
-    except Exception:
-        pass
-    try:
-        _inv3(item, issues)
-    except Exception:
-        pass
-    try:
-        _inv4(item, report_text, issues)
-    except Exception:
-        pass
-    try:
-        _inv5(item, report_text, issues)
-    except Exception:
-        pass
-    try:
-        _inv6(item, issues)
-    except Exception:
-        pass
+    for fn in (_inv1, _inv2, _inv3, _inv6, _inv7, _inv9, _inv10):
+        try:
+            fn(item, issues)
+        except Exception:
+            pass
+    for fn in (_inv4, _inv5):
+        try:
+            fn(item, report_text, issues)
+        except Exception:
+            pass
     return issues
+
+
+# ---------------------------------------------------------------------------
+# LLM 输出 grounding 校验（Critic/Repair 幻觉拦截）
+# ---------------------------------------------------------------------------
+
+# 硬数字：数字紧邻单位（元/亿/万/%/倍）。年份(19xx/20xx)与序号类小数字不构成事实主张，不抓
+_HARD_NUM_PAT = re.compile(r'(-?\d+\.?\d*)\s*(亿|万|元|%|倍)')
+_YEAR_PAT = re.compile(r'^(19|20)\d{2}$')
+# 裸数字池（辅助）：报告中常写 "PE:337"（无"倍"字），若股评写"337倍"，
+# 仅按单位池匹配会误杀。裸数字要求非小数点/逗号/百分号邻接，降低误配。
+_BARE_NUM_PAT = re.compile(r'(?<![\d.,(（])(-?\d+\.?\d*)(?![\d.,%）)])')
+
+
+def extract_hard_numbers(text: str) -> list[tuple[float, str]]:
+    """从文本提取带单位的事实型数字：[(归一值, 单位类)]。
+    金额统一归一到"亿"（万→/1e4）；元/倍/% 保持原值。"""
+    out: list[tuple[float, str]] = []
+    if not text:
+        return out
+    for m in _HARD_NUM_PAT.finditer(str(text)):
+        raw = m.group(1)
+        if _YEAR_PAT.match(raw):
+            continue
+        v = float(raw)
+        unit = m.group(2)
+        if unit == "万":
+            out.append((v / 1e4, "亿"))
+        else:
+            out.append((v, unit))
+    return out
+
+
+def _extract_bare_numbers(text: str) -> list[float]:
+    """提取全部裸数字（不限单位），作为 traceability 的辅助池。"""
+    out: list[float] = []
+    if not text:
+        return out
+    for m in _BARE_NUM_PAT.finditer(str(text)):
+        raw = m.group(1)
+        if _YEAR_PAT.match(raw):
+            continue
+        try:
+            out.append(float(raw))
+        except ValueError:
+            continue
+    return out
+
+
+def _traceable(value: float, unit: str, pool: list[tuple[float, str]],
+               bare_pool: list[float], tol: float) -> bool:
+    """value 是否可溯源：先按单位类匹配 pool；失败则按裸数字匹配 bare_pool。
+    0 值宽松放过。"""
+    if value == 0:
+        return True
+    for pv, pu in pool:
+        if pu != unit:
+            continue
+        denom = max(abs(value), abs(pv))
+        if denom > 0 and abs(value - pv) / denom <= tol:
+            return True
+    for bv in bare_pool:
+        denom = max(abs(value), abs(bv))
+        if denom > 0 and abs(value - bv) / denom <= tol:
+            return True
+    return False
+
+
+def _make_pools(source_text: str) -> tuple[list[tuple[float, str]], list[float]]:
+    return extract_hard_numbers(source_text), _extract_bare_numbers(source_text)
+
+
+def filter_untraceable_issues(
+    issues: list[str],
+    source_text: str,
+    tol: float = 0.05,
+) -> tuple[list[str], list[str]]:
+    """Critic 发现的 grounding 过滤：发现中的每个硬数字都必须能在 source_text
+    （原始分析+采集数据）找到出处（±tol 取整误差）。
+
+    - 发现不含硬数字 → 保留（无法校验，存疑从宽）
+    - 全部硬数字可溯源 → 保留
+    - 含 ≥1 个不可溯源硬数字 → 判定疑似幻觉（过时数据/编造），丢弃
+
+    :return: (保留的发现, 丢弃的发现)
+    """
+    pool, bare = _make_pools(source_text)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for issue in issues:
+        if not issue:
+            continue
+        nums = extract_hard_numbers(str(issue))
+        if not nums:
+            kept.append(issue)
+            continue
+        bad = [f"{v}{u}" for v, u in nums if not _traceable(v, u, pool, bare, tol)]
+        if bad:
+            dropped.append(issue)
+        else:
+            kept.append(issue)
+    return kept, dropped
+
+
+def has_new_hard_numbers(
+    original_text: str,
+    new_text: str,
+    tol: float = 0.05,
+) -> list[tuple[float, str]]:
+    """Repair 输出校验：new_text 中引入的、在 original_text（原文+采集数据池）
+    中不存在的新硬数字列表。空列表 = 通过。"""
+    pool, bare = _make_pools(original_text)
+    return [(v, u) for v, u in extract_hard_numbers(new_text)
+            if not _traceable(v, u, pool, bare, tol)]
+
+
+_SENT_SPLIT = re.compile(r'(?<=[。！？；])|\n')
+
+
+def strip_untraceable_sentences(
+    text: str,
+    source_text: str,
+    tol: float = 0.05,
+    keep_patterns: tuple = ("不构成投资建议", "股市有风险"),
+) -> tuple[str, list[str]]:
+    """股评/长文幻觉拦截（句子级）：逐句检查，含不可溯源硬数字的句子整句剔除。
+
+    数字可溯源判定与 has_new_hard_numbers 同池同容差。
+    keep_patterns: 命中这些子串的句子永远保留（免责声明等）。
+    返回 (清洗后文本, 被剔除句子列表)。全部剔除时返回空串。"""
+    if not text:
+        return text, []
+    pool, bare = _make_pools(source_text)
+    kept: list[str] = []
+    removed: list[str] = []
+    for sent in _SENT_SPLIT.split(str(text)):
+        s = sent.strip()
+        if not s:
+            continue
+        if any(k in s for k in keep_patterns):
+            kept.append(s)
+            continue
+        nums = extract_hard_numbers(s)
+        bad = [(v, u) for v, u in nums if not _traceable(v, u, pool, bare, tol)]
+        if bad:
+            removed.append(s)
+        else:
+            kept.append(s)
+    return "\n".join(kept), removed
 
 
 # ---------------------------------------------------------------------------

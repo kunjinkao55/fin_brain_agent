@@ -875,6 +875,13 @@ A股披露节奏：1-4月年报+一季报，7-8月半年报（7月预告高发�
 - 若公告中含业绩快报/预告且已覆盖当前分析期→快报数据优先级高于旧季报/年报
 - 扣非净利润增速优先于归母净利润增速——一次性变卖资产/政府补贴带来的账面暴增没有持续性
 
+[财报期次纪律 - 硬性规则]
+- 只参考最近三份财报（collected_data 中最新三个报告期），更早的财报期一律不用
+- 最近一份财报为主要参考：盈利能力、毛利率、现金流质量、增速判断、关键信号，全部以最新报告期为准
+- 较远的两份只用于趋势分析（连续3期走势），禁止引用其绝对数值作为现状描述，更禁止引用三份之前的任何具体数字（如前年的毛利率/净利润）
+- 关键信号中的趋势序列（毛利率/现金流等）必须且只展示最近三期，并逐期标注期次
+- 最新期与更早口径矛盾时，以最新期为准并注明"以最新X期为准"
+
 [景气信号检测]
 分析行业前景时，关注以下信号词对应的事实：
 - 供需端：供不应求/供给偏紧/需求旺盛→产能利用率提升→毛利率扩张
@@ -929,7 +936,7 @@ A股披露节奏：1-4月年报+一季报，7-8月半年报（7月预告高发�
 - 绝对估值: PE/PB/PS在历史分位
 - 相对估值: 与同行业可比公司对比
 - ⚠️ PEG计算约束：计算PEG时使用的增速必须是"可持续增速"（近2-3年复合增速或机构一致预期），严禁用单季暴增数据（如Q1+265%）计算PEG。单季暴增→PEG虚低→估值看起来便宜→误导投资决策。如无法估算可持续增速，请明确标注"可持续增速未知，PEG暂不可用"而非硬套公式。
-- 情景估值: 悲观/基准/乐观三种情景，概率加权计算期望价值。⚠️ 核心约束1：EPS必须与增速自洽——悲观EPS ≤ 基准EPS ≤ 乐观EPS。⚠️ 核心约束2：PE必须随情景动态调整——市场悲观时PE同步压缩，乐观时PE同步扩张。悲观PE=基准PE×0.6~0.8(不低于行业PE中枢)，乐观PE=基准PE×1.1~1.3(不超过基准PE×1.5)。不得三种情景用同一个PE。⚠️ 核心约束3：每个情景必须输出结构化 EPS 和 PE 数值字段，且 价格 = EPS × PE（代码将强制校验算术一致性，不符者按 EPS×PE 重算）；概率合计必须为100%。⚠️ 核心约束4：情景估值中的 EPS 必须基于工具返回的"每股收益"和最新股本推导，禁止自行假设或编造股本；若发现工具股本可能滞后（如公告含送转股、权益分派、除权等），应明确标注"股本数据可能滞后，情景 EPS 仅供参考，建议以券商/交易所实时数据为准"。
+- 情景估值: 悲观/基准/乐观三种情景，概率加权计算期望价值。⚠️ 核心约束0（驱动因子树，分类引擎修正方法支柱四）：情景假设必须写**经营驱动因子**——渗透率、新老客户订单变化（砍单/加单比例）、产能爬坡/扩产节奏、涨价/降价幅度、原材料成本变化——先由经营变量导出 EPS，**再**匹配合理 PE。PE 是经营结果推导后的**因变量**，绝不允许三个情景只改 PE 倍数而 EPS 相同（代码将检测此类"股价外推式伪情景"并整体降级）。⚠️ 核心约束1：EPS必须与增速自洽——悲观EPS ≤ 基准EPS ≤ 乐观EPS。⚠️ 核心约束2：PE必须随情景动态调整——市场悲观时PE同步压缩，乐观时PE同步扩张。悲观PE=基准PE×0.6~0.8(不低于行业PE中枢)，乐观PE=基准PE×1.1~1.3(不超过基准PE×1.5)。不得三种情景用同一个PE。⚠️ 核心约束3：每个情景必须输出结构化 EPS 和 PE 数值字段，且 价格 = EPS × PE（代码将强制校验算术一致性，不符者按 EPS×PE 重算）；概率合计必须为100%。⚠️ 核心约束4：情景估值中的 EPS 必须基于工具返回的"每股收益"和最新股本推导，禁止自行假设或编造股本；若发现工具股本可能滞后（如公告含送转股、权益分派、除权等），应明确标注"股本数据可能滞后，情景 EPS 仅供参考，建议以券商/交易所实时数据为准"。
 
 第9步 催化剂与风险（什么会推动股价）:
 - 未来12个月正面催化剂: 新品/政策/行业复苏/订单/业绩
@@ -1438,6 +1445,12 @@ def valuation_agent_node(state: FinBrainState) -> dict:
 
 LOGIC_CRITIC_PROMPT = """你是投资逻辑审查员。只检查逻辑链是否自洽，不管数据对错。
 
+⚠️ 硬性纪律（违反将导致你的发现被代码拦截丢弃）:
+1. 只许审查给定文本，禁止引入你记忆中的任何外部数据（历史价格、旧财报、旧公告、训练数据中的数字）
+2. 每条发现必须引用原文片段作为证据
+3. 发现中的每个数字都必须能在给定文本中找到出处（±5%取整误差），找不到出处的数字不要写
+4. 没有明确证据时，返回通过
+
 检查:
 1. "因为A→导致B→最终C→市场D→因此E"的每一步是否成立？是否有跳步或循环论证？
 2. 是否存在"必然""确定""唯一"等过度自信措辞？
@@ -1480,6 +1493,12 @@ def _financial_code_check(analysis_text: str) -> list:
 
 FINANCIAL_CRITIC_PROMPT = """你是财务数据审查员。只检查财务解读是否准确，不管投资逻辑。
 
+⚠️ 硬性纪律（违反将导致你的发现被代码拦截丢弃）:
+1. 只许审查给定文本，禁止引入你记忆中的任何外部数据（历史价格、旧财报、旧公告、训练数据中的数字）
+2. 每条发现必须引用原文片段作为证据
+3. 发现中的每个数字都必须能在给定文本中找到出处（±5%取整误差），找不到出处的数字不要写
+4. 没有明确证据时，返回通过
+
 系统已自动完成以下数值验证（你不需要再检查这些）:
 {code_findings}
 
@@ -1492,6 +1511,12 @@ FINANCIAL_CRITIC_PROMPT = """你是财务数据审查员。只检查财务解读
 如果没有问题，返回 {"通过": true, "财务误读": [], "建议": ""}"""
 
 INDUSTRY_CRITIC_PROMPT = """你是行业事实审查员。只检查行业相关的陈述是否准确。
+
+⚠️ 硬性纪律（违反将导致你的发现被代码拦截丢弃）:
+1. 只许审查给定文本，禁止引入你记忆中的任何外部数据（历史价格、旧财报、旧公告、训练数据中的数字）
+2. 每条发现必须引用原文片段作为证据
+3. 发现中的每个数字都必须能在给定文本中找到出处（±5%取整误差），找不到出处的数字不要写
+4. 没有明确证据时，返回通过
 
 检查:
 1. 竞争格局描述是否准确？"唯一""绝对领先"等表述是否有竞争对手可以反驳？
@@ -1509,6 +1534,11 @@ REPAIR_PROMPT = """你是报告修正专员。你会收到一份投资分析JSON
 2. 只修改分析JSON中被Critic标记为有问题的字段
 3. 不改变Critic未涉及的字段
 4. 修正：过度自信措辞→改为客观表述；数据误读→修正归因；遗漏风险→补充风险条目；竞争描述→修正不实表述
+
+⚠️ 硬性纪律（违反将导致你的修正被代码整体作废）:
+1. 禁止新增原始JSON中不存在的任何数字/事实（日期、价格、财务数据、百分比、股数）——数值一律保持原值，数值修正由代码层统一负责
+2. 禁止引入你记忆中的过时数据（旧价格、旧财报、旧公告）
+3. 你只能：删除问题表述、改写措辞、按Critic意见调整定性描述
 
 输出: 修正后的完整JSON（保持原结构，只改问题字段）"""
 
@@ -1540,11 +1570,11 @@ def _call_critic(prompt_template, analysis_text):
     except Exception:
         return {"通过": True, "逻辑漏洞": [], "财务误读": [], "行业误述": [], "建议": ""}
 
-    # 合并代码层发现的数值问题
+    # 合并代码层发现的数值问题（代码生成=可信来源，单独携带，绕过幻觉过滤）
     if "{code_findings}" in prompt_template and code_issues:
         for issue in code_issues:
             if issue not in result.get("财务误读", []):
-                result.setdefault("财务误读", []).append(issue)
+                result.setdefault("_code_issues", []).append(issue)
     return result
 
 
@@ -1572,15 +1602,32 @@ def critics_node(state: FinBrainState) -> dict:
                 if item and item not in all_issues:
                     all_issues.append(item)
 
+    # 幻觉拦截（Critic grounding 校验）：发现中的硬数字必须在 原文+采集数据 中
+    # 有出处（±5% 取整容差），无出处即判疑似幻觉/过时数据，丢弃并记录
+    metadata = state.get("metadata", {}) or {}
+    _dropped = []
+    try:
+        from backend.consistency import filter_untraceable_issues as _fui
+        _source = raw + "\n" + (state.get("collected_data", "") or "")
+        all_issues, _dropped = _fui(all_issues, _source)
+    except Exception:
+        pass
+    # 代码层数值发现（FCF/PE-ROE，可信来源）直接入列，不参与过滤
+    for item in results.get("Financial", {}).get("_code_issues", []):
+        if item and item not in all_issues:
+            all_issues.append(item)
+    metadata["critic_dropped"] = _dropped
+
     # 构建结构化修复清单
     fix_list = []
     for item in all_issues:
         fix_list.append({"issue": item, "must_fix": True})
 
     # 把标记信息放在 metadata 中，而不是 analysis 字符串中（根源性解决 JSON 污染问题）
-    metadata = state.get("metadata", {}) or {}
     metadata["critic_fixes"] = fix_list
     metadata["critic_summary"] = " | ".join(f"{name}:{sum(len(r.get(k, [])) for k in ['逻辑漏洞', '财务误读', '行业误述'])}个问题" for name, r in results.items())
+    if _dropped:
+        metadata["critic_summary"] += f" | 幻觉拦截{len(_dropped)}条"
 
     prev_log = state.get("processing_log", [])
     prev_log.append({"phase": "Critics", "summary": "三路审查完成",
@@ -1644,6 +1691,21 @@ def repair_node(state: FinBrainState) -> dict:
                 repaired = json.dumps(repair_resp, ensure_ascii=False) if isinstance(repair_resp, dict) else str(repair_resp)
     except Exception:
         repaired = raw
+
+    # Repair 输出校验：引入任何 原始JSON+采集数据 中不存在的新硬数字（过时/编造数据）
+    # → 整体作废回退原文（数值修正由代码层负责，Repair 只允许改定性表述）
+    if repaired != raw:
+        try:
+            from backend.consistency import has_new_hard_numbers as _hnh
+            _pool = raw + "\n" + (state.get("collected_data", "") or "")
+            _new_nums = _hnh(_pool, repaired)
+            if _new_nums:
+                metadata["repair_rejected"] = (
+                    f"Repair引入{len(_new_nums)}个无出处数字"
+                    f"({', '.join(f'{v}{u}' for v, u in _new_nums[:3])})，已作废回退原文")
+                repaired = raw
+        except Exception:
+            pass
 
     # 把修复信息放在 metadata 中，而不是 analysis 字符串中（根源性解决 JSON 污染问题）
     metadata["repair_count"] = len(fix_list)
@@ -1780,6 +1842,73 @@ REPORTER_PROMPT = """你是 FinBrain 报告格式化专员。
 6. [分析师关键判断传递] 分析JSON中如果标记了以下信号，结论段必须复述：①扣非增速远低于归母→标注"非经常性损益驱动，主业增长存疑"；②经营现金流长期<净利润→标注"利润含金量不足"；③短期涨幅>50%而基本面微利→标注"估值已透支，炒作风险高"；④财报季时效→提到最新业绩窗口期对估值的影响。这些判断来自上下游Agent的协同分析，不得遗漏。"""
 
 
+def _build_gap_explanation(item: dict, stock_price: float) -> list:
+    """估值差距极大（合理价值远低于现价）时，用数据解释"为什么差这么多"。
+
+    全部数字取自 item 已有的代码计算结果（估值水位/事件/次新股包/calc表/评分），
+    不发明新数字。返回文本行列表（供投资决策段渲染）。"""
+    lines = []
+    try:
+        vw = item.get("估值水位", {})
+        pe_ttm = None
+        try:
+            pe_ttm = float(str(vw.get("PE", "0")).replace("倍", "") or 0)
+        except (ValueError, TypeError):
+            pass
+        ind_pe = 0.0
+        try:
+            ind_pe = float(item.get("投资评级", {}).get("估值明细", {}).get("行业PE中枢", 0) or 0)
+        except Exception:
+            pass
+        if pe_ttm and ind_pe > 0:
+            lines.append(f"PE(TTM) {pe_ttm:.0f}倍 vs 行业中枢 {ind_pe:g}倍：估值乘数溢价 {pe_ttm/ind_pe:.1f} 倍")
+        # IPO 情绪溢价
+        for e in (item.get("_events") or []):
+            if isinstance(e, dict) and e.get("类型") == "IPO":
+                _ip = (e.get("参数") or {}).get("发行价(元)")
+                if _ip and stock_price > 0:
+                    lines.append(f"现价较发行价 {_ip:.2f} 元上涨 {(stock_price/_ip-1)*100:.0f}%：新股情绪溢价主导")
+                break
+        # 流通盘
+        _fr = (item.get("_nl_pack") or {}).get("float_ratio")
+        if _fr and _fr < 0.3:
+            lines.append(f"流通盘仅 {_fr*100:.2f}%：筹码稀缺，价格发现不充分，波动极端")
+        # 隐含增速 vs 实际轨迹
+        _calc = item.get("_calc")
+        _cagr = _calc.get("隐含增速").value if (_calc and _calc.get("隐含增速")) else None
+        if _cagr:
+            _gb = str(item.get("评分", {}).get("成长性", {}).get("依据", ""))[:50]
+            lines.append(f"市场隐含年复合增速≈{_cagr:.0f}%，公司实际轨迹（{_gb}）差距悬殊")
+        lines.append("背离本质：合理价值=盈利×行业乘数（基本面锚），当前价=情绪×稀缺筹码（资金锚），"
+                     "泡沫消化前价格可能长期偏离价值锚")
+    except Exception:
+        pass
+    return lines
+
+
+def _trend_buy_price(hist_bars: list, stock_price: float) -> float:
+    """趋势参考买入价 = 近期显著支撑位（区间最低价）×1.05 缓冲。
+
+    无K线数据，或支撑价与现价差距<10%（无趋势折扣意义）时返回 None。"""
+    try:
+        lows = []
+        for b in (hist_bars or []):
+            try:
+                v = float(b.get("low", 0) or 0)
+                if v > 0:
+                    lows.append(v)
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if not lows:
+            return None
+        t = round(min(lows) * 1.05, 2)
+        if stock_price > 0 and t >= stock_price * 0.9:
+            return None
+        return t
+    except Exception:
+        return None
+
+
 def _validate_scenarios(item: dict):
     """情景估值代码级校验：价格=EPS×PE 算术校验（容差15%，不符则重算）、
     情景价格单调性（悲观≤基准≤乐观）、概率合计=100%、概率加权价值代码重算。
@@ -1817,7 +1946,28 @@ def _validate_scenarios(item: dict):
     except (TypeError, ValueError):
         eps_ttm = None
     _EPS_BAND = {"悲观": (0.3, 1.0), "基准": (0.5, 1.3), "乐观": (0.7, 2.0)}
-    prices, probs = {}, {}
+    # 情景 PE 行业中枢锚定带（可信度锚定）：LLM 的 PE 判断保留但不出圈——
+    # 基准 [0.8×, 1.5×] 行业中枢；悲观 [max(0.6×基准, 0.5×中枢), 0.8×基准]；
+    # 乐观 [1.1×基准, min(1.3×基准, 1.5×中枢)]。跨轮方差从 ±4x 收敛到带内。
+    _pe_bands = None
+    try:
+        _ind_pe0 = float(item.get("投资评级", {}).get("估值明细", {}).get("行业PE中枢", 0) or 0)
+    except Exception:
+        _ind_pe0 = 0.0
+    if _ind_pe0 > 0:
+        _base_pe_now = _num((sc.get("基准") or {}).get("PE")) or 0
+        _base_clamped = (min(max(_base_pe_now, 0.8 * _ind_pe0), 1.5 * _ind_pe0)
+                         if _base_pe_now > 0 else _ind_pe0)
+        _plo_o = 1.1 * _base_clamped
+        _phi_o = 1.5 * _ind_pe0          # 硬顶：任何情景 PE 不超过 1.5× 行业中枢
+        if _plo_o > _phi_o:
+            _plo_o = _phi_o              # 基准触顶时乐观收敛到同一硬顶
+        _pe_bands = {
+            "悲观": (max(0.6 * _base_clamped, 0.5 * _ind_pe0), 0.8 * _base_clamped),
+            "基准": (0.8 * _ind_pe0, 1.5 * _ind_pe0),
+            "乐观": (_plo_o, _phi_o),
+        }
+    prices, probs, eps_map = {}, {}, {}
     for s in ["悲观", "基准", "乐观"]:
         si = sc.get(s, {})
         if not isinstance(si, dict):
@@ -1835,6 +1985,16 @@ def _validate_scenarios(item: dict):
                 check["arith_ok"] = False
                 si["EPS"] = _clamped
                 eps = _clamped
+        # 情景 PE 行业中枢锚定带（钳制后价格随算术校验重算）
+        if pe is not None and _pe_bands and s in _pe_bands:
+            _plo, _phi = _pe_bands[s]
+            if pe < _plo or pe > _phi:
+                _pe_c = round(min(max(pe, _plo), _phi), 1)
+                check["notes"].append(
+                    f"{s}情景PE {pe}超出行业中枢锚定带[{_plo:.1f},{_phi:.1f}]，已钳制为{_pe_c}")
+                check["arith_ok"] = False
+                si["PE"] = _pe_c
+                pe = _pe_c
         # 算术校验：价格 ≈ EPS × PE
         if eps is not None and pe is not None and eps > 0 and pe > 0:
             expect = round(eps * pe, 2)
@@ -1846,15 +2006,46 @@ def _validate_scenarios(item: dict):
                 price = expect
         if price is not None:
             prices[s] = price
+        if eps is not None:
+            eps_map[s] = eps
         m = re.search(r'([\d.]+)', str(si.get("概率", "")))
         if m:
             probs[s] = float(m.group(1)) / 100
+
+    # 支柱四：PE 自变量检测——三情景 EPS 两两相等、仅 PE 不同 = 股价外推式伪情景
+    # （没触及商业本质），按 TTM 带整体重建（与兜底生成器同参数）
+    if len(eps_map) == 3 and eps_map.get("悲观") == eps_map.get("基准") == eps_map.get("乐观"):
+        check["notes"].append(
+            f"三情景EPS相同({eps_map['悲观']})仅PE不同，属股价外推式伪情景（支柱四），已按TTM带重建")
+        check["arith_ok"] = False
+        _e0 = eps_ttm if eps_ttm else eps_map.get("基准")
+        _sp = 0.0
+        try:
+            _sp = float(item.get("投资评级", {}).get("当前价格", 0) or 0)
+        except Exception:
+            pass
+        _pe_now = _sp / _e0 if (_e0 and _sp > 0) else 0
+        if _e0 and _pe_now > 0:
+            _pess_eps = round(_e0 * 0.85, 2)
+            _pess_pe = round(max(_pe_now * 0.6, 10), 1)
+            _base_eps = round(_e0, 2)
+            _base_pe = round(_pe_now, 1)
+            _opt_eps = round(_e0 * 1.15, 2)
+            _opt_pe = round(min(_pe_now * 1.2, _pe_now + 15), 1)
+            sc["悲观"] = {"价格": round(_pess_eps * _pess_pe, 2), "EPS": _pess_eps, "PE": _pess_pe,
+                         "假设": "经营恶化：订单下滑+毛利率承压（代码重建）", "概率": "20%"}
+            sc["基准"] = {"价格": round(_base_eps * _base_pe, 2), "EPS": _base_eps, "PE": _base_pe,
+                         "假设": "经营延续：现有订单与毛利水平维持（代码重建）", "概率": "60%"}
+            sc["乐观"] = {"价格": round(_opt_eps * _opt_pe, 2), "EPS": _opt_eps, "PE": _opt_pe,
+                         "假设": "经营改善：新订单放量+产能爬坡（代码重建）", "概率": "20%"}
+            prices = {s: sc[s]["价格"] for s in ["悲观", "基准", "乐观"]}
+            probs = {"悲观": 0.2, "基准": 0.6, "乐观": 0.2}
+
     # 单调性：悲观价 ≤ 基准价 ≤ 乐观价
     if len(prices) == 3 and not (prices["悲观"] <= prices["基准"] <= prices["乐观"]):
         check["monotonic_ok"] = False
         check["notes"].append(
-            f"情景价格倒挂: 悲观{prices['悲观']}/基准{prices['基准']}/乐观{prices['乐观']}")
-    # 概率合计 + 概率加权价值代码重算（不信任LLM的算术）
+            f"情景价格倒挂: 悲观{prices['悲观']}/基准{prices['基准']}/乐观{prices['乐观']}")    # 概率合计 + 概率加权价值代码重算（不信任LLM的算术）
     if len(probs) == 3 and len(prices) == 3:
         psum = sum(probs.values())
         if abs(psum - 1.0) > 0.05:
@@ -2015,7 +2206,20 @@ def reporter_node(state: FinBrainState) -> dict:
                             data_periods.add(f"{d} [{p}]" if p else d)
             except Exception:
                 pass
-    period_note = "、".join(sorted(data_periods, reverse=True)[:8]) if data_periods else "未知"
+    # 财报期次纪律：报告期不写死——按系统时间+披露节奏动态推算最近三期，
+    # 并标注实际数据是否覆盖（未覆盖说明免费源滞后，提示以实时数据为准）
+    try:
+        from backend.tools import expected_recent_periods as _erp
+        _expected = _erp(count=3)
+        _have = set(d.split(" ")[0] for d in data_periods)
+        _parts = []
+        for _d, _lbl in _expected:
+            _mark = "" if _d in _have else "⚠️未覆盖"
+            _parts.append(f"{_d} [{_lbl}]{_mark}")
+        period_note = "、".join(_parts) if _parts else (
+            "、".join(sorted(data_periods, reverse=True)[:8]) if data_periods else "未知")
+    except Exception:
+        period_note = "、".join(sorted(data_periods, reverse=True)[:8]) if data_periods else "未知"
 
     # 解析JSON — 用 raw_decode 避免嵌套数组/对象的 regex 误匹配
     raw_stripped = raw.strip()
@@ -2033,11 +2237,16 @@ def reporter_node(state: FinBrainState) -> dict:
             except json.JSONDecodeError:
                 pass
 
-    # 方案0.5: ast.literal_eval 解析 Python 单引号格式
+    # 方案0.5: ast.literal_eval 解析 Python 单引号格式（先剥 ```json/python 围栏）
+    # （实测：LLM 会把 Python repr 单引号 dict 塞进 ```json 围栏，双重格式叠加）
     if data is None:
         try:
             import ast
-            data = ast.literal_eval(raw_stripped)
+            _ast_text = raw_stripped
+            _fm = re.search(r'```(?:json|python)?\s*([\s\S]*?)```', _ast_text)
+            if _fm:
+                _ast_text = _fm.group(1).strip()
+            data = ast.literal_eval(_ast_text)
         except (ValueError, SyntaxError):
             pass
 
@@ -2352,6 +2561,63 @@ def reporter_node(state: FinBrainState) -> dict:
                 else: ctype = "成长型"
 
             llm_scores = item.get("评分", {}) if isinstance(item, dict) else {}
+
+            # === 支柱三：估值锚定匹配矩阵（三硬核指标齐全时替换 quality×growth 路径） ===
+            _matrix_mult, _matrix_note = 0.0, ""
+            try:
+                from backend.scoring import indicator_pe_matrix as _ipm
+                # 收入增速（最新年报同比）
+                _ann_rows = [p for p in profit_data if p.get("报告期") == "年报"]
+                _rev_g = None
+                if len(_ann_rows) >= 2:
+                    _r0 = float(_ann_rows[0].get("营业总收入") or 0)
+                    _r1 = float(_ann_rows[1].get("营业总收入") or 0)
+                    if _r1 > 0:
+                        _rev_g = (_r0 / _r1 - 1) * 100
+                # 毛利率趋势（年报同比，pp）
+                _gm_pp = None
+                if len(annuals) >= 2:
+                    _g0 = annuals[0].get("毛利率(%)")
+                    _g1 = annuals[1].get("毛利率(%)")
+                    if _g0 is not None and _g1 is not None:
+                        _gm_pp = float(_g0) - float(_g1)
+                # CAPEX/CFO（最新年报）
+                _cx = None
+                _cf_rows = [c for c in (cs_data.get("cashflow") or []) if c.get("报告期") == "年报"]
+                if _cf_rows:
+                    _cfo_a = float(_cf_rows[0].get("经营现金流净额") or 0)
+                    _capex_a = float(_cf_rows[0].get("购建固定资产支付现金") or 0)
+                    if _cfo_a > 0 and _capex_a > 0:
+                        _cx = _capex_a / _cfo_a
+                if _rev_g is not None and _gm_pp is not None and _cx is not None:
+                    _band, _matrix_mult, _rd = _ipm(_rev_g, _gm_pp, _cx)
+                    _matrix_note = (f"乘数矩阵[{_band}×{_matrix_mult}]: 增速{_rev_g:.0f}%({_rd['增速档']}) | "
+                                    f"毛利率{_gm_pp:+.1f}pp({_rd['毛利率趋势档']}) | "
+                                    f"CAPEX/CFO{_cx:.2f}({_rd['资本开支档']})")
+                else:
+                    item.setdefault("_pairing_notes", []).append(
+                        f"乘数矩阵指标不全(增速/毛利率趋势/CAPEX-CFO)，回退 quality×growth 路径")
+                # 支柱五断路器输入：营收增速 / 年报经营现金流 / ROIC proxy / 周期属性
+                item["_rev_growth"] = _rev_g
+                if _cf_rows:
+                    item["_cfo_annual"] = float(_cf_rows[0].get("经营现金流净额") or 0)
+                try:
+                    _bal0 = (cs_data.get("balance") or [{}])[0]
+                    _eq2 = float(_bal0.get("股东权益", 0) or 0)
+                    _cash2 = float(_bal0.get("货币资金", 0) or 0)
+                    _ib2 = sum(float(_bal0.get(k, 0) or 0)
+                               for k in ("短期借款", "长期借款", "应付债券", "一年内到期的非流动负债"))
+                    _ic2 = _eq2 + _ib2 - _cash2
+                    if ttm_net > 0 and _ic2 > 0:
+                        item["_roic_proxy"] = ttm_net / _ic2
+                except Exception:
+                    pass
+                _cw = (state.get("metadata") or {}).get("company_weights", {})
+                if isinstance(_cw, dict) and _cw.get("cyclical") is not None:
+                    item["_cyclical"] = _cw.get("cyclical")
+            except Exception:
+                _matrix_mult, _matrix_note = 0.0, ""
+
             decision = compute_investment_rating(
                 company_type=ctype,
                 financial_scores={
@@ -2368,6 +2634,7 @@ def reporter_node(state: FinBrainState) -> dict:
                 roe=roe, debt=debt,
                 bps=float(latest_val.get("每股净资产", 0) or 0),
                 bps_adjusted=_share_ctx.bps_adjusted or 0.0,  # FIX-02：IPO/定增后口径
+                matrix_mult=_matrix_mult, matrix_note=_matrix_note,  # 支柱三
             )
             # 覆盖LLM——代码说了算
             # 估值水位强制覆盖（PE/PB/市值/前瞻PE — 代码统一，消除LLM矛盾）
@@ -2455,6 +2722,8 @@ def reporter_node(state: FinBrainState) -> dict:
                 _diffs = _xval({"PE": code_pe, "PB": code_pb, "市值": mktcap}, _rt, tol=0.02)
                 if _diffs:
                     item["_xval_diffs"] = _diffs
+                    # 幂等：审计重试会重跑本函数，先清除上轮注入的同类告警防重复
+                    item["校验"] = [c for c in item.get("校验", []) if "跨源比对" not in str(c)]
                     item.setdefault("校验", []).extend(
                         [f"[数据质量⚠️] 跨源比对: {d}（可能存在股本滞后/送转除权延迟）" for d in _diffs])
             except Exception:
@@ -2828,6 +3097,37 @@ def reporter_node(state: FinBrainState) -> dict:
                 except Exception:
                     pass  # 兜底生成失败不影响流程
 
+            # === 情景估值逐情景补全：部分情景缺失/缺结构化字段时按模板补齐 ===
+            # （实测：LLM 驱动因子长文挤压结构化输出——基准缺 EPS/PE、乐观整段缺失。
+            #  全空兜底不触发 → 加权价值无法计算 → 双锚点失效、合理价值裸退 PE 乘数法）
+            try:
+                _sc2 = item.get("情景估值")
+                if isinstance(_sc2, dict):
+                    _eps0 = eps_ttm if eps_ttm > 0 else (float(latest_val.get("每股收益", 0) or 0))
+                    _pe0 = stock_price / _eps0 if _eps0 > 0 and stock_price > 0 else 0
+                    if _eps0 > 0 and _pe0 > 0:
+                        _tmpl = {
+                            "悲观": {"EPS": round(_eps0 * 0.85, 2), "PE": round(max(_pe0 * 0.6, 10), 1),
+                                     "概率": "20%", "假设": "利润下滑+估值压缩（代码补全）"},
+                            "基准": {"EPS": round(_eps0, 2), "PE": round(_pe0, 1),
+                                     "概率": "60%", "假设": "当前增速延续（代码补全）"},
+                            "乐观": {"EPS": round(_eps0 * 1.15, 2), "PE": round(min(_pe0 * 1.2, _pe0 + 15), 1),
+                                     "概率": "20%", "假设": "超预期增长+估值扩张（代码补全）"},
+                        }
+                        for _s, _t in _tmpl.items():
+                            _si = _sc2.get(_s)
+                            if not isinstance(_si, dict):
+                                _si = _sc2[_s] = dict(_t)
+                                _si["_补全"] = True
+                            else:
+                                for _k, _v in _t.items():
+                                    if _si.get(_k) is None:
+                                        _si[_k] = _v
+                                        _si["_补全"] = True
+                        # 缺价格/PE超带等由下游 _validate_scenarios 重算钳制
+            except Exception:
+                pass
+
             # === 情景估值代码级校验（无论是否定增都执行）===
             _validate_scenarios(item)
 
@@ -2939,7 +3239,103 @@ def reporter_node(state: FinBrainState) -> dict:
             except Exception:
                 pass  # 次新股包/预告联动失败不阻塞报告
 
+            # === 支柱一/二：利润引擎解剖 + SOTP 拆分检测（分类引擎修正方法） ===
+            # 口径：板块净利润不可得，毛利额占比 ≈ 利润引擎占比（最优近似）
+            try:
+                from backend.tools import get_business_segments as _gbs
+                from backend.profit_engines import (
+                    classify_engines as _ce, sotp_triggers as _st,
+                    engine_anchor as _ea, sotp_fair_value as _sfv)
+                _seg_data = _gbs(sym)
+                if isinstance(_seg_data, dict) and _seg_data.get("segments"):
+                    _engines = _ce(_seg_data["segments"], _seg_data.get("前期"))
+                    _triggers = _st(_seg_data["segments"], _seg_data.get("前期"))
+                    _anchor = _ea(_engines)
+                    item["_engines"] = {
+                        "报告期": _seg_data.get("报告期"),
+                        "板块": [{"名称": e.name, "收入占比": e.rev_pct, "毛利占比": e.gp_pct,
+                                 "毛利率": e.gross_margin, "收入同比": e.rev_growth,
+                                 "类型": e.engine_type, "备注": e.note} for e in _engines],
+                        "SOTP触发": _triggers,
+                        "锚定引擎": _anchor.name if _anchor else None,
+                    }
+                    if _anchor:
+                        _vm = item.get("估值方法", "")
+                        if isinstance(_vm, str):
+                            item["估值方法"] = (
+                                f"【利润引擎】单一引擎「{_anchor.name}」毛利占比"
+                                f"{_anchor.gp_pct*100:.0f}%>40%，估值锚向其倾斜（{_anchor.engine_type}）。"
+                                + _vm)
+                    if _triggers:
+                        # 幂等：审计重试会重跑本函数，先清除上轮注入的 SOTP 条目防重复
+                        item["校验"] = [c for c in item.get("校验", []) if "SOTP" not in str(c)]
+                        for _t in _triggers:
+                            item.setdefault("校验", []).append(f"[校验⚠️] SOTP强制隔离阀: {_t}")
+                        # SOTP 参考估值（毛利占比分配净利近似，仅作对照不替换主估值）
+                        _ind_pe_base = 0.0
+                        try:
+                            _ind_pe_base = float(decision.get("估值明细", {}).get("行业PE中枢", 0) or 0)
+                        except Exception:
+                            pass
+                        _sotp_total, _sotp_detail = _sfv(_engines, ttm_net, _ind_pe_base)
+                        if _sotp_total > 0 and total_shares > 0:
+                            item["_engines"]["SOTP参考估值"] = round(_sotp_total / total_shares, 2)
+                            item["_engines"]["SOTP明细"] = _sotp_detail
+                            item.setdefault("校验", []).append(
+                                f"[校验⚠️] SOTP参考估值 {item['_engines']['SOTP参考估值']}元/股"
+                                f"（毛利占比分配净利近似）vs 合理价值 {decision.get('合理价值')}元")
+            except Exception:
+                pass  # 利润引擎解剖失败不阻塞报告
+
+            # === 三锚点合理区间（可信度呈现）：PE乘数法 / 情景加权 / SOTP 并列 ===
+            # 单点合理价值跨轮方差大，区间+出处比单点更可信
+            try:
+                _anchors = {}
+                _r3 = item.get("投资评级", {})
+                if isinstance(_r3, dict):
+                    _fv_pe = _r3.get("合理价值(PE乘数法)")
+                    if isinstance(_fv_pe, (int, float)) and _fv_pe > 0:
+                        _anchors["PE乘数法"] = float(_fv_pe)
+                    else:
+                        _fv_cur = _r3.get("合理价值")
+                        if isinstance(_fv_cur, (int, float)) and _fv_cur > 0:
+                            _anchors["PE乘数法"] = float(_fv_cur)
+                _wv = item.get("情景估值", {}).get("概率加权价值")
+                if isinstance(_wv, (int, float)) and _wv > 0:
+                    _anchors["情景加权"] = float(_wv)
+                _sv = item.get("_engines", {}).get("SOTP参考估值")
+                if isinstance(_sv, (int, float)) and _sv > 0:
+                    _anchors["SOTP"] = float(_sv)
+                if len(_anchors) >= 2 and isinstance(_r3, dict):
+                    _lo, _hi = round(min(_anchors.values()), 2), round(max(_anchors.values()), 2)
+                    _detail = " / ".join(f"{k}{v:.2f}" for k, v in _anchors.items())
+                    _r3["合理区间"] = f"{_lo}~{_hi}元（{_detail}）"
+            except Exception:
+                pass
+
+            # === 估值差距解读 + 趋势参考买入价（合理价值仅为现价零头时启用） ===
+            # 读者对"-80%差距"天然不信任：用数据解释背离成因，并给出趋势框架的
+            # 可执行入场锚（近期技术支撑×1.05），与价值锚（安全买入价）并列呈现
+            try:
+                _r4 = item.get("投资评级", {})
+                _fv4 = float(_r4.get("合理价值", 0) or 0) if isinstance(_r4, dict) else 0
+                if _fv4 > 0 and stock_price > 0 and _fv4 / stock_price <= 0.5:
+                    _expl = _build_gap_explanation(item, stock_price)
+                    if _expl:
+                        item["估值差距解读"] = _expl
+                    from backend.tools import fetch_stock_history as _fsh
+                    _hist = _fsh(sym, scale=240, datalen=20)
+                    _tb = _trend_buy_price((_hist or {}).get("data", []), stock_price)
+                    if _tb:
+                        item["趋势参考买入价"] = _tb
+            except Exception:
+                pass
+
             # === 价格状态机：根据当前价vs买入价自动判定执行策略 ===
+            # 幂等：审计重试会重跑本函数，先清除上轮生成的分歧/状态段落，
+            # 防止本轮条件不触发时残留上一轮的过期数值（方案A合理价值/买入价）
+            item.pop("框架分歧", None)
+            item.pop("执行状态", None)
             try:
                 r3 = item.get("投资评级", {}) if isinstance(item, dict) else {}
                 sp = float(r3.get("当前价格", stock_price)) if isinstance(r3, dict) and r3.get("当前价格") else stock_price
@@ -3519,16 +3915,17 @@ def reporter_node(state: FinBrainState) -> dict:
                     audit_report += fallback
                     break
 
-                # 第二级：定向外科手术——只改写被标记段落
-                fix_instructions = "; ".join([i.get("修正建议", "") for i in critical])
-                fix_prompt = (f"以下报告存在数据矛盾:\n{fix_instructions}\n"
-                              f"请只修改投资决策和结论段，使数字与风险描述一致。输出全文。")
-                fix_resp = _get_llm().invoke([
-                    SystemMessage(content=REPORTER_PROMPT),
-                    HumanMessage(content=f"{audit_report[:2000]}\n\n{fix_prompt}"),
-                ])
-                audit_report = fix_resp.content
-                retry_count += 1
+                # 第二级：严重问题逐条显著标注（替代原 LLM 全文改写）。
+                # 原"定向外科手术"让 LLM 输出全文并整体替换 audit_report——实测会丢失
+                # 评分卡/情景估值等全部代码渲染段落并引入新幻觉，属以毒攻毒。
+                # 代码渲染的报告全文一律保留，严重问题以 [审计⚠️] ❌ 逐条标注，交人工判断。
+                for c in critical:
+                    desc = c.get("描述", "")
+                    fix = c.get("修正建议", "")
+                    audit_report += f"\n[审计⚠️] ❌ {desc}" + (f" (建议: {fix})" if fix else "")
+                audit_report += ("\n⚠️ 系统提示：审计发现的严重一致性问题已逐条标注，"
+                                 "各段落数字以代码计算值为准，建议人工复核。")
+                break
             elif warnings:
                 # 第一级：轻微问题→追加审计标注
                 for w in warnings:
@@ -3655,9 +4052,9 @@ def reporter_node(state: FinBrainState) -> dict:
         if _inv_hit:
             _audit_rows.append(("一致性守卫", "⚠️", "存在一致性违例，见预检/审计"))
         elif _disabled:
-            _audit_rows.append(("一致性守卫", "✅", f"6条不变量通过；已禁用指标: {','.join(_disabled)}（全文零引用）"))
+            _audit_rows.append(("一致性守卫", "✅", f"10条不变量通过；已禁用指标: {','.join(_disabled)}（全文零引用）"))
         else:
-            _audit_rows.append(("一致性守卫", "✅", "6条不变量通过"))
+            _audit_rows.append(("一致性守卫", "✅", "10条不变量通过"))
 
         # 12. 跨源比对（FIX-12：F10口径 vs 实时行情口径）
         if _it.get("_xval_diffs"):
@@ -3672,13 +4069,17 @@ def reporter_node(state: FinBrainState) -> dict:
     for row in _audit_rows[:24]:  # 最多2只股票×12项
         _audit_table += f"  | {row[0]} | {row[1]} | {row[2]} |\n"
     _audit_table += f"  * 审计重试: {retry_count}次 | 代码预检: {'通过' if _skip_auditor else '发现问题'}\n"
-    _audit_table += ("  * 已检查: 事件分类/口径配对/摊薄幂等/数字回溯/情景算术/一致性不变量×6/"
+    _audit_table += ("  * 已检查: 事件分类/口径配对/摊薄幂等/数字回溯/情景算术/一致性不变量×10/"
                      "禁用指标/跨源比对/单位/时效性/评分合计\n"
-                     "  * 未覆盖: 管理层叙事真实性/行业前景判断/公告完整性(免费源)/日内行情漂移"
+                     "  * 未覆盖: 管理层叙事真实性/行业前景判断/公告完整性(免费源)/日内行情漂移/"
+                     "回购增持数据(免费源缺失)"
                      "——以上类别依赖人工复核，本表不声称已验证\n")
     # Critic审查摘要追加到审计区域（不污染报告头部）
     if _critic_summary:
         _audit_table += f"  * Critic审查: {_critic_summary}\n"
+    _repair_rejected = metadata.get("repair_rejected", "")
+    if _repair_rejected:
+        _audit_table += f"  * Repair拦截: {_repair_rejected}\n"
 
     audit_report += "\n" + _audit_table
     if _evidence_text:
@@ -3889,15 +4290,14 @@ def ask(question: str, history: list = None) -> str:
 COMMENTATOR_PROMPT = """你是同花顺社区的资深股评作者，混迹股市十几年。你的任务是把 FinBrain 投资报告转写为一篇适合在同花顺社区发布的股评帖。
 
 写作规范：
-1. 所有数据必须严格来自输入报告，不得编造任何数字或事实
+1. 所有数据必须严格来自输入报告，不得编造任何数字或事实；禁止使用你记忆中的任何数据（历史价格、旧财报、旧公告、行业均值）。每个数字都必须能在报告中逐字找到（±5%取整误差），禁止自行推算/约算产生新数字——代码将逐句校验，含无出处数字的句子会被整句删除
 2. 纯自然语言，禁止 markdown（无 **、无 #、无 - 列表、无表格）
 3. 禁止 emoji
 4. 核心原则：每个观点必须有报告中的具体数字支撑。说毛利率下降就带上"从X%降到Y%"；说增速放缓就带上"Q1仅+6%"。不允许"毛利承压""增速放缓"这类无数字的模糊表述。
 5. 结构：股票名+核心判断 → 关键财务分析（带数字）→ 真假增长判别（扣非vs归母、现金流验证）→ 亮点与风险对举（各带数字）→ 估值透支检查（股价涨幅vs基本面改善）→ 市场预期差 → 操作思路
 6. 若报告显示扣非增速远低于归母→必须在股评中点明"非经常性损益驱动，主业增长存疑"。若短期涨幅>50%而基本面微利→必须标注"炒作风险"。
-6. 篇幅 1200-1400 字，每个论点带数字，不写无数据支撑的空洞感慨
-7. 语气客观理性，不喊口号（"必涨""爆赚"），不推荐具体买卖
-8. 文末附免责："以上分析基于公开财务数据，不构成投资建议，股市有风险，投资需谨慎。"
+6. 篇幅 400到500 字，每个论点带数字，不写无数据支撑的空洞感慨
+7. 文末附免责："以上分析基于公开财务数据，不构成投资建议，股市有风险，投资需谨慎。"
 
 风格要求：
 - 全文自然点缀 3-5 个炒股黑话（如上车、吃肉、站岗、磨底、起飞），让文章有茶馆聊天的亲切感，但不要堆砌
@@ -3946,7 +4346,39 @@ def generate_commentary(report_text: str) -> str:
         SystemMessage(content=COMMENTATOR_PROMPT),
         HumanMessage(content=f"请将以下投资报告转写为同花顺社区股评：\n\n{core}{slang_hints}"),
     ])
-    return response.content
+    text = response.content
+
+    # === 股评幻觉拦截（数字必须可溯源到报告原文，用户实测反馈修复）===
+    # 防线1：提取股评全部硬数字，与报告原文比对（±5%），发现无出处数字
+    # 防线2：带违规清单让 LLM 重写一次
+    # 防线3：重写仍不合格 → 句子级清洗（含无出处数字的句子整句剔除，确定性兜底）
+    try:
+        from backend.consistency import (
+            has_new_hard_numbers as _hnh, strip_untraceable_sentences as _strip)
+        bad = _hnh(core, text)
+        if bad:
+            _bad_str = "、".join(f"{v}{u}" for v, u in bad[:8])
+            retry = llm.invoke([
+                SystemMessage(content=COMMENTATOR_PROMPT),
+                HumanMessage(content=(
+                    f"请将以下投资报告转写为同花顺社区股评：\n\n{core}{slang_hints}\n\n"
+                    f"⚠️ 上一稿引入了报告中不存在的数字：{_bad_str}。"
+                    "重写时每个数字都必须能在报告中找到，禁止推算、编造或引用你记忆中的任何数据。")),
+            ])
+            text2 = retry.content
+            bad2 = _hnh(core, text2)
+            if not bad2:
+                text = text2
+            else:
+                # 确定性兜底：句子级清洗（两稿取硬数字更少者）
+                cand = text2 if len(bad2) <= len(bad) else text
+                cleaned, removed = _strip(cand, core)
+                if cleaned.strip():
+                    text = cleaned
+                # removed 非空时静默丢弃（宁可少几句，不出错数字）
+    except Exception:
+        pass  # 校验失败不阻塞股评输出
+    return text
 
 
 if __name__ == "__main__":

@@ -434,6 +434,73 @@ class TestReportQualityGuards(unittest.TestCase):
         # 年报口径覆盖率 = 21.5/6.6 ≈ 3.26，绝不能出现Q1口径的92倍
         self.assertNotIn("92", fh["依据"])
 
+    def test_expected_recent_periods(self):
+        """报告期动态推算：按披露节奏从系统时间推最近三份（不写死）"""
+        from datetime import date
+        from backend.tools import expected_recent_periods as erp
+        self.assertEqual(erp(date(2026, 7, 26)),
+                         [("2026-03-31", "一季报"), ("2025-12-31", "年报"), ("2025-09-30", "三季报")])
+        self.assertEqual(erp(date(2026, 5, 15)),
+                         [("2026-03-31", "一季报"), ("2025-12-31", "年报"), ("2025-09-30", "三季报")])
+        # 年报披露前（2 月）：最近三份为 Q3/H1/Q1
+        self.assertEqual(erp(date(2026, 2, 15)),
+                         [("2025-09-30", "三季报"), ("2025-06-30", "半年报"), ("2025-03-31", "一季报")])
+        # 9 月：半年报已出，Q3 未出
+        self.assertEqual(erp(date(2026, 9, 1)),
+                         [("2026-06-30", "半年报"), ("2026-03-31", "一季报"), ("2025-12-31", "年报")])
+
+    def test_gap_explanation_and_trend_buy(self):
+        """估值差距解读（数据驱动）+ 趋势参考买入价（支撑×1.05，接近现价不展示）"""
+        from backend.agent import _build_gap_explanation, _trend_buy_price
+        item = {
+            "估值水位": {"PE": "337"},
+            "投资评级": {"估值明细": {"行业PE中枢": 40}},
+            "_events": [{"类型": "IPO", "参数": {"发行价(元)": 22.6}}],
+            "_nl_pack": {"float_ratio": 0.1662},
+            "评分": {"成长性": {"依据": "年报:营收+18%,扣非-7%"}},
+        }
+        lines = _build_gap_explanation(item, 174.0)
+        text = "\n".join(lines)
+        self.assertIn("337", text)          # PE 溢价
+        self.assertIn("8.4", text)          # 337/40
+        self.assertIn("670", text)          # 较发行价涨幅
+        self.assertIn("16.62", text)        # 流通盘
+        bars = [{"low": "102.56"}, {"low": "145.0"}, {"low": "120.3"}]
+        self.assertAlmostEqual(_trend_buy_price(bars, 174.0), 107.69, places=2)
+        self.assertIsNone(_trend_buy_price(bars, 110.0))   # 与现价差<10% → 不展示
+        self.assertIsNone(_trend_buy_price([], 174.0))
+
+    def test_cashflow_latest_period_primary(self):
+        """财报期次纪律：最近一份财报为主要参考——Q1现金流为负是真实信号，必须用Q1口径；
+        盈利能力指标也用最新期次值（毛利率23%而非年报27%）"""
+        from backend.tools import calculate_scores
+        cs = {
+            "profit": [
+                {"报告期": "一季报", "扣非净利润": 1e8, "归母净利润": 1.1e8},
+                {"报告期": "年报", "扣非净利润": 4e8, "归母净利润": 4.2e8},
+            ],
+            "cashflow": [
+                {"报告期": "一季报", "经营现金流净额": -0.8e8},  # Q1净流出（真实恶化，不属季节性失真）
+                {"报告期": "年报", "经营现金流净额": 2.5e8, "购建固定资产支付现金": 1e8},
+            ],
+            "balance": [{"报告期": "年报", "资产总计": 100, "负债合计": 50}],
+            "valuation": {"data": [{"日期": "2026-03-31", "报告期": "一季报", "ROE(%)": 3, "毛利率(%)": 23,
+                          "净利率(%)": 8, "每股收益": 0.5, "每股净资产": 6.5,
+                          "总股本": 2e8, "资产负债率(%)": 40},
+                         {"日期": "2025-12-31", "报告期": "年报", "ROE(%)": 12, "毛利率(%)": 27,
+                          "净利率(%)": 13, "每股收益": 2.0, "每股净资产": 6.0,
+                          "总股本": 2e8, "资产负债率(%)": 41}]},
+            "price": {"price": 50}, "industry": "半导体",
+        }
+        out = calculate_scores(cs)
+        fh = out["财务健康"]
+        self.assertIn("一季报", fh["依据"])
+        self.assertIn("🔴", fh["现金流标签"])  # 覆盖率 -0.8/1.0 < 0.3 → 警报
+        pe_dim = out["盈利能力"]
+        self.assertIn("23.0%", pe_dim["依据"])   # 最新期毛利率，非年报 27%
+        self.assertIn("一季报", pe_dim["依据"])
+        self.assertIn("27.0%", pe_dim["依据"])   # 年报值仅作趋势参照标注
+
     def test_profitability_basis_formatted(self):
         """盈利能力依据中的浮点必须格式化（不再出现17.1648694075%）"""
         from backend.tools import calculate_scores
@@ -844,6 +911,151 @@ class TestMarketSentiment(unittest.TestCase):
 
 
 
+class TestCriticGrounding(unittest.TestCase):
+    """Critic/Repair 幻觉拦截：发现中的硬数字必须可溯源，Repair 引入新数字即作废"""
+
+    def test_extract_hard_numbers(self):
+        """硬数字提取：金额归一到亿、年号排除、万→亿换算"""
+        from backend.consistency import extract_hard_numbers
+        nums = extract_hard_numbers("PE 337倍，市值323亿，Q1净利0.15亿，涨幅8.5%，2026年，现金流5900万")
+        self.assertIn((337.0, "倍"), nums)
+        self.assertIn((323.0, "亿"), nums)
+        self.assertIn((0.15, "亿"), nums)
+        self.assertIn((8.5, "%"), nums)
+        self.assertIn((0.59, "亿"), nums)  # 5900万 → 0.59亿
+        self.assertFalse(any(u == "年" for _, u in nums))
+        self.assertFalse(any(v == 2026 for v, _ in nums))
+
+    def test_filter_untraceable_issues(self):
+        """发现过滤：可溯源保留、无出处数字丢弃、无数字保留"""
+        from backend.consistency import filter_untraceable_issues
+        source = '{"评分":{"估值合理":{"依据":"PE 337倍, PB 26.6倍"}}, "估值水位":{"市值":"323亿"}}'
+        kept, dropped = filter_untraceable_issues([
+            "PE 337倍远超行业中枢，估值过高（原文：PE 337倍）",   # 可溯源 → 保留
+            "PE 986倍明显泡沫，比行业均值高20倍",                  # 986倍无出处 → 丢弃
+            "操作建议与评级方向矛盾",                               # 无数字 → 保留
+        ], source)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(len(dropped), 1)
+        self.assertIn("986", dropped[0])
+
+    def test_has_new_hard_numbers(self):
+        """Repair 新数字检测：引入原文不存在的数字即违规"""
+        from backend.consistency import has_new_hard_numbers
+        original = '{"合理价值": 31.9, "PE": "337倍"}'
+        ok = has_new_hard_numbers(original, '{"合理价值": 31.9, "PE": "337倍", "风险": "估值高"}')
+        self.assertEqual(ok, [])
+        bad = has_new_hard_numbers(original, '{"合理价值": 31.9, "对标": "可比公司PE 45倍"}')
+        self.assertEqual(bad, [(45.0, "倍")])
+
+    def test_critics_node_filters_hallucination(self):
+        """critics_node：幻觉发现被拦截进 metadata，代码发现直通"""
+        import json as _json
+        from unittest.mock import patch
+        from backend.agent import critics_node
+
+        def fake_critic(prompt, text):
+            if "财务" in prompt:
+                return {"通过": False,
+                        "财务误读": ["毛利率从45%下滑至27%，恶化严重"],  # 45% 无出处 → 幻觉
+                        "_code_issues": ["FCF预警: 经营现金流0.59亿但资本开支1.89亿"]}
+            if "逻辑" in prompt:
+                return {"通过": False, "逻辑漏洞": ["操作建议与评级矛盾"], "建议": ""}
+            return {"通过": True, "行业误述": [], "建议": ""}
+
+        state = {"analysis": _json.dumps({"毛利率": "27.1%", "PE": "337倍"}, ensure_ascii=False),
+                 "collected_data": "", "processing_log": [], "metadata": {}}
+        with patch("backend.agent._call_critic", side_effect=fake_critic):
+            out = critics_node(state)
+        fixes = [f["issue"] for f in out["metadata"]["critic_fixes"]]
+        self.assertFalse(any("45%" in f for f in fixes), "幻觉发现未被拦截")
+        self.assertTrue(any("评级矛盾" in f for f in fixes))
+        self.assertTrue(any("FCF" in f for f in fixes), "代码发现应直通")
+        self.assertEqual(len(out["metadata"]["critic_dropped"]), 1)
+        self.assertIn("幻觉拦截", out["metadata"]["critic_summary"])
+
+    def test_repair_rejects_new_numbers(self):
+        """repair_node：Repair 引入新数字（过时/编造）→ 整体作废回退原文"""
+        from unittest.mock import patch, MagicMock
+        from backend.agent import repair_node
+        raw = '[{"代码":"301583","名称":"托伦斯","估值水位":{"PE":"337倍"}}]'
+        state = {"analysis": raw, "collected_data": "", "processing_log": [],
+                 "metadata": {"critic_fixes": [{"issue": "测试问题", "must_fix": True}]}}
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = MagicMock(
+            content='[{"代码":"301583","名称":"托伦斯","估值水位":{"PE":"986倍"}}]')
+        with patch("backend.agent._get_llm", return_value=mock_llm):
+            out = repair_node(state)
+        self.assertEqual(out["analysis"], raw, "引入986倍的Repair应被作废")
+        self.assertIn("repair_rejected", out["metadata"])
+
+    def test_repair_passes_when_no_new_numbers(self):
+        """repair_node：仅改措辞不引入新数字 → 修正保留"""
+        from unittest.mock import patch, MagicMock
+        from backend.agent import repair_node
+        raw = '[{"代码":"301583","名称":"托伦斯","估值水位":{"PE":"337倍"},"结论":{"总评":"严重高估"}}]'
+        state = {"analysis": raw, "collected_data": "", "processing_log": [],
+                 "metadata": {"critic_fixes": [{"issue": "措辞过激", "must_fix": True}]}}
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = MagicMock(
+            content='[{"代码":"301583","名称":"托伦斯","估值水位":{"PE":"337倍"},"结论":{"总评":"估值偏高"}}]')
+        with patch("backend.agent._get_llm", return_value=mock_llm):
+            out = repair_node(state)
+        self.assertIn("估值偏高", out["analysis"])
+        self.assertNotIn("repair_rejected", out["metadata"])
+
+    def test_strip_untraceable_sentences(self):
+        """句子级清洗：含无出处数字的句子整句剔除，免责声明必留"""
+        from backend.consistency import strip_untraceable_sentences
+        source = "PE:337 市值:323亿 毛利率从27.1%降至23.3%"
+        text = ("毛利率从27.1%降至23.3%，利润空间收窄。"
+                "公司IPO募资5000万元扩产。"
+                "以上分析基于公开财务数据，不构成投资建议，股市有风险，投资需谨慎。")
+        cleaned, removed = strip_untraceable_sentences(text, source)
+        self.assertNotIn("5000万", cleaned)
+        self.assertIn("27.1%", cleaned)
+        self.assertIn("不构成投资建议", cleaned)
+        self.assertEqual(len(removed), 1)
+
+    def test_generate_commentary_blocks_fabrication(self):
+        """股评转写：LLM 引入报告外数字（编造募资额）→ 校验+句子级清洗后输出干净"""
+        from unittest.mock import patch, MagicMock
+        from backend.agent import generate_commentary
+        report = ("FinBrain 投资研究: 托伦斯 (301583)\n"
+                  "[估值水位] PE:337 PB:26.6 市值:323亿 前瞻PE:季节性失真\n"
+                  "毛利率从27.1%降至23.3%。扣非净利润同比-8%。\n" * 12)  # >200字符
+        fabricated = ("托伦斯这波炒作太猛了，股价174元对比发行价22.6元已经起飞。"
+                      "公司IPO募资5000万元扩产，听着就不靠谱。"
+                      "毛利率从27.1%降至23.3%，利润空间明显收窄。"
+                      "以上分析基于公开财务数据，不构成投资建议，股市有风险，投资需谨慎。")
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = MagicMock(content=fabricated)  # 首稿+重试稿同内容
+        with patch("backend.agent._get_llm", return_value=mock_llm), \
+             patch("backend.accounting_rag.search_kb", return_value=[]):
+            out = generate_commentary(report)
+        self.assertNotIn("5000万", out, "编造的募资额应被清洗")
+        self.assertNotIn("174元", out, "报告外价格应被清洗")
+        self.assertIn("27.1%", out, "真实数字应保留")
+        self.assertIn("不构成投资建议", out)
+
+    def test_generate_commentary_retry_success(self):
+        """股评转写：首稿有幻觉、重试稿干净 → 采用重试稿"""
+        from unittest.mock import patch, MagicMock
+        from backend.agent import generate_commentary
+        report = ("FinBrain 投资研究: 托伦斯 (301583)\n"
+                  "[估值水位] PE:337 PB:26.6 市值:323亿\n毛利率从27.1%降至23.3%。\n" * 12)
+        bad = "公司IPO募资5000万元扩产。毛利率从27.1%降至23.3%。"
+        good = "毛利率从27.1%降至23.3%，利润空间收窄。PE高达337倍，估值太贵。"
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [MagicMock(content=bad), MagicMock(content=good)]
+        with patch("backend.agent._get_llm", return_value=mock_llm), \
+             patch("backend.accounting_rag.search_kb", return_value=[]):
+            out = generate_commentary(report)
+        self.assertIn("337", out)
+        self.assertNotIn("5000万", out)
+        self.assertEqual(mock_llm.invoke.call_count, 2)
+
+
 def run_all():
     """运行全部测试并输出结果"""
     loader = unittest.TestLoader()
@@ -852,7 +1064,7 @@ def run_all():
                 TestInvestmentRating, TestHarnessGuards, TestConfig,
                 TestOutputConsistency, TestReportQualityGuards,
                 TestStructuredOutput, TestGraphRouting, TestLLMFallback,
-                TestMarketSentiment]:
+                TestMarketSentiment, TestCriticGrounding]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
     runner = unittest.TextTestRunner(verbosity=2)

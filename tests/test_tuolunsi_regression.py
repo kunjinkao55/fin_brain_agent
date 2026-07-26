@@ -280,6 +280,49 @@ class TestTuolunsiConsistency(unittest.TestCase):
         self.assertLess(sc["概率加权价值"], 60.0)
         self.assertGreater(sc["概率加权价值"], 10.0)
         self.assertTrue(any("锚定" in n for n in item["_scenario_check"]["notes"]))
+    def test_scenario_eps_ttm_anchoring(self):
+        """情景锚定（复验暴露）：LLM 情景 EPS 脱离 TTM 现实区间时必须钳制重算。
+        托伦斯复验案例：悲观 EPS=1.2 是 TTM 0.516 的 2.3 倍 → 加权价值 125 元严重高估。"""
+        from backend.agent import _validate_scenarios
+        item = {"_eps_ttm": T_EPS_TTM,
+                "情景估值": {
+                    "悲观": {"价格": 80.0, "EPS": 1.2, "PE": 66.67, "概率": "30%", "假设": "增速回落至20%"},
+                    "基准": {"价格": 130.0, "EPS": 1.6, "PE": 81.25, "概率": "50%", "假设": "维持30%增速"},
+                    "乐观": {"价格": 180.0, "EPS": 2.0, "PE": 90.0, "概率": "20%", "假设": "增长40%"},
+                }}
+        _validate_scenarios(item)
+        sc = item["情景估值"]
+        # 悲观钳制到 ≤1.0×TTM、基准 ≤1.3×、乐观 ≤2.0×（钳制值取整两位小数，容差0.01）
+        self.assertLessEqual(sc["悲观"]["EPS"], T_EPS_TTM + 0.01)
+        self.assertLessEqual(sc["基准"]["EPS"], T_EPS_TTM * 1.3 + 0.01)
+        self.assertLessEqual(sc["乐观"]["EPS"], T_EPS_TTM * 2.0 + 0.01)
+        # 钳制后 价格=EPS×PE 重算，加权价值从 125 元大幅回落至现实区间（PE 倍数仍是 LLM 判断）
+        self.assertAlmostEqual(sc["悲观"]["价格"], round(sc["悲观"]["EPS"] * 66.67, 2), places=2)
+        self.assertLess(sc["概率加权价值"], 60.0)
+        self.assertGreater(sc["概率加权价值"], 10.0)
+
+    def test_scenario_pe_industry_band_clamp(self):
+        """情景 PE 行业中枢锚定带（83.81 元案例回归）：基准 PE 120 → 钳到 60，
+        加权价值从 83.81 收敛到行业带内（PE 判断留给 LLM 但不出圈）。"""
+        from backend.agent import _validate_scenarios
+        item = {"_eps_ttm": T_EPS_TTM,
+                "投资评级": {"估值明细": {"行业PE中枢": 40}},
+                "情景估值": {
+                    "悲观": {"价格": 50.0, "EPS": 0.5, "PE": 100.0, "概率": "30%", "假设": "行业下行"},
+                    "基准": {"价格": 80.4, "EPS": 0.67, "PE": 120.0, "概率": "50%", "假设": "稳步推进"},
+                    "乐观": {"价格": 143.07, "EPS": 1.03, "PE": 138.9, "概率": "20%", "假设": "订单超预期"},
+                }}
+        _validate_scenarios(item)
+        sc = item["情景估值"]
+        # 基准 [0.8×, 1.5×]×40 = [32, 60]；悲观 [36, 48]；乐观 ≤60（基准触顶收敛）
+        self.assertEqual(sc["基准"]["PE"], 60.0)
+        self.assertLessEqual(sc["悲观"]["PE"], 48.0)
+        self.assertGreaterEqual(sc["悲观"]["PE"], 36.0)
+        self.assertLessEqual(sc["乐观"]["PE"], 60.0)
+        # 价格随钳制重算，加权从 83.81 收敛到带内
+        self.assertAlmostEqual(sc["基准"]["价格"], round(sc["基准"]["EPS"] * 60.0, 2), places=2)
+        self.assertLess(sc["概率加权价值"], 50.0)
+        self.assertTrue(any("锚定带" in n for n in item["_scenario_check"]["notes"]))
 
 
 class TestTuolunsiEventRules(unittest.TestCase):

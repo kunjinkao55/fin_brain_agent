@@ -383,6 +383,9 @@ def get_financial_statements(symbol: str) -> dict:
             "MONETARYFUNDS": "货币资金", "ACCOUNTS_RECE": "应收账款",
             "INVENTORY": "存货", "ACCOUNTS_PAYABLE": "应付账款",
             "DEBT_ASSET_RATIO": "资产负债率",
+            # 有息负债（支柱五 ROIC proxy 用，字段缺失时为 None 不影响其他列）
+            "SHORT_LOAN": "短期借款", "LONG_LOAN": "长期借款",
+            "BOND_PAYABLE": "应付债券", "NONCURRENT_LIAB_1YEAR": "一年内到期的非流动负债",
         }
         INCOME_COLS = {
             "TOTAL_OPERATE_INCOME": "营业总收入", "OPERATE_COST": "营业成本",
@@ -508,6 +511,92 @@ def get_valuation(symbol: str) -> dict:
     except Exception as e:
         result = {"error": f"获取估值失败: {str(e)}"}
         return _try_with_data_slots(symbol, result, "valuation", ["data"])
+
+
+# ============================================================
+#  工具4c：报告期推算（财报期次纪律配套）
+# ============================================================
+
+def expected_recent_periods(ref_date=None, count: int = 3) -> list:
+    """按A股披露节奏，以系统时间动态推算最近的 count 个应已披露的报告期。
+
+    披露截止：一季报/年报 次年4月30日，半年报 8月31日，三季报 10月31日。
+    返回 [(期末日期str, 期次标签)]，最新在前。
+    例（ref=2026-07-26）: [("2026-03-31","一季报"),("2025-12-31","年报"),("2025-09-30","三季报")]
+    """
+    from datetime import date as _date
+    ref = ref_date or _date.today()
+    cands = []
+    for y in (ref.year, ref.year - 1, ref.year - 2):
+        cands += [
+            (_date(y, 12, 31), "年报", _date(y + 1, 4, 30)),
+            (_date(y, 9, 30), "三季报", _date(y, 10, 31)),
+            (_date(y, 6, 30), "半年报", _date(y, 8, 31)),
+            (_date(y, 3, 31), "一季报", _date(y, 4, 30)),
+        ]
+    avail = [(end, label) for end, label, ddl in cands if ddl <= ref and end < ref]
+    avail.sort(key=lambda x: x[0], reverse=True)
+    return [(d.isoformat(), lbl) for d, lbl in avail[:count]]
+
+
+# ============================================================
+#  工具4b：主营构成（利润引擎解剖，分类引擎修正方法 支柱一/二）
+# ============================================================
+
+def get_business_segments(symbol: str) -> dict:
+    """获取主营构成（按产品分类，东财 via akshare）：最新两期板块收入/毛利/毛利率。
+
+    返回 {"报告期": "2025-12-31", "segments": [{名称,收入,收入占比,毛利额,毛利占比,毛利率}],
+          "前期": [...], "前期报告期": str}。
+    板块净利润不可得，毛利额占比为"利润引擎占比"的免费源最佳近似（口径见文档）。
+    失败返回 {"error": ...}，不抛异常。"""
+    from backend import cache
+    cached = cache.get("business_segments", symbol)
+    if cached:
+        return cached
+    try:
+        import akshare as _ak
+        prefix = ("SH" if symbol.startswith(("60", "68")) else
+                  "BJ" if symbol.startswith(("4", "8", "92")) else "SZ")
+        df = _ak.stock_zygc_em(symbol=f"{prefix}{symbol}")
+        if df is None or len(df) == 0:
+            return {"error": "主营构成无数据"}
+        df = df[df["分类类型"] == "按产品分类"]
+        if len(df) == 0:
+            return {"error": "主营构成(按产品)无数据"}
+        periods = sorted(df["报告日期"].astype(str).unique().tolist(), reverse=True)
+        # 前期必须同期次（年报↔年报，半年报↔半年报）：
+        # 否则年报(全年)对半年报(半年)的收入同比会出现 ~+100% 的伪增长
+        _md = periods[0][5:]
+        _pool = [p for p in periods if p[5:] == _md and p != periods[0]]
+        prev_period = _pool[0] if _pool else (periods[1] if len(periods) > 1 else None)
+
+        def _rows(period):
+            sub = df[df["报告日期"].astype(str) == period]
+            segs = []
+            for _, r in sub.iterrows():
+                name = str(r["主营构成"]).strip()
+                # "其中:xx" 是主板块的子项拆分，"其他/其他(补充)" 单列但不参与引擎判定
+                segs.append({
+                    "名称": name,
+                    "收入": float(r["主营收入"] or 0),
+                    "收入占比": float(r["收入比例"] or 0),
+                    "毛利额": float(r["主营利润"] or 0),
+                    "毛利占比": float(r["利润比例"] or 0),
+                    "毛利率": float(r["毛利率"]) if r["毛利率"] is not None else None,
+                    "_子项": name.startswith(("其中:", "其中：")),
+                    "_其他": name in ("其他", "其他(补充)", "其他（补充）"),
+                })
+            return segs
+
+        result = {"报告期": periods[0], "segments": _rows(periods[0]),
+                  "前期报告期": prev_period,
+                  "前期": _rows(prev_period) if prev_period else []}
+        cache.set("business_segments", symbol, result)
+        return result
+    except Exception as e:
+        return {"error": f"获取主营构成失败: {str(e)}"}
+
 
 
 # ============================================================
@@ -877,6 +966,19 @@ def format_report(analysis: dict) -> str:
             _val_note = rating.get("估值方法说明", "") if isinstance(rating, dict) else ""
             if _pe_ref is not None:
                 lines.append(f"    📊 估值方法: 主锚点=情景概率加权（机构常用多情景DCF），参考地板=PE乘数法({_pe_ref}元)")
+            _fair_range = rating.get("合理区间", "") if isinstance(rating, dict) else ""
+            if _fair_range:
+                lines.append(f"    合理区间（三锚点）: {_fair_range}")
+            # 估值差距解读（合理价值仅为现价零头时）：为什么差这么多 + 趋势参考买入价
+            _gap_expl = analysis.get("估值差距解读", [])
+            if _gap_expl:
+                lines.append(f"    ⚠️ 估值差距解读（合理价值为何远低于现价）:")
+                for _g in _gap_expl[:6]:
+                    lines.append(f"      - {_g}")
+            _tb = analysis.get("趋势参考买入价")
+            if _tb:
+                lines.append(f"    趋势参考买入价: ≈{_tb}元（近期技术支撑×1.05，趋势框架入场锚，"
+                             "与价值锚安全买入价并列，按自身风格选用）")
             if weighted: lines.append(f"    加权总分: {weighted}/100  置信度: {conf}")
             lines.append(f"    * 估值基于财报数据计算，非实时定价。不构成买卖建议。")
 
@@ -913,10 +1015,16 @@ def format_report(analysis: dict) -> str:
         val_chain = rating.get("估值明细", {}) if isinstance(rating, dict) else {}
         if val_chain and val_chain.get("公式"):
             lines.append(f"  [估值明细] {val_chain['公式']}")
-            lines.append(f"    行业PE中枢={val_chain.get('行业PE中枢','?')} | "
-                         f"财务质量乘数={val_chain.get('财务质量乘数','?')} | "
-                         f"成长溢价={val_chain.get('成长溢价','?')} | "
-                         f"EPS(TTM)={val_chain.get('EPS(TTM)','?')}元")
+            # 因子行键驱动渲染（兼容 quality×growth 路径与支柱三乘数矩阵路径）
+            _factor_parts = []
+            for _k in ("行业PE中枢", "财务质量乘数", "成长溢价", "乘数矩阵", "EPS(TTM)"):
+                if _k in val_chain:
+                    _v = val_chain[_k]
+                    _factor_parts.append(f"{_k}={_v}{'元' if _k == 'EPS(TTM)' else ''}")
+            if _factor_parts:
+                lines.append("    " + " | ".join(_factor_parts))
+            if val_chain.get("乘数矩阵说明"):
+                lines.append(f"    📐 {val_chain['乘数矩阵说明']}")
             if val_chain.get("前瞻说明"):
                 lines.append(f"    ⚠️ {val_chain['前瞻说明']}")
             if val_chain.get("PB地板"):
@@ -951,6 +1059,23 @@ def format_report(analysis: dict) -> str:
             if landscape: lines.append(f"    竞争格局: {landscape}")
             gm_attr = moat.get("毛利率归因", "")
             if gm_attr: lines.append(f"    毛利率归因: {gm_attr}")
+
+        # ---- 利润引擎（支柱一/二：主营构成解剖，毛利占比≈利润贡献）----
+        engines = analysis.get("_engines", {})
+        if isinstance(engines, dict) and engines.get("板块"):
+            lines.append("")
+            lines.append(f"  [利润引擎] 主营构成解剖（{engines.get('报告期','?')}，毛利占比≈利润引擎占比）")
+            for seg in engines["板块"][:6]:
+                gm = f"{seg['毛利率']*100:.1f}%" if seg.get("毛利率") is not None else "-"
+                rg = f"{seg['收入同比']*100:+.0f}%" if seg.get("收入同比") is not None else "-"
+                lines.append(f"    {seg['名称']}: 收入占比{seg['收入占比']*100:.1f}% | "
+                             f"毛利占比{seg['毛利占比']*100:.1f}% | 毛利率{gm} | 同比{rg} | {seg['类型']}")
+            if engines.get("锚定引擎"):
+                lines.append(f"    ⚓ 单一引擎毛利占比>40%：估值锚向「{engines['锚定引擎']}」倾斜（支柱一）")
+            for _t in (engines.get("SOTP触发") or []):
+                lines.append(f"    🔀 SOTP强制隔离阀: {_t}")
+            if engines.get("SOTP参考估值"):
+                lines.append(f"    SOTP参考估值: {engines['SOTP参考估值']}元/股（毛利占比分配净利近似，仅作对照）")
 
         # ---- 评分表格 ----
         scores = analysis.get("评分", {})
@@ -1720,30 +1845,42 @@ def calculate_scores(financial_data: dict) -> dict:
     gm = _find_val("毛利率(%)")
     nm = _find_val("净利率(%)")
 
-    # 结构突变检测：当最新季度数据与年报严重背离时（V型反转），用最新季度修正
-    # 典型案例：东山精密 FY2025 ROE=6.9% → Q1 2026 年化 ROE≈20%
+    # 财报期次纪律（用户规则）：最近一份财报为主要参考，较远两份仅用于趋势。
+    # 最新期次优先：ROE 用最新期年化值、毛利率/净利率用最新期值；
+    # 季节性失真防护（与前瞻PE禁用同源）：Q1净利 < 年报15% → 年化无意义，退回年报口径。
+    _period_note = ""
     if val_data and len(val_data) >= 2:
-        _q_latest = val_data[0]  # 最新季度
+        _q_latest = val_data[0]  # 最新报告期
         _q_date = _q_latest.get("日期") or _q_latest.get("date") or ""
-        if not _q_date.endswith("-12-31"):  # 非年报
+        if not _q_date.endswith("-12-31"):  # 最新期非年报
             try:
+                _q_period = _q_latest.get("报告期", "最新期")
                 _q_roe = float(_q_latest.get("ROE(%)", 0) or 0)
                 _q_gm = float(_q_latest.get("毛利率(%)", 0) or 0)
                 _q_nm = float(_q_latest.get("净利率(%)", 0) or 0)
-                # 季度 ROE 年化（Q1×4，中报×2，三季报×4/3）
-                # 优先按报告期字段匹配，其次按日期月份推断
-                _q_period = _q_latest.get("报告期", "")
                 _ann_factor = {"一季报": 4, "半年报": 2, "三季报": 4/3, "一季度": 4}.get(_q_period, 0)
                 if _ann_factor == 0:
-                    # 报告期字段未匹配 → 按日期推断（03-31→Q1, 06-30→H1, 09-30→Q3）
                     _mm = _q_date[5:7] if len(_q_date) >= 7 else ""
                     _ann_factor = {"03": 4, "06": 2, "09": 4/3}.get(_mm, 1)
-                _q_roe_ann = _q_roe * _ann_factor
-                # 突变条件：年化 ROE 比年报 ROE 高出 2 倍以上，或毛利率提升超 30%
-                if (_q_roe_ann > roe * 2 and _q_roe_ann > 10) or (_q_gm > gm * 1.3 and _q_gm > 15):
-                    roe = _q_roe_ann  # 用年化 ROE 替代年报 ROE
-                    gm = _q_gm
-                    nm = _q_nm
+                _seasonal = False
+                if _q_period == "一季报":
+                    _prof0 = (financial_data.get("profit", []) or [{}])[0]
+                    _anns0 = [p for p in (financial_data.get("profit", []) or []) if p.get("报告期") == "年报"]
+                    _q_net0 = float(_prof0.get("归母净利润") or _prof0.get("扣非净利润") or 0)
+                    _ann_net0 = float(_anns0[0].get("归母净利润") or _anns0[0].get("扣非净利润") or 0) if _anns0 else 0
+                    if _ann_net0 > 0 and 0 < _q_net0 < _ann_net0 * 0.15:
+                        _seasonal = True
+                if _seasonal:
+                    _period_note = f"（{_q_period}季节性失真，主参考=年报口径）"
+                else:
+                    _ann_roe, _ann_gm = roe, gm
+                    if _q_roe > 0:
+                        roe = _q_roe * _ann_factor
+                    if _q_gm > 0:
+                        gm = _q_gm
+                    if _q_nm > 0:
+                        nm = _q_nm
+                    _period_note = f"（{_q_period}口径为主，年报ROE{_ann_roe:.1f}%/毛利率{_ann_gm:.1f}%）"
             except (ValueError, TypeError):
                 pass  # 季度数据提取失败，保持年报值
 
@@ -1756,7 +1893,8 @@ def calculate_scores(financial_data: dict) -> dict:
 
     if gm >= 40: pe_score = min(10, pe_score + 1)
     if nm >= 20: pe_score = min(10, pe_score + 1)
-    scores["盈利能力"] = {"得分": pe_score, "依据": f"ROE {roe:.1f}%, 毛利率{gm:.1f}%, 净利率{nm:.1f}%"}
+    scores["盈利能力"] = {"得分": pe_score,
+                         "依据": f"ROE {roe:.1f}%, 毛利率{gm:.1f}%, 净利率{nm:.1f}%{_period_note}"}
 
     # --- 2. 成长性 (0-10) —— 年报底色 + 季报势头，扣非净利润优先 ---
     profit_data = financial_data.get("profit", [])
@@ -1890,16 +2028,32 @@ def calculate_scores(financial_data: dict) -> dict:
     fcf = 0.0
     fcf_ratio = 0.0
     net_profit = 1.0
+    _fcf_cfo = 0.0  # FCF 专用 CFO（恒为年报口径；cf_data 为空时保持默认）
     if cf_data:
-        # 年报口径优先：季度现金流受季节性影响大（Q1净利极小→覆盖率虚高至90+），期间混用会失真
+        # 财报期次纪律（用户规则）：最近一份财报为主要参考——现金流覆盖率用最新期次。
+        # 季节性失真防护：Q1净利<年报15% 且 Q1经营现金流为正 → 覆盖率虚高失真，退回年报口径；
+        # （Q1现金流为负是真实恶化信号，不属失真，必须保留最新期）。
+        # FCF 仍走年报口径（资本开支是年度尺度，单季口径无意义）。
         cf_annual = [c for c in cf_data if c.get("报告期") == "年报"]
         annual_profit = [p for p in profit_data if p.get("报告期") == "年报"]
-        if cf_annual and annual_profit:
+        _use_latest = True
+        _latest_period0 = profit_data[0].get("报告期", "") if profit_data else ""
+        if _latest_period0 == "一季报" and profit_data and annual_profit:
+            _q_net0 = float(profit_data[0].get("归母净利润") or profit_data[0].get("扣非净利润") or 0)
+            _ann_net0 = float(annual_profit[0].get("归母净利润") or annual_profit[0].get("扣非净利润") or 0)
+            _q_cfo0 = float(cf_data[0].get("经营现金流净额", 0) or 0)
+            if _ann_net0 > 0 and 0 < _q_net0 < _ann_net0 * 0.15 and _q_cfo0 > 0:
+                _use_latest = False  # Q1 季节性虚高失真
+        if _use_latest:
+            cf_latest = cf_data[0]  # 降序排列，[0]最新
+            cf_period = cf_latest.get("报告期", "最新期")
+            net_profit = float(profit_data[0].get("扣非净利润") or profit_data[0].get("归母净利润") or 1) if profit_data else 1
+        elif cf_annual and annual_profit:
             cf_latest = cf_annual[0]
             cf_period = "年报"
             net_profit = float(annual_profit[0].get("扣非净利润") or annual_profit[0].get("归母净利润") or 1)
         else:
-            cf_latest = cf_data[0]  # 降序排列，[0]最新
+            cf_latest = cf_data[0]
             cf_period = cf_latest.get("报告期", "最新期")
             net_profit = float(profit_data[0].get("扣非净利润") or profit_data[0].get("归母净利润") or 1) if profit_data else 1
         op_cf = float(cf_latest.get("经营现金流净额", 0) or 0)
@@ -1915,10 +2069,13 @@ def calculate_scores(financial_data: dict) -> dict:
             if cf_ratio >= 0.8: cf_score = 2
 
         # FCF = CFO - CAPEX。重资产行业CFO可能很高但全被CAPEX吃掉
-        capex_val = float(cf_latest.get("购建固定资产支付现金", 0) or 0)
-        fcf = op_cf - capex_val
-        if op_cf > 0 and capex_val > 0:
-            fcf_ratio = fcf / op_cf  # FCF/CFO：现金流中多少是真正自由的
+        # FCF 始终用年报口径（资本开支是年度尺度，单季无意义）；覆盖率仍用最新期（期次纪律）
+        _fcf_row = cf_annual[0] if cf_annual else cf_latest
+        capex_val = float(_fcf_row.get("购建固定资产支付现金", 0) or 0)
+        _fcf_cfo = float(_fcf_row.get("经营现金流净额", 0) or 0)
+        fcf = _fcf_cfo - capex_val
+        if _fcf_cfo > 0 and capex_val > 0:
+            fcf_ratio = fcf / _fcf_cfo  # FCF/CFO：现金流中多少是真正自由的
         else:
             fcf_ratio = 0
 
@@ -1935,10 +2092,10 @@ def calculate_scores(financial_data: dict) -> dict:
 
     # FCF 预警标记（供 _fix_and_decide 强制注入风险段落）
     _fcf_warning = ""
-    if op_cf > 0 and capex_val > 0 and fcf < 0 and fcf_ratio < -0.3:
+    if _fcf_cfo > 0 and capex_val > 0 and fcf < 0 and fcf_ratio < -0.3:
         _fcf_warning = ("FCF预警: 经营现金流{:.2f}亿但资本开支{:.2f}亿, "
                         "自由现金流≈{:.2f}亿(负!), CFO虽高但被CAPEX吞噬, "
-                        "'利润含金量高'仅适用于CFO,不适用于FCF".format(op_cf/1e8, capex_val/1e8, fcf/1e8))
+                        "'利润含金量高'仅适用于CFO,不适用于FCF".format(_fcf_cfo/1e8, capex_val/1e8, fcf/1e8))
 
     scores["财务健康"] = {
         "得分": min(10, debt_score + cf_score),
