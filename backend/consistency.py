@@ -107,8 +107,13 @@ def _inv2(item: dict, issues: list[Issue]) -> None:
     if safe is None:
         return
     text = _texts(item)
-    pat = r'(\d+\.?\d*)\s*元(?:以下|之下)?[^。；\n]{0,12}(?:可|再|建议|轻仓|试探|买入|建仓|参与)'
+    # 明确的买入动词；"可/再" 等弱词不算（"再考虑"并非买入建议）
+    pat = r'(\d+\.?\d*)\s*元(?:以下|之下)?[^。；\n]{0,12}(?:买入|建仓|轻仓|试探|抄底|参与|加仓)'
+    # 否定语境排除："当前174元严重高估，不建议买入" 不是买入建议
+    neg = re.compile(r'(?:不|勿|暂不|禁止|避免|未|别)[^。；\n]{0,4}(?:买入|建仓|参与|加仓|抄底)')
     for m in re.finditer(pat, text):
+        if neg.search(m.group(0)):
+            continue
         price = float(m.group(1))
         if price > safe:
             issues.append(Issue(
@@ -189,10 +194,11 @@ def _inv4(item: dict, report_text: str, issues: list[Issue]) -> None:
 
 
 # 全文唯一值检查的标签（同标签多处数值须一致）
+# 注意：不含"经营现金流"——Q1(-0.8亿)与年报(0.59亿)是不同期次的合法并存值，
+# 标签级比对无法区分期次，必然误报（现金流类矛盾由跨源比对/FCF预警覆盖）。
 _UNIQUE_LABELS = {
     "市值": r'市值[^。\n]{0,15}?([\d,]+(?:\.\d+)?)\s*亿',
     "归母净利": r'归母净利[润]?[^。\n]{0,15}?([\d,]+(?:\.\d+)?)\s*亿',
-    "经营现金流": r'经营[性活]?现金流[^。\n]{0,15}?(-?[\d,]+(?:\.\d+)?)\s*亿',
 }
 
 

@@ -205,7 +205,7 @@ def adjust_bps_for_event(
     """股本变动事件后的 BPS 调整（FIX-02）。
 
     :param latest_equity_yi: 最近期归母权益（亿元）。
-    :param net_raised_yi: 募集净额（亿元），未知按 0 处理（保守）。
+    :param net_raised_yi: 募集净额（亿元）。**公式路径必需**——未知时不得按 0 处理。
     :param post_shares: 发行后总股本（股）。
     :param disclosed_bps: 公告披露的发行后每股净资产（元），存在时优先采用。
 
@@ -213,13 +213,18 @@ def adjust_bps_for_event(
         （basis="公告披露发行后每股净资产"）；否则按
         ``(latest_equity_yi + net_raised_yi) * 1e8 / post_shares`` 计算
         （basis="发行后口径(含募集净额)"）；输入不足返回 (None, "")。
+
+    注意：募集净额未知时 ``(现有权益+0)/变动后股本`` 会产生比财报口径更大的失真
+    （托伦斯真实案例：9.1亿权益/1.8547亿股=4.91 元，掩盖 9.41 亿募资已到账的事实，
+    且 basis 会谎称"含募集净额"）。此时宁可退回财报口径 + 跨源比对告警。
     """
     if disclosed_bps is not None and disclosed_bps > 0:
         return float(disclosed_bps), "公告披露发行后每股净资产"
     if latest_equity_yi is None or not post_shares or post_shares <= 0:
         return None, ""
-    raised = float(net_raised_yi) if net_raised_yi else 0.0
-    bps = (float(latest_equity_yi) + raised) * 1e8 / float(post_shares)
+    if not net_raised_yi or float(net_raised_yi) <= 0:
+        return None, ""
+    bps = (float(latest_equity_yi) + float(net_raised_yi)) * 1e8 / float(post_shares)
     return bps, "发行后口径(含募集净额)"
 
 

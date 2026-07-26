@@ -1806,6 +1806,17 @@ def _validate_scenarios(item: dict):
         return float(m.group(1)) if m else None
 
     check = {"arith_ok": True, "monotonic_ok": True, "notes": []}
+    # FIX 情景锚定（真实测试暴露）：LLM 情景 EPS 不得脱离 TTM EPS 现实区间，
+    # 否则加权价值被荒谬 EPS 假设带飞（托伦斯复验：悲观 EPS=1.2 是 TTM 0.516 的 2.3 倍，
+    # 加权价值 125 元严重高估）。钳制带：悲观[0.3×,1.0×]、基准[0.5×,1.3×]、乐观[0.7×,2.0×]，
+    # 钳制后由下游算术校验按 价格=EPS×PE 重算。
+    eps_ttm = None
+    try:
+        _e = float(item.get("_eps_ttm") or 0)
+        eps_ttm = _e if _e > 0 else None
+    except (TypeError, ValueError):
+        eps_ttm = None
+    _EPS_BAND = {"悲观": (0.3, 1.0), "基准": (0.5, 1.3), "乐观": (0.7, 2.0)}
     prices, probs = {}, {}
     for s in ["悲观", "基准", "乐观"]:
         si = sc.get(s, {})
@@ -1814,6 +1825,16 @@ def _validate_scenarios(item: dict):
         eps = _num(si.get("EPS"))
         pe = _num(si.get("PE"))
         price = _num(si.get("价格"))
+        # EPS TTM 锚定钳制（在算术校验之前，钳制后价格自动重算）
+        if eps is not None and eps_ttm and s in _EPS_BAND:
+            _lo, _hi = eps_ttm * _EPS_BAND[s][0], eps_ttm * _EPS_BAND[s][1]
+            if eps < _lo or eps > _hi:
+                _clamped = round(min(max(eps, _lo), _hi), 2)
+                check["notes"].append(
+                    f"{s}情景EPS {eps}超出TTM锚定带[{_lo:.2f},{_hi:.2f}]，已钳制为{_clamped}")
+                check["arith_ok"] = False
+                si["EPS"] = _clamped
+                eps = _clamped
         # 算术校验：价格 ≈ EPS × PE
         if eps is not None and pe is not None and eps > 0 and pe > 0:
             expect = round(eps * pe, 2)
@@ -2250,6 +2271,10 @@ def reporter_node(state: FinBrainState) -> dict:
                     post_shares=(_p.get("发行后总股本(万股)") or 0) * 1e4,
                     disclosed_bps=_p.get("发行后每股净资产(元)"),
                 )
+                if _bps_adj is None:
+                    item.setdefault("_pairing_notes", []).append(
+                        f"{_cap_ev.type}事件：发行后BPS参数未全部获取（披露值/募集净额缺失），"
+                        "PB暂用财报口径（可能偏离实际），请结合跨源比对告警人工复核")
 
             # === FIX-01：股本单一事实源（SSOT），全模块禁止自行推算 ===
             _share_ctx = resolve_share_context(
@@ -2356,6 +2381,19 @@ def reporter_node(state: FinBrainState) -> dict:
             bps = _share_ctx.effective_bps
             code_pb = stock_price / bps if stock_price > 0 and bps > 0 else 0
             mktcap = total_shares * stock_price / 1e8 if total_shares > 0 else 0
+            # FIX-01：评分卡依据中的 PE/PB 统一为代码口径
+            # （消除 calculate_scores 与 reporter 取数期次差异导致的"27.2 vs 26.6"双口径）
+            try:
+                _vr = item.get("评分", {}).get("估值合理", {})
+                if isinstance(_vr, dict) and _vr.get("依据"):
+                    _basis = str(_vr["依据"])
+                    if code_pe > 0:
+                        _basis = re.sub(r'PE\s*\d+\.?\d*', f"PE {code_pe:.0f}", _basis)
+                    if code_pb > 0:
+                        _basis = re.sub(r'PB\s*\d+\.?\d*', f"PB {code_pb:.1f}", _basis)
+                    _vr["依据"] = _basis
+            except Exception:
+                pass
             # 前瞻PE: 当前价 / (最新期间净利 × 年化系数 / 总股本)。
             # 年化系数期间感知：一季报×4 / 中报×2 / 三季报×4/3。
             # 季节性失真防护：Q1净利占年报比例过低的公司（利润集中在下半年），
@@ -2410,8 +2448,9 @@ def reporter_node(state: FinBrainState) -> dict:
                 with _xr_urllib.urlopen(_xr_req, timeout=8, context=_XR_SSL) as _xr_resp:
                     _xr_d = (json.loads(_xr_resp.read().decode("utf-8")).get("data") or {})
                 _rt = {}
-                if _xr_d.get("f162"): _rt["PE"] = float(_xr_d["f162"])
-                if _xr_d.get("f167"): _rt["PB"] = float(_xr_d["f167"])
+                # 东财 push2 的 f162(PE_TTM)/f167(PB) 为 ×100 缩放整型（55105→551.05，1744→17.44）
+                if _xr_d.get("f162"): _rt["PE"] = float(_xr_d["f162"]) / 100
+                if _xr_d.get("f167"): _rt["PB"] = float(_xr_d["f167"]) / 100
                 if _xr_d.get("f20"): _rt["市值"] = float(_xr_d["f20"]) / 1e8  # f20 单位:元→亿
                 _diffs = _xval({"PE": code_pe, "PB": code_pb, "市值": mktcap}, _rt, tol=0.02)
                 if _diffs:
@@ -2553,7 +2592,10 @@ def reporter_node(state: FinBrainState) -> dict:
                 pass
 
             # 成长-估值匹配检查：高增长+低PE → 强制上调
-            rev_growth = float(re.search(r'营收[^+]*([+-]?\d+)', score_pe).group(1) or 0) if re.search(r'营收[^+]*([+-]?\d+)', score_pe) else 0
+            # （营收增速取自成长性依据文本；估值合理依据里是 PE/PB，不含营收）
+            _growth_basis = item.get("评分", {}).get("成长性", {}).get("依据", "")
+            _rg_m = re.search(r'营收[^+\-\d]*([+-]?\d+)', _growth_basis)
+            rev_growth = float(_rg_m.group(1)) if _rg_m else 0
             pe_val = code_pe
             if rev_growth > 30 and pe_val < 15:
                 decision["评级"] = "BUY"
@@ -3351,6 +3393,15 @@ def reporter_node(state: FinBrainState) -> dict:
             except Exception:
                 audit_json = {"问题": []}
             issues = audit_json.get("问题", [])
+            # FIX-10 闭环：代码预检 blocker（一致性违例/数字不可回溯）必须触发修复重试——
+            # 即使 LLM 审计零问题也要注入，且必须在 "if not issues: break" 之前，
+            # 否则预检问题只打印不修复（第五轮复验发现的闭环漏洞）
+            if (retry_count == 0 and _code_issues
+                    and not any(i.get("级别") == "❌" for i in issues)):
+                issues = issues + [{"级别": "❌", "类型": "代码预检",
+                                    "描述": ci,
+                                    "修正建议": "使相关段落与评分卡/代码计算值一致，消除矛盾表述"}
+                                   for ci in _code_issues[:5]]
             if not issues:
                 break
 
@@ -3592,7 +3643,7 @@ def reporter_node(state: FinBrainState) -> dict:
         # 10. 数字可回溯（FIX-04：关键数字全部来自计算登记表）
         _ct = _it.get("_calc")
         if _ct is not None:
-            _audit_rows.append(("数字可回溯", "✅", f"{len(_ct.names())}项关键数字已登记，发布前容差1%验证"))
+            _audit_rows.append(("数字可回溯", "✅", f"{len(_ct.names())}项关键数字已登记，发布前分指标容差验证"))
         else:
             _audit_rows.append(("数字可回溯", "—", "无计算登记表"))
 

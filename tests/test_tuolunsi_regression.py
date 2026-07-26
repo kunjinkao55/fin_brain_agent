@@ -167,6 +167,9 @@ class TestTuolunsiCalcVerification(unittest.TestCase):
         ct.register("隐含增速", 102.0, formula="(322.7亿÷40÷0.98亿)^(1/3)-1")
         bad = verify_report_text("市场隐含未来3年利润年复合增速需达40%以上才能消化当前估值", ct)
         self.assertTrue(any("隐含增速" in v for v in bad))
+        # 同义词变体（第四轮真实报告暴露：LLM 写"年化增速需达30%以上"）
+        bad2 = verify_report_text("当前市盈率隐含未来净利润年化增速需达30%以上", ct)
+        self.assertTrue(any("隐含增速" in v for v in bad2))
         good = verify_report_text("隐含年复合增速≈102%", ct)
         self.assertEqual(good, [])
 
@@ -256,6 +259,27 @@ class TestTuolunsiConsistency(unittest.TestCase):
         self.assertTrue(any(i.rule == "INV-5" for i in check_invariants(item, text)))
         text2 = "Q1归母净利润0.1亿……Q1归母净利0.15亿……"
         self.assertTrue(any(i.rule == "INV-5" for i in check_invariants(item, text2)))
+    def test_scenario_eps_ttm_anchoring(self):
+        """情景锚定（复验暴露）：LLM 情景 EPS 脱离 TTM 现实区间时必须钳制重算。
+        托伦斯复验案例：悲观 EPS=1.2 是 TTM 0.516 的 2.3 倍 → 加权价值 125 元严重高估。"""
+        from backend.agent import _validate_scenarios
+        item = {"_eps_ttm": T_EPS_TTM,
+                "情景估值": {
+                    "悲观": {"价格": 80.0, "EPS": 1.2, "PE": 66.67, "概率": "30%", "假设": "增速回落至20%"},
+                    "基准": {"价格": 130.0, "EPS": 1.6, "PE": 81.25, "概率": "50%", "假设": "维持30%增速"},
+                    "乐观": {"价格": 180.0, "EPS": 2.0, "PE": 90.0, "概率": "20%", "假设": "增长40%"},
+                }}
+        _validate_scenarios(item)
+        sc = item["情景估值"]
+        # 悲观钳制到 ≤1.0×TTM、基准 ≤1.3×、乐观 ≤2.0×（钳制值取整两位小数，容差0.01）
+        self.assertLessEqual(sc["悲观"]["EPS"], T_EPS_TTM + 0.01)
+        self.assertLessEqual(sc["基准"]["EPS"], T_EPS_TTM * 1.3 + 0.01)
+        self.assertLessEqual(sc["乐观"]["EPS"], T_EPS_TTM * 2.0 + 0.01)
+        # 钳制后 价格=EPS×PE 重算，加权价值从 125 元大幅回落至现实区间（PE 倍数仍是 LLM 判断）
+        self.assertAlmostEqual(sc["悲观"]["价格"], round(sc["悲观"]["EPS"] * 66.67, 2), places=2)
+        self.assertLess(sc["概率加权价值"], 60.0)
+        self.assertGreater(sc["概率加权价值"], 10.0)
+        self.assertTrue(any("锚定" in n for n in item["_scenario_check"]["notes"]))
 
 
 class TestTuolunsiEventRules(unittest.TestCase):

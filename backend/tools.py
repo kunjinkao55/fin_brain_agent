@@ -1936,8 +1936,8 @@ def calculate_scores(financial_data: dict) -> dict:
     # FCF 预警标记（供 _fix_and_decide 强制注入风险段落）
     _fcf_warning = ""
     if op_cf > 0 and capex_val > 0 and fcf < 0 and fcf_ratio < -0.3:
-        _fcf_warning = ("FCF预警: 经营现金流{:.0f}亿但资本开支{:.0f}亿, "
-                        "自由现金流≈{:.0f}亿(负!), CFO虽高但被CAPEX吞噬, "
+        _fcf_warning = ("FCF预警: 经营现金流{:.2f}亿但资本开支{:.2f}亿, "
+                        "自由现金流≈{:.2f}亿(负!), CFO虽高但被CAPEX吞噬, "
                         "'利润含金量高'仅适用于CFO,不适用于FCF".format(op_cf/1e8, capex_val/1e8, fcf/1e8))
 
     scores["财务健康"] = {

@@ -170,8 +170,19 @@ _LABEL_PATTERNS: dict[str, list[str]] = {
     "PB": [r"PB[：:]?\s*(\d+\.?\d*)"],
     "合理价值": [r"合理价值[：:]?\s*\**(\d+\.?\d*)"],
     "安全买入价": [r"安全买入价[：:]?\s*≤?\s*\**(\d+\.?\d*)"],
-    "隐含增速": [r"年复合增速[^0-9]{0,12}(\d+\.?\d*)\s*%"],
+    "隐含增速": [r"(?:年复合增速|年化增速|复合增速|年复合增长率)[^0-9]{0,12}(\d+\.?\d*)\s*%"],
     "概率加权价值": [r"概率加权价值[：:]?\s*\**(\d+\.?\d*)"],
+}
+
+# 分指标容差：估值锚点类指标在 LLM 叙述/框架分歧段中常按整数取整
+# （29.2 → "合理价值30元"），四舍五入不构成矛盾，放宽到 5%；
+# "隐含增速"叙述常写"超过100%"（真实值 103.5%，表述模糊但成立），同放宽；
+# PE/PB/市值保持严容差（B2/B3 类错误均为 20%+ 偏差，不受影响）。
+_LABEL_TOL: dict[str, float] = {
+    "合理价值": 0.05,
+    "安全买入价": 0.05,
+    "概率加权价值": 0.05,
+    "隐含增速": 0.05,
 }
 
 
@@ -202,6 +213,7 @@ def verify_report_text(text: str, calc_table: CalcTable, tol: float = 0.01) -> l
         if not patterns:
             continue
         entry = calc_table.get(name)
+        tol_i = _LABEL_TOL.get(name, tol)  # 分指标容差（叙述取整放宽）
         occurrences: list[float] = []
         for pat in patterns:
             for m in re.findall(pat, text):
@@ -215,17 +227,17 @@ def verify_report_text(text: str, calc_table: CalcTable, tol: float = 0.01) -> l
         # 出现值 vs 注册值
         for occ in occurrences:
             dev = _rel_dev(occ, entry.value)
-            if dev > tol:
+            if dev > tol_i:
                 violations.append(
-                    f"[{name}] 文本值 {occ} 与登记值 {entry.value} "
-                    f"偏差 {dev:.1%} 超过容差 {tol:.0%}"
+                    f"[{name}] 文本值 {occ} 与登记值 {entry.value:.2f} "
+                    f"偏差 {dev:.1%} 超过容差 {tol_i:.0%}"
                 )
 
         # 同一指标多处出现值两两一致性
         for i in range(len(occurrences)):
             for j in range(i + 1, len(occurrences)):
                 dev = _rel_dev(occurrences[i], occurrences[j])
-                if dev > tol:
+                if dev > tol_i:
                     violations.append(
                         f"[{name}] 全文多处出现值不一致："
                         f"{occurrences[i]} vs {occurrences[j]}，偏差 {dev:.1%}"
@@ -256,7 +268,7 @@ def cross_validate_fields(primary: dict, secondary: dict, tol: float = 0.02) -> 
         dev = abs(v1 - v2) / max(abs(v1), abs(v2))
         if dev > tol:
             diffs.append(
-                f"[{key}] 跨源不一致：{v1} vs {v2}，"
+                f"[{key}] 跨源不一致：{v1:.2f} vs {v2:.2f}，"
                 f"偏差 {dev:.1%} 超过容差 {tol:.0%}"
             )
     return diffs
