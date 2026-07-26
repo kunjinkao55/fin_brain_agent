@@ -18,6 +18,18 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
+def _breakers() -> dict:
+    """一致性断路器阈值（configs/scoring.json [估值守卫.一致性断路器]，禁止硬编码）。"""
+    from backend.scoring_config import get_valuation_guards
+    return get_valuation_guards()["breakers"]
+
+
+def _grounding_tol() -> float:
+    """grounding 校验取整容差（[估值守卫.回溯验证.grounding容差]）。"""
+    from backend.scoring_config import get_valuation_guards
+    return get_valuation_guards()["verify"]["grounding容差"]
+
+
 @dataclass
 class Issue:
     """一条一致性违例。"""
@@ -85,15 +97,16 @@ def _inv1(item: dict, issues: list[Issue]) -> None:
             lo, hi = float(m.group(1)), float(m.group(2))
             if lo > hi:
                 lo, hi = hi, lo
-            if safe is not None and lo < safe * (1 - 0.02):
+            _b = _breakers()
+            if safe is not None and lo < safe * (1 - _b["INV1下限容差"]):
                 issues.append(Issue(
                     "INV-1", "blocker",
-                    f"合理区间下限{lo}元低于安全买入价{safe}元（容差2%），区间与安全边际口径冲突"))
+                    f"合理区间下限{lo}元低于安全买入价{safe}元（容差{_b['INV1下限容差']*100:.0f}%），区间与安全边际口径冲突"))
                 return
-            if fair is not None and hi > fair * 1.1:
+            if fair is not None and hi > fair * _b["INV1上限倍数"]:
                 issues.append(Issue(
                     "INV-1", "blocker",
-                    f"合理区间上限{hi}元高于合理价值{fair}元的110%（{fair * 1.1:.2f}元），区间自相矛盾"))
+                    f"合理区间上限{hi}元高于合理价值{fair}元的{_b['INV1上限倍数']*100:.0f}%（{fair * _b['INV1上限倍数']:.2f}元），区间自相矛盾"))
                 return
 
 
@@ -171,8 +184,8 @@ def _inv3(item: dict, issues: list[Issue]) -> None:
         if eps is None or text_growth is None:
             continue
         implied = eps / eps_ttm - 1.0
-        # 阈值 5pp（含边界，浮点容差 1e-6）
-        if abs(implied - text_growth) > 0.05 - 1e-6:
+        _tol3 = _breakers()["INV3增速偏差pp"]
+        if abs(implied - text_growth) > _tol3 - 1e-6:
             issues.append(Issue(
                 "INV-3", "warning",
                 f"{n}情景假设文本增速{text_growth:+.0%}与EPS隐含增速{implied:+.1%}"
@@ -249,7 +262,7 @@ def _inv6(item: dict, issues: list[Issue]) -> None:
         return
     up_ratio = float(m.group(1))
     mood_text = str(sent.get("综合情绪", "")) + str(sent.get("情绪标签", ""))
-    if up_ratio < 30 and any(w in mood_text for w in ("偏暖", "乐观", "高涨")):
+    if up_ratio < _breakers()["INV6广度阈值"] and any(w in mood_text for w in ("偏暖", "乐观", "高涨")):
         issues.append(Issue(
             "INV-6", "warning",
             f"市场广度上涨比例仅{up_ratio}%，与综合情绪「{mood_text}」的偏暖表述背离"))
@@ -272,10 +285,11 @@ def _inv7(item: dict, issues: list[Issue]) -> None:
         g = float(g)
     except (TypeError, ValueError):
         return
-    if g > 30:
+    _th7 = _breakers()["INV7增速阈值"]
+    if g > _th7:
         issues.append(Issue(
             "INV-7", "warning",
-            f"评级{level}但营收增速{g:.0f}%>30%：高增长转型期使用静态PE卖出可能犯下致命错误，"
+            f"评级{level}但营收增速{g:.0f}%>{_th7:.0f}%：高增长转型期使用静态PE卖出可能犯下致命错误，"
             "建议人工复核（若为第二曲线/新业务驱动，应先做SOTP拆分再定评级）"))
 
 
@@ -296,11 +310,12 @@ def _inv9(item: dict, issues: list[Issue]) -> None:
         return
     if cfo <= 0 or shares <= 0:
         return
+    _b9 = _breakers()
     implied_mcap = fair * shares
-    if implied_mcap > 10 * cfo and roic < 0.15:
+    if implied_mcap > _b9["INV9现金流倍数"] * cfo and roic < _b9["INV9_ROIC阈值"]:
         issues.append(Issue(
             "INV-9", "warning",
-            f"合理价值隐含市值{implied_mcap/1e8:.0f}亿 > 10×经营现金流({cfo/1e8:.2f}亿)，"
+            f"合理价值隐含市值{implied_mcap/1e8:.0f}亿 > {_b9['INV9现金流倍数']:.0f}×经营现金流({cfo/1e8:.2f}亿)，"
             f"且ROIC仅{roic*100:.1f}%：估值严重依赖再投资假设，资本回报下降时价值将大幅缩水"))
 
 
@@ -310,7 +325,7 @@ def _inv10(item: dict, issues: list[Issue]) -> None:
         cyc = float(item.get("_cyclical", 0) or 0)
     except (TypeError, ValueError):
         return
-    if cyc > 0.4 and _fair_value(item):
+    if cyc > _breakers()["INV10周期阈值"] and _fair_value(item):
         issues.append(Issue(
             "INV-10", "warning",
             f"周期属性({cyc*100:.0f}%)公司以TTM EPS锚定合理价值："
@@ -412,7 +427,7 @@ def _make_pools(source_text: str) -> tuple[list[tuple[float, str]], list[float]]
 def filter_untraceable_issues(
     issues: list[str],
     source_text: str,
-    tol: float = 0.05,
+    tol: float = None,
 ) -> tuple[list[str], list[str]]:
     """Critic 发现的 grounding 过滤：发现中的每个硬数字都必须能在 source_text
     （原始分析+采集数据）找到出处（±tol 取整误差）。
@@ -423,6 +438,8 @@ def filter_untraceable_issues(
 
     :return: (保留的发现, 丢弃的发现)
     """
+    if tol is None:
+        tol = _grounding_tol()
     pool, bare = _make_pools(source_text)
     kept: list[str] = []
     dropped: list[str] = []
@@ -444,10 +461,12 @@ def filter_untraceable_issues(
 def has_new_hard_numbers(
     original_text: str,
     new_text: str,
-    tol: float = 0.05,
+    tol: float = None,
 ) -> list[tuple[float, str]]:
     """Repair 输出校验：new_text 中引入的、在 original_text（原文+采集数据池）
     中不存在的新硬数字列表。空列表 = 通过。"""
+    if tol is None:
+        tol = _grounding_tol()
     pool, bare = _make_pools(original_text)
     return [(v, u) for v, u in extract_hard_numbers(new_text)
             if not _traceable(v, u, pool, bare, tol)]
@@ -459,7 +478,7 @@ _SENT_SPLIT = re.compile(r'(?<=[。！？；])|\n')
 def strip_untraceable_sentences(
     text: str,
     source_text: str,
-    tol: float = 0.05,
+    tol: float = None,
     keep_patterns: tuple = ("不构成投资建议", "股市有风险"),
 ) -> tuple[str, list[str]]:
     """股评/长文幻觉拦截（句子级）：逐句检查，含不可溯源硬数字的句子整句剔除。
@@ -469,6 +488,8 @@ def strip_untraceable_sentences(
     返回 (清洗后文本, 被剔除句子列表)。全部剔除时返回空串。"""
     if not text:
         return text, []
+    if tol is None:
+        tol = _grounding_tol()
     pool, bare = _make_pools(source_text)
     kept: list[str] = []
     removed: list[str] = []

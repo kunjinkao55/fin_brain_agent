@@ -1177,7 +1177,39 @@ def format_report(analysis: dict) -> str:
             fwd_note = analysis.get("_fwd_pe_note", "")
             if fwd_note:
                 lines.append(f"    ⚠️ {fwd_note}")
+            # A1：历史 PE band（近2年TTM PE区间）
+            if analysis.get("_pe_band"):
+                lines.append(f"    📏 {analysis['_pe_band']}")
         lines.append(f"    * 基于最新财报数据计算，非实时行情。日内股价波动会导致PE/PB/市值变化。请以交易软件实时数据为准。")
+
+        # ---- 可比公司估值对比（A2）----
+        comp = analysis.get("可比公司对比", {})
+        if isinstance(comp, dict) and comp.get("列表"):
+            lines.append("")
+            lines.append("  [可比公司估值对比]（东财实时 PE(TTM)/PB）")
+            for r in comp["列表"]:
+                pb_txt = f" | PB {r['PB']}" if r.get("PB") else ""
+                lines.append(f"    {r['名称']}({r['代码']}): PE {r['PE']}{pb_txt}")
+            if comp.get("可比PE均值") and comp.get("本股PE"):
+                prem = comp["本股PE"] / comp["可比PE均值"] if comp["可比PE均值"] > 0 else 0
+                lines.append(f"    可比PE均值: {comp['可比PE均值']} 倍 | 本股PE: {comp['本股PE']} 倍"
+                             f" → 相对可比溢价 {prem:.1f} 倍")
+
+        # ---- 一致预期前瞻（A3：机构多年EPS一致预期/无覆盖降级为本报告情景）----
+        fwd = analysis.get("一致预期前瞻", {})
+        if isinstance(fwd, dict) and fwd.get("rows"):
+            lines.append("")
+            lines.append(f"  [一致预期前瞻]（{fwd.get('来源','')}）")
+            lines.append(f"    {'年份':<14}{'EPS':>7}{'增速':>8}{'现价PE':>8}{'机构数':>6}")
+            for r in fwd["rows"]:
+                g = f"{r['增速']:+.0f}%" if r.get("增速") is not None else "-"
+                pe_txt = str(r["现价PE"]) if r.get("现价PE") else "-"
+                inst = str(r.get("机构数") or "-")
+                lines.append(f"    {r['年份']:<14}{r['EPS']:>7}{g:>8}{pe_txt:>8}{inst:>6}")
+            if fwd.get("基准年EPS"):
+                lines.append(f"    ※ 增速以最近年报 EPS {fwd['基准年EPS']} 元为基数；现价PE=当前价÷预期EPS")
+            else:
+                lines.append(f"    ※ 无机构一致预期覆盖（次新/冷门股），前瞻以本报告情景为准")
 
         # ---- 机构共识 ----
         consensus = analysis.get("机构共识", {})
@@ -1254,9 +1286,20 @@ def format_report(analysis: dict) -> str:
         if compare:
             lines.append(_format_compare_section(compare))
 
-        # ---- 观察指标 ----
+        # ---- 监测表（A5：风险触发器+观察窗口，合并代码日历/解禁/预告兑现与LLM证伪/观察）----
+        monitor = analysis.get("_monitor", [])
         watch = analysis.get("观察指标", [])
-        if watch:
+        if monitor:
+            lines.append("")
+            lines.append("  [监测表] 风险触发器与观察窗口")
+            lines.append(f"    {'观察项':<24}{'触发器/阈值':<30}{'窗口':<16}{'来源':<5}")
+            for m in monitor:
+                lines.append(f"    {str(m.get('观察项',''))[:22]:<24}"
+                             f"{str(m.get('触发器',''))[:28]:<30}"
+                             f"{str(m.get('窗口',''))[:14]:<16}"
+                             f"{str(m.get('来源','')):<5}")
+        elif watch:
+            # 监测表未生成时回退旧版观察指标段
             lines.append("")
             lines.append("  [观察指标]")
             for w in watch:
@@ -1329,6 +1372,15 @@ def format_report(analysis: dict) -> str:
                 lines.append(f"    市场担忧: {'; '.join(concerns)}")
             gap = mkt_exp.get("可能的预期差", "")
             if gap: lines.append(f"    预期差: {gap}")
+            # A4：预期差三方对照（市场隐含 / 机构一致预期 / 本报告基准情景）
+            cmp_lines = mkt_exp.get("预期差对照", [])
+            if cmp_lines:
+                lines.append("    预期差对照:")
+                for c in cmp_lines:
+                    lines.append(f"      - {c}")
+            concl = mkt_exp.get("预期差结论", "")
+            if concl:
+                lines.append(f"    预期差结论: {concl}")
         elif analysis.get("市场已定价", ""):
             lines.append("")
             lines.append(f"  [市场已定价] {analysis['市场已定价']}")

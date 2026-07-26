@@ -86,7 +86,7 @@ Receives the structured fix list from Critics. Auto-corrects the analysis JSON: 
 Generates the final narrative, constrained by both Critic findings and Repair corrections.
 
 ### Audit Engine (Code, no LLM)
-9 deterministic checks + FCF warning injection. When the scoring engine's conservative PE anchor conflicts with the LLM's growth narrative, a `[Framework Divergence]` section presents both perspectives rather than forcing one to win.
+12 deterministic guards + 10 cross-module consistency invariants + FCF warning injection + LLM-output grounding (numbers must trace to source). When the scoring engine's conservative PE anchor conflicts with the LLM's growth narrative, a `[Framework Divergence]` section presents both perspectives rather than forcing one to win.
 
 ---
 
@@ -132,7 +132,7 @@ LLM nodes (Analyst, Valuation, Critic, Repair, Audit) use `with_structured_outpu
 Three configurable LLM slots (slot 1 required, slot 2/3 optional) provide automatic failover. If the primary model fails or does not support structured output, the chain tries the next configured slot. All failures are logged; complete failure raises a clear `RuntimeError`.
 
 ### Dual-Layer Verification
-- **Code layer (Audit Engine)**: 8 pre-checks on mathematical consistency, unit validity, field completeness
+- **Code layer (Audit Engine)**: 12 guard checks + 10 invariants on arithmetic consistency, unit validity, numeric traceability, cross-source reconciliation
 - **LLM layer (Critic Agent)**: Semantic review of logic, assumptions, and narrative quality
 - **Code pre-check**: If all deterministic checks pass, the LLM auditor runs in "warning-only" mode, avoiding unnecessary retries
 
@@ -170,17 +170,20 @@ Three configurable tiers (FREE/PREMIUM/INSTITUTIONAL) with pluggable premium dat
 - Scenario valuation (pessimistic/base/optimistic with probability weighting)
 - Catalyst tracking and falsification conditions
 - Long-term structural review (industry endgame, management, ultimate risks)
+- Comparable-company PE/PB benchmarking + multi-year consensus EPS foresight + monitor table (trigger/window/source) — institutional-grade report presentation
+- Config-driven valuation guards (all valuation parameters externalized to `configs/scoring.json [估值守卫]`, zero hardcoding)
 
 **Agent Layer**
 - Intent routing (Chat / Deep Analysis / Phantom Hunter)
 - Structured LLM outputs: Analyst, Valuation, Critic, Repair, Audit use Pydantic schemas
 - Critic Agent with structured findings (logic flaws, over-optimism, missing risks)
 - Valuation Agent with company-stage classification
-- Audit Engine with 9 deterministic checks + code pre-check
+- Audit Engine with 12 deterministic guards + 10 invariants + code pre-check
 - LangGraph conditional edges: data missing → re-fetch, Critic clean → skip Repair
 - 4-level escalation (warning → surgical fix → analyst retry → circuit breaker)
 - Processing marker system to prevent double-processing across retries
 - 3-slot LLM fallback chain (slot 1 required, slot 2/3 optional)
+- LLM output grounding / hallucination interception (Critic findings filtered for untraceable hard numbers, Repair output rejected on any new hard number, commentary transcription sentence-level stripping)
 - **Market sentiment reference**: market breadth + individual price change + short-term heat (limit-up / dragon-tiger), used as a timing/pace reference, not a valuation input
 
 **Output Layer**
@@ -249,7 +252,7 @@ Pipeline detected dilution event (定增 25.9亿股, 12.6% dilution) → dilutio
 | Frontend | Streamlit + Plotly |
 | Cache | Local memory (TTL) / Redis (configurable) |
 | Data Tier | FREE / PREMIUM / INSTITUTIONAL (pluggable premium slots) |
-| Testing | 98 tests — 72 e2e (compilation, data tools, scoring consistency, output compliance, report quality guards, structured output, graph routing, LLM fallback) + 26 golden regression |
+| Testing | 148 tests — 88 e2e (compilation, data tools, scoring consistency, output compliance, report quality guards, structured output, graph routing, LLM fallback) + 28 golden regression + 15 engine classification + 17 data-slot |
 
 ---
 
@@ -352,7 +355,7 @@ finbrain/
 │   ├── app.py                  # Streamlit UI (7 pages)
 │   └── kline_chart.py          # K-line chart module
 ├── tests/
-│   └── test_e2e.py             # 72 e2e tests
+│   └── test_e2e.py             # 88 e2e tests (+ golden regression / engine classification / data-slot suites)
 ├── docs/                       # Documentation
 └── data/
     ├── uploads/                # User-uploaded documents

@@ -174,16 +174,18 @@ _LABEL_PATTERNS: dict[str, list[str]] = {
     "概率加权价值": [r"概率加权价值[：:]?\s*\**(\d+\.?\d*)"],
 }
 
-# 分指标容差：估值锚点类指标在 LLM 叙述/框架分歧段中常按整数取整
-# （29.2 → "合理价值30元"），四舍五入不构成矛盾，放宽到 5%；
-# "隐含增速"叙述常写"超过100%"（真实值 103.5%，表述模糊但成立），同放宽；
-# PE/PB/市值保持严容差（B2/B3 类错误均为 20%+ 偏差，不受影响）。
-_LABEL_TOL: dict[str, float] = {
-    "合理价值": 0.05,
-    "安全买入价": 0.05,
-    "概率加权价值": 0.05,
-    "隐含增速": 0.05,
-}
+def _verify_cfg() -> dict:
+    """回溯验证容差（configs/scoring.json [估值守卫.回溯验证]，禁止硬编码）。"""
+    from backend.scoring_config import get_valuation_guards
+    return get_valuation_guards()["verify"]
+
+
+def _label_tol() -> dict:
+    """分指标容差：估值锚点类指标在 LLM 叙述/框架分歧段中常按整数取整
+    （29.2 → "合理价值30元"），四舍五入不构成矛盾，用[锚点容差]；
+    PE/PB/市值保持[默认容差]（B2/B3 类错误均为 20%+ 偏差，不受影响）。"""
+    anchor = _verify_cfg()["锚点容差"]
+    return {"合理价值": anchor, "安全买入价": anchor, "概率加权价值": anchor, "隐含增速": anchor}
 
 
 def _rel_dev(actual: float, expected: float) -> float:
@@ -193,7 +195,7 @@ def _rel_dev(actual: float, expected: float) -> float:
     return abs(actual - expected) / abs(expected)
 
 
-def verify_report_text(text: str, calc_table: CalcTable, tol: float = 0.01) -> list[str]:
+def verify_report_text(text: str, calc_table: CalcTable, tol: float = None) -> list[str]:
     """报告数字回溯验证（FIX-04 核心）。
 
     对 calc_table 中每个已注册且在 _LABEL_PATTERNS 中有锚定正则的指标：
@@ -207,13 +209,16 @@ def verify_report_text(text: str, calc_table: CalcTable, tol: float = 0.01) -> l
 
     返回违规描述字符串列表，每条含指标名/期望值/实际值/偏差。
     """
+    if tol is None:
+        tol = _verify_cfg()["默认容差"]
+    _ltol = _label_tol()
     violations: list[str] = []
     for name in calc_table.names():
         patterns = _LABEL_PATTERNS.get(name)
         if not patterns:
             continue
         entry = calc_table.get(name)
-        tol_i = _LABEL_TOL.get(name, tol)  # 分指标容差（叙述取整放宽）
+        tol_i = _ltol.get(name, tol)  # 分指标容差（叙述取整放宽）
         occurrences: list[float] = []
         for pat in patterns:
             for m in re.findall(pat, text):
@@ -249,13 +254,15 @@ def verify_report_text(text: str, calc_table: CalcTable, tol: float = 0.01) -> l
 #  跨源字段比对（FIX-12）
 # ============================================================
 
-def cross_validate_fields(primary: dict, secondary: dict, tol: float = 0.02) -> list[str]:
+def cross_validate_fields(primary: dict, secondary: dict, tol: float = None) -> list[str]:
     """对两个字典的共同键做相对偏差比对（FIX-12）。
 
     相对偏差 = |a-b| / max(|a|,|b|)，> tol → 返回差异描述（键名/两值/偏差）。
     None 值跳过（缺数据不构成矛盾）；0 值跳过（0 作分母无意义）；
     非数值字段跳过（本函数只做数值比对）。
     """
+    if tol is None:
+        tol = _verify_cfg()["跨源容差"]
     diffs: list[str] = []
     for key in primary.keys() & secondary.keys():
         v1, v2 = primary[key], secondary[key]

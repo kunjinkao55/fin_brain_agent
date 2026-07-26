@@ -7,7 +7,8 @@ FinBrain 投资决策引擎 — 动态权重 + 安全边际 + BUY/HOLD/SELL 评�
 
 import logging
 from backend.scoring_config import (get_weights, get_safety_margin, get_safety_adjustments,
-                                     get_valuation, get_roe_multipliers, get_rating_thresholds)
+                                     get_valuation, get_roe_multipliers, get_rating_thresholds,
+                                     get_valuation_guards)
 
 logger = logging.getLogger(__name__)
 
@@ -17,36 +18,27 @@ def indicator_pe_matrix(rev_growth_pct: float | None,
                         capex_cfo: float | None) -> tuple[str, float, dict]:
     """支柱三：估值锚定匹配矩阵——乘数绑定三硬核指标，而非行业名称。
 
-    指标分档：
-      收入增速:   >30%→高 | 10~30%→中 | <10%→低
-      毛利率趋势: 提升(>+0.5pp)→高 | 稳定→中 | 下滑(<-0.5pp)→低
-      CAPEX/CFO:  <0.5→高(轻资产) | 0.5~1.0→中 | >1.0→低(重资产吞噬)
-
-    档位规则：
-      高乘数(1.5): ≥2 项高档 且 毛利率趋势不为低
-      低乘数(0.6): ≥2 项低档
-      中乘数(1.0): 其他
-
-    指标缺失（None）按中性"中"处理。capex_cfo 仅在公司级可用，
-    板块级调用传 None。
+    档位与阈值全部从 configs/scoring.json [估值守卫.乘数矩阵] 读取（禁止硬编码）。
+    指标缺失（None）按中性"中"处理。capex_cfo 仅在公司级可用，板块级调用传 None。
 
     :return: (band_label, mult, readings)
     """
+    mc = get_valuation_guards()["matrix"]
     g_band = "中" if rev_growth_pct is None else (
-        "高" if rev_growth_pct > 30 else ("中" if rev_growth_pct >= 10 else "低"))
+        "高" if rev_growth_pct > mc["增速高档"] else ("中" if rev_growth_pct >= mc["增速低档"] else "低"))
     m_band = "中" if gm_trend_pp is None else (
-        "高" if gm_trend_pp > 0.5 else ("低" if gm_trend_pp < -0.5 else "中"))
+        "高" if gm_trend_pp > mc["毛利率档pp"] else ("低" if gm_trend_pp < -mc["毛利率档pp"] else "中"))
     c_band = "中" if capex_cfo is None else (
-        "高" if capex_cfo < 0.5 else ("低" if capex_cfo > 1.0 else "中"))
+        "高" if capex_cfo < mc["资本开支高档"] else ("低" if capex_cfo > mc["资本开支低档"] else "中"))
     bands = [g_band, m_band, c_band]
     readings = {"增速档": g_band, "毛利率趋势档": m_band, "资本开支档": c_band,
                 "收入增速%": rev_growth_pct, "毛利率趋势pp": gm_trend_pp,
                 "CAPEX/CFO": capex_cfo}
     if bands.count("高") >= 2 and m_band != "低":
-        return "高乘数", 1.5, readings
+        return "高乘数", mc["高"], readings
     if bands.count("低") >= 2:
-        return "低乘数", 0.6, readings
-    return "中乘数", 1.0, readings
+        return "低乘数", mc["低"], readings
+    return "中乘数", mc["中"], readings
 
 
 def _quality_adjustment(roe: float, debt: float) -> float:
@@ -115,34 +107,37 @@ def compute_investment_rating(
     if ind_pe == 0:
         ind_pe = val_cfg["default_ind_pe"]
     # 财务质量调整PE基准：ROE和负债率决定了企业应享有怎样的估值
-    quality_mult = 1.0
-    if roe > 35: quality_mult = 1.6       # 顶级盈利能力（茅台级）
-    elif roe > 25: quality_mult = 1.3     # 优秀
-    elif roe > 18: quality_mult = 1.1     # 良好
-    elif roe > 12: quality_mult = 0.85    # 中等（丽珠14.67%在这档）
-    elif roe > 8: quality_mult = 0.65     # 偏低
-    elif roe > 3: quality_mult = 0.45     # 弱
-    else: quality_mult = 0.30             # 极弱（泰格4.29%在这档）
-    if debt > 70: quality_mult -= 0.10
-    elif debt > 50: quality_mult -= 0.05
-    elif debt < 20: quality_mult += 0.05
+    # （阈值与乘数从 configs/scoring.json [ROE质量乘数] 读取——该配置节此前闲置，本轮接线）
+    _rm = get_roe_multipliers()
+    quality_mult = 0.30
+    for _th, _m in zip(_rm["thresholds"], _rm["multipliers"][:-1]):
+        if roe > _th:
+            quality_mult = _m
+            break
+    else:
+        quality_mult = _rm["multipliers"][-1]
+    if debt > _rm["debt_high"]: quality_mult += _rm["debt_high_adj"]
+    elif debt > _rm["debt_mid"]: quality_mult += _rm["debt_mid_adj"]
+    elif debt < _rm["debt_low"]: quality_mult += _rm["debt_low_adj"]
 
     # 现金流修正：低ROE可能是重资产折旧导致（非经营问题），若现金流强劲则减轻惩罚
     _fh = financial_scores.get("财务健康", {}) if isinstance(financial_scores, dict) else {}
     _cf_sev = _fh.get("现金流严重度", 1) if isinstance(_fh, dict) else 1
     _cf_label = str(_fh.get("现金流标签", "")) if isinstance(_fh, dict) else ""
-    if quality_mult < 0.7 and _cf_sev <= 1:  # ROE低但现金流🟢/🟡优秀
-        quality_mult = max(quality_mult, 0.7)  # 抬底：重资产优质公司不应被ROE过度惩罚
-    elif quality_mult < 0.5 and _cf_sev <= 2:  # ROE很低但现金流至少🟠
-        quality_mult = max(quality_mult, 0.5)  # 抬底：现金流尚可则不过度折价
+    _cf_floor = get_valuation_guards()["cf_floor"]
+    if quality_mult < _cf_floor["一档"] and _cf_sev <= 1:  # ROE低但现金流🟢/🟡优秀
+        quality_mult = max(quality_mult, _cf_floor["一档"])  # 抬底：重资产优质公司不应被ROE过度惩罚
+    elif quality_mult < _cf_floor["二档"] and _cf_sev <= 2:  # ROE很低但现金流至少🟠
+        quality_mult = max(quality_mult, _cf_floor["二档"])  # 抬底：现金流尚可则不过度折价
 
-    # 成长溢价/折价：高增速溢价，衰退折价
+    # 成长溢价/折价：高增速溢价，衰退折价（档位乘数从 configs/scoring.json [估值守卫.成长溢价] 读取）
+    _gpm = get_valuation_guards()["growth_pe_mult"]
     growth_score = _safe_score(financial_scores, "成长性")
     growth_pe_mult = 1.0
-    if growth_score >= 9:   growth_pe_mult = 1.8   # S级：超高速成长(+100%以上)
-    elif growth_score >= 7: growth_pe_mult = 1.3   # A级：强劲成长(+50%以上)
-    elif growth_score >= 5: growth_pe_mult = 1.1   # B级：温和成长(+20%以上)
-    elif growth_score <= 2: growth_pe_mult = 0.7   # C级衰退：营收/利润双降(-10%以上)，PE应打折
+    if growth_score >= 9:   growth_pe_mult = _gpm["S"]   # S级：超高速成长(+100%以上)
+    elif growth_score >= 7: growth_pe_mult = _gpm["A"]   # A级：强劲成长(+50%以上)
+    elif growth_score >= 5: growth_pe_mult = _gpm["B"]   # B级：温和成长(+20%以上)
+    elif growth_score <= 2: growth_pe_mult = _gpm["C"]   # C级衰退：营收/利润双降(-10%以上)，PE应打折
 
     # 支柱三：乘数矩阵优先——三硬核指标（增速/毛利率趋势/CAPEX-CFO）齐全时，
     # 乘数绑定经营实质而非行业标签；缺失时回退 quality×growth 传统路径。

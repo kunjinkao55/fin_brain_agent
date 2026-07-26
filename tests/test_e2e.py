@@ -434,6 +434,74 @@ class TestReportQualityGuards(unittest.TestCase):
         # 年报口径覆盖率 = 21.5/6.6 ≈ 3.26，绝不能出现Q1口径的92倍
         self.assertNotIn("92", fh["依据"])
 
+    def test_consensus_forward_render(self):
+        """A3 一致预期前瞻段渲染（机构覆盖正常渲染；无 rows 不渲染）"""
+        from backend.tools import format_report
+        item = {"代码": "600406", "名称": "国电南瑞",
+                "一致预期前瞻": {"来源": "同花顺", "基准年EPS": 1.16,
+                                "rows": [{"年份": "2025E", "EPS": 1.30, "增速": 12, "现价PE": 17.6, "机构数": 12},
+                                          {"年份": "2026E", "EPS": 1.45, "增速": 12, "现价PE": 15.8, "机构数": 10}]}}
+        text = format_report(item)
+        self.assertIn("一致预期前瞻", text)
+        self.assertIn("2025E", text)
+        self.assertIn("17.6", text)
+        item2 = {"代码": "301583", "名称": "托伦斯"}
+        self.assertNotIn("一致预期前瞻", format_report(item2))
+
+    def test_monitor_table_render(self):
+        """A5 监测表：有 _monitor 时替代表格渲染，无则回退旧观察指标段"""
+        from backend.tools import format_report
+        item = {"代码": "301583", "名称": "托伦斯",
+                "_monitor": [{"观察项": "限售解禁（网下配售）", "触发器": "163万股",
+                              "窗口": "2027-01-10", "来源": "代码"}],
+                "观察指标": ["毛利率能否企稳"]}
+        text = format_report(item)
+        self.assertIn("[监测表]", text)
+        self.assertIn("限售解禁", text)
+        self.assertNotIn("- 毛利率能否企稳", text)
+        item2 = {"代码": "301583", "名称": "托伦斯", "观察指标": ["毛利率能否企稳"]}
+        self.assertIn("[观察指标]", format_report(item2))
+
+    def test_historical_pe_band(self):
+        """A1 历史PE band：季度末TTM×季末价得区间；数据不足/次新股→None"""
+        from backend.agent import _historical_pe_band
+        profit = [
+            {"报告期": "一季报", "date": "2026-03-31", "归母净利润": 1e8},
+            {"报告期": "年报", "date": "2025-12-31", "归母净利润": 5e8},
+            {"报告期": "三季报", "date": "2025-09-30", "归母净利润": 3e8},
+            {"报告期": "半年报", "date": "2025-06-30", "归母净利润": 2e8},
+            {"报告期": "一季报", "date": "2025-03-31", "归母净利润": 0.8e8},
+            {"报告期": "年报", "date": "2024-12-31", "归母净利润": 4e8},
+            {"报告期": "三季报", "date": "2024-09-30", "归母净利润": 2.5e8},
+            {"报告期": "半年报", "date": "2024-06-30", "归母净利润": 1.6e8},
+        ]
+        import datetime as _dt
+        bars = []
+        d = _dt.date(2024, 6, 1)
+        while d <= _dt.date(2026, 6, 1):
+            if d.weekday() < 5:
+                bars.append({"day": d.isoformat(), "close": "50"})
+            d += _dt.timedelta(days=1)
+        band = _historical_pe_band(profit, bars, 1e8, current_pe=40.0)
+        self.assertIsNotNone(band)
+        self.assertGreaterEqual(band["max"], band["median"])
+        self.assertGreaterEqual(band["median"], band["min"])
+        self.assertIn("40.0", band["文本"])
+        self.assertIn("高于区间", band["文本"])
+        # 次新股（K线不足240根）→ None
+        self.assertIsNone(_historical_pe_band(profit, bars[:100], 1e8, 40.0))
+
+    def test_comparables_section_render(self):
+        """A2 可比公司估值对比段渲染（相对可比溢价）"""
+        from backend.tools import format_report
+        item = {"代码": "301583", "名称": "托伦斯",
+                "可比公司对比": {"列表": [{"代码": "688409", "名称": "富创精密", "PE": 45.2, "PB": 5.1}],
+                                "可比PE均值": 45.2, "本股PE": 337.0}}
+        text = format_report(item)
+        self.assertIn("可比公司估值对比", text)
+        self.assertIn("富创精密", text)
+        self.assertIn("溢价", text)
+
     def test_expected_recent_periods(self):
         """报告期动态推算：按披露节奏从系统时间推最近三份（不写死）"""
         from datetime import date

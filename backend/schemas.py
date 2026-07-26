@@ -137,6 +137,7 @@ class AnalystOutput(BaseModel):
     定增信息: Optional[Dict[str, Any]] = None
     公告: Optional[Dict[str, Any]] = None
     机构共识: Optional[Dict[str, Any]] = None
+    可比公司: Optional[List[str]] = Field(default_factory=list, description="2-4家A股可比公司名称")
     校验: Optional[List[str]] = Field(default_factory=list)
     偏见修正: Optional[str] = None
 

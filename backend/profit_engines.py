@@ -15,13 +15,23 @@ from typing import Any, Dict, List, Optional
 
 ENGINE_TYPES = ("复利型", "周期型", "成长型", "价值陷阱型", "常规")
 
-# 支柱二：强制隔离阀阈值
+# 支柱二：强制隔离阀阈值（默认值；实际取值以 configs/scoring.json [估值守卫.SOTP] 为准）
 SOTP_GROWTH_GAP_PP = 30.0   # 板块增速差 > 30 个百分点
 SOTP_GM_GAP_PP = 15.0       # 板块毛利率差 > 15 个百分点
 # 支柱一：锚定倾斜阈值（单一引擎毛利贡献）
 ANCHOR_GP_THRESHOLD = 0.40
 # SOTP 总部未分配成本折价
 HQ_DISCOUNT = 0.10
+
+
+def _sotp_cfg() -> dict:
+    """SOTP 参数（configs/scoring.json [估值守卫.SOTP]，禁止硬编码；缺失回退模块默认）。"""
+    try:
+        from backend.scoring_config import get_valuation_guards
+        return get_valuation_guards()["sotp"]
+    except Exception:
+        return {"增速差pp": SOTP_GROWTH_GAP_PP, "毛利率差pp": SOTP_GM_GAP_PP,
+                "锚定毛利占比": ANCHOR_GP_THRESHOLD, "总部折价": HQ_DISCOUNT}
 
 
 @dataclass
@@ -120,11 +130,14 @@ def sotp_triggers(
     """
     reasons: List[str] = []
     mains = _main_segments(segments)
+    _cfg = _sotp_cfg()
+    _gm_gap = _cfg["毛利率差pp"]
+    _g_gap = _cfg["增速差pp"]
     # 毛利率差 > 15pp（当期）
     gms = [float(s["毛利率"]) for s in mains if s.get("毛利率") is not None]
-    if len(gms) >= 2 and (max(gms) - min(gms)) * 100 > SOTP_GM_GAP_PP:
+    if len(gms) >= 2 and (max(gms) - min(gms)) * 100 > _gm_gap:
         reasons.append(
-            f"板块毛利率极差{(max(gms)-min(gms))*100:.1f}pp>{SOTP_GM_GAP_PP:.0f}pp，禁止混同估值")
+            f"板块毛利率极差{(max(gms)-min(gms))*100:.1f}pp>{_gm_gap:.0f}pp，禁止混同估值")
     # 增速差 > 30pp（两期收入同比）
     growths: List[tuple[str, float]] = []
     prev = _growth_map(prev_segments or [])
@@ -135,20 +148,22 @@ def sotp_triggers(
                             float(s.get("收入") or 0) / p["rev"] - 1))
     if len(growths) >= 2:
         gs = [g for _, g in growths]
-        if (max(gs) - min(gs)) * 100 > SOTP_GROWTH_GAP_PP:
+        if (max(gs) - min(gs)) * 100 > _g_gap:
             hi = growths[gs.index(max(gs))]
             lo = growths[gs.index(min(gs))]
             reasons.append(
-                f"板块增速极差{(max(gs)-min(gs))*100:.0f}pp>{SOTP_GROWTH_GAP_PP:.0f}pp"
+                f"板块增速极差{(max(gs)-min(gs))*100:.0f}pp>{_g_gap:.0f}pp"
                 f"（{hi[0]}{hi[1]*100:+.0f}% vs {lo[0]}{lo[1]*100:+.0f}%），强制SOTP拆分")
     return reasons
 
 
 def engine_anchor(
     engines: List[Engine],
-    threshold: float = ANCHOR_GP_THRESHOLD,
+    threshold: float = None,
 ) -> Optional[Engine]:
-    """支柱一核心纪律：单一引擎毛利贡献 >40% → 估值锚向该引擎倾斜。"""
+    """支柱一核心纪律：单一引擎毛利贡献超阈值 → 估值锚向该引擎倾斜。"""
+    if threshold is None:
+        threshold = _sotp_cfg()["锚定毛利占比"]
     for e in engines:
         if e.gp_pct > threshold:
             return e
@@ -159,7 +174,7 @@ def sotp_fair_value(
     engines: List[Engine],
     ttm_net: float,
     base_pe: float,
-    hq_discount: float = HQ_DISCOUNT,
+    hq_discount: float = None,
 ) -> tuple[float, List[str]]:
     """支柱二 SOTP 估值：Σ(各板块分配利润 × 板块独立PE) × (1-总部折价)。
 
@@ -175,6 +190,8 @@ def sotp_fair_value(
     """
     from backend.scoring import indicator_pe_matrix
 
+    if hq_discount is None:
+        hq_discount = _sotp_cfg()["总部折价"]
     detail: List[str] = []
     if not engines or ttm_net <= 0 or base_pe <= 0:
         return 0.0, detail

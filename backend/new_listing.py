@@ -252,13 +252,14 @@ def parse_customer_concentration(content: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _range_pct(seg: str) -> tuple[Optional[float], Optional[float]]:
-    """从片段解析增速区间："增长25%~30%"→(0.25,0.30)、"下降约30%"→(-0.30,-0.30)。"""
-    m = re.search(r'(增长|上升|增加|下降|下滑|减少)\s*(?:约|近)?\s*([\d.]+)\s*%\s*[~～—至-]\s*([\d.]+)\s*%', seg)
+    """从片段解析增速区间："增长25%~30%"→(0.25,0.30)、"下降约30%"→(-0.30,-0.30)。
+    兼容 "比上年同期增长：54% - 69%"（冒号+空格+连字符）与 en dash。"""
+    m = re.search(r'(增长|上升|增加|下降|下滑|减少)\s*(?:约|近)?\s*[：:]?\s*([\d.]+)\s*%\s*[~～—–\-至]\s*([\d.]+)\s*%', seg)
     if m:
         sign = -1.0 if m.group(1) in ("下降", "下滑", "减少") else 1.0
         lo, hi = sorted([float(m.group(2)), float(m.group(3))])
         return round(sign * lo / 100, 6), round(sign * hi / 100, 6)
-    m = re.search(r'(增长|上升|增加|下降|下滑|减少)\s*(?:约|近)?\s*([\d.]+)\s*%', seg)
+    m = re.search(r'(增长|上升|增加|下降|下滑|减少)\s*(?:约|近)?\s*[：:]?\s*([\d.]+)\s*%', seg)
     if m:
         sign = -1.0 if m.group(1) in ("下降", "下滑", "减少") else 1.0
         v = round(sign * float(m.group(2)) / 100, 6)
@@ -267,8 +268,9 @@ def _range_pct(seg: str) -> tuple[Optional[float], Optional[float]]:
 
 
 def _range_amount_yi(seg: str) -> tuple[Optional[float], Optional[float]]:
-    """从片段解析金额区间（统一亿元）："38,300万元~39,800万元"→(3.83,3.98)。"""
-    m = re.search(r'([\d,]+(?:\.\d+)?)\s*([亿万])元?\s*[~～—至-]\s*([\d,]+(?:\.\d+)?)\s*([亿万])元?', seg)
+    """从片段解析金额区间（统一亿元）："38,300万元~39,800万元"→(3.83,3.98)。
+    兼容 en dash（–）与"盈利：500,000 万元–550,000 万元"格式。"""
+    m = re.search(r'([\d,]+(?:\.\d+)?)\s*([亿万])元?\s*[~～—–\-至]\s*([\d,]+(?:\.\d+)?)\s*([亿万])元?', seg)
     if not m:
         return None, None
     lo, hi = _to_float(m.group(1)), _to_float(m.group(3))
@@ -280,6 +282,31 @@ def _range_amount_yi(seg: str) -> tuple[Optional[float], Optional[float]]:
         hi /= 10000
     lo, hi = sorted([lo, hi])
     return round(lo, 4), round(hi, 4)
+
+
+def _np_amount_yi(text: str) -> tuple[Optional[float], Optional[float]]:
+    """归母净利润金额区间："盈利：500,000 万元–550,000 万元"→(50.0, 55.0)。
+    兼容"净利润 X 亿元~Y 亿元"、"盈利：X亿元"单值。返回(下限,上限)或(None,None)。"""
+    # 区间：盈利：X万/亿 ~ Y万/亿（"盈利："前缀可省略，但要求紧邻分隔符）
+    m = re.search(r'([\d,]+(?:\.\d+)?)\s*([亿万])元?\s*[~～—–\-至]\s*([\d,]+(?:\.\d+)?)\s*([亿万])元?', text)
+    if m:
+        lo, hi = _to_float(m.group(1)), _to_float(m.group(3))
+        if lo is not None and hi is not None:
+            if m.group(2) == "万":
+                lo /= 10000
+            if m.group(4) == "万":
+                hi /= 10000
+            lo, hi = sorted([lo, hi])
+            return round(lo, 4), round(hi, 4)
+    # 单值：盈利：X 万/亿元（取第一个"盈利："后的数字）
+    m = re.search(r'盈利[：:]\s*([\d,]+(?:\.\d+)?)\s*([亿万])元?', text)
+    if m:
+        v = _to_float(m.group(1))
+        if v is not None:
+            if m.group(2) == "万":
+                v /= 10000
+            return round(v, 4), round(v, 4)
+    return None, None
 
 
 def parse_performance_forecast(content: str, title: str = "") -> Optional[dict]:
@@ -297,6 +324,7 @@ def parse_performance_forecast(content: str, title: str = "") -> Optional[dict]:
         text = content or ""
         result: dict = {"period": None, "rev_min_yi": None, "rev_max_yi": None,
                         "rev_growth_min": None, "rev_growth_max": None,
+                        "np_min_yi": None, "np_max_yi": None,
                         "np_growth_min": None, "np_growth_max": None,
                         "forecast_type": "不确定"}
 
@@ -324,22 +352,26 @@ def parse_performance_forecast(content: str, title: str = "") -> Optional[dict]:
             glo, ghi = _range_pct(rev_seg)
             result["rev_growth_min"], result["rev_growth_max"] = glo, ghi
 
-        # 净利增速区间：定位"净利润"（排除"扣非"以免混入口径）后的窗口
-        np_seg = ""
-        for kw in ("归属于上市公司股东的净利润", "净利润"):
+        # 归母净利金额+增速：定位"净利润"（排除"扣非"以免混入口径），
+        # 窗口向前扩 100 字符（"盈利：500,000 万元–550,000 万元"可能位于标签之前）
+        np_idx = -1
+        for kw in ("归属于上市公司股东的净利润", "的净利润", "净利润"):
             start = 0
             while True:
                 idx = text.find(kw, start)
                 if idx < 0:
                     break
                 if "扣非" not in text[max(0, idx - 20):idx]:
-                    np_seg = text[idx:idx + 120]
+                    np_idx = idx
                     break
                 start = idx + len(kw)
-            if np_seg:
+            if np_idx >= 0:
                 break
-        if np_seg:
-            glo, ghi = _range_pct(np_seg)
+        if np_idx >= 0:
+            np_win = text[max(0, np_idx - 100):np_idx + 150]
+            lo, hi = _np_amount_yi(np_win)
+            result["np_min_yi"], result["np_max_yi"] = lo, hi
+            glo, ghi = _range_pct(np_win)
             result["np_growth_min"], result["np_growth_max"] = glo, ghi
 
         # 预告类型：标题/正文关键词优先，否则按净利增速方向推断
@@ -352,15 +384,15 @@ def parse_performance_forecast(content: str, title: str = "") -> Optional[dict]:
             result["forecast_type"] = "续亏"
         elif "预亏" in merged:
             result["forecast_type"] = "首亏"
-        elif "预增" in merged:
+        elif "预增" in merged or "同向上升" in merged:
             result["forecast_type"] = "预增"
-        elif "预减" in merged:
+        elif "预减" in merged or "同向下降" in merged:
             result["forecast_type"] = "预减"
         elif result["np_growth_max"] is not None:
             result["forecast_type"] = "预减" if result["np_growth_max"] < 0 else "预增"
 
         # 一个有效数字都没有 → None
-        numeric_keys = ("rev_min_yi", "rev_growth_min", "np_growth_min")
+        numeric_keys = ("rev_min_yi", "rev_growth_min", "np_min_yi", "np_growth_min")
         if all(result[k] is None for k in numeric_keys):
             return None
         return result

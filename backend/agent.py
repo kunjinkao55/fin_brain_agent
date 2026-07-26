@@ -569,7 +569,7 @@ def calculate_score(symbol: str) -> str:
     # PE/PB/市值：东财实时行情
     pe_data = {}
     try:
-        secid = f"1.{symbol}" if symbol.startswith(("60", "00")) else f"0.{symbol}"
+        secid = f"1.{symbol}" if symbol.startswith(("60", "68", "9")) else f"0.{symbol}"  # 68科创板同属上海
         pe_url = (f"http://push2.eastmoney.com/api/qt/stock/get?"
                   f"secid={secid}&fields=f116,f117,f162,f167,f20")
         from backend.tools import _SSL_CTX
@@ -868,6 +868,7 @@ ANALYST_PROMPT = """[铁律 - 输出格式]
 1. 纯JSON（双引号），不要markdown代码块```json```，输出必须以[或{开头。字符串必须用双引号(")，不能用单引号(')否则解析失败
 2. 多只股票必须输出JSON数组 [{股票1},{股票2}]，每只独立完整
 3. 每只股票必须包含: 公司画像、竞争优势、投资逻辑链、评分、亮点、风险、业绩驱动力、关键信号、估值水位、催化剂、市场预期拆解、情景估值、投资评级、证伪条件、观察指标、操作建议、止损、结论。缺一不可
+4. "可比公司"字段：列出 2-4 家与该公司业务最接近的 A 股可比公司（写名称即可，如 ["富创精密","先锋精科"]），用于估值对比；不得编造不存在的公司
 
 [财报季时机感知]
 A股披露节奏：1-4月年报+一季报，7-8月半年报（7月预告高发），10月三季报。这四个窗口期是市场根据业绩重新定价的核心节点。
@@ -1887,10 +1888,13 @@ def _build_gap_explanation(item: dict, stock_price: float) -> list:
 
 
 def _trend_buy_price(hist_bars: list, stock_price: float) -> float:
-    """趋势参考买入价 = 近期显著支撑位（区间最低价）×1.05 缓冲。
+    """趋势参考买入价 = 近期显著支撑位（区间最低价）×支撑缓冲。
 
-    无K线数据，或支撑价与现价差距<10%（无趋势折扣意义）时返回 None。"""
+    缓冲/折扣阈值从 configs/scoring.json [估值守卫.趋势参考] 读取。
+    无K线数据，或支撑价与现价差距小于折扣阈值（无趋势折扣意义）时返回 None。"""
     try:
+        from backend.scoring_config import get_valuation_guards as _gvg
+        _tr = _gvg()["trend"]
         lows = []
         for b in (hist_bars or []):
             try:
@@ -1901,10 +1905,93 @@ def _trend_buy_price(hist_bars: list, stock_price: float) -> float:
                 continue
         if not lows:
             return None
-        t = round(min(lows) * 1.05, 2)
-        if stock_price > 0 and t >= stock_price * 0.9:
+        t = round(min(lows) * _tr["支撑缓冲"], 2)
+        if stock_price > 0 and t >= stock_price * _tr["现价折扣阈值"]:
             return None
         return t
+    except Exception:
+        return None
+
+
+def _historical_pe_band(profit_rows: list, hist_bars: list,
+                        total_shares: float, current_pe: float = 0.0) -> dict | None:
+    """近2年 TTM PE 区间（A1：历史 PE band）。
+
+    逐季度末计算 TTM 净利（最近年报 + 最新同期 - 上年同期），乘以季末收盘价/股本，
+    得到 TTM PE 序列 → 返回 {"min","max","median","current","文本"}。
+    数据不足或上市未满一年 → None（调用方提示参考可比公司）。
+    最小K线数/最小时点数从 configs/scoring.json [估值守卫.历史PE区间] 读取。
+    """
+    try:
+        from backend.scoring_config import get_valuation_guards as _gvg
+        _hp = _gvg()["pe_band_hist"]
+        if not profit_rows or not hist_bars or len(hist_bars) < _hp["最小K线数"] or total_shares <= 0:
+            return None
+        # 按报告期分组（行内含 date）
+        from statistics import median
+        by_label: dict = {}
+        for p in profit_rows:
+            lbl = p.get("报告期", "")
+            d = str(p.get("date") or "")[:10]
+            net = float(p.get("归母净利润") or p.get("扣非净利润") or 0)
+            if d and lbl:
+                by_label.setdefault(lbl, []).append((d, net))
+        for lbl in by_label:
+            by_label[lbl].sort(key=lambda x: x[0], reverse=True)
+        annuals = by_label.get("年报", [])
+        if not annuals:
+            return None
+        # K线 日期→收盘
+        closes = {}
+        days = []
+        for b in hist_bars:
+            d = str(b.get("day") or "")[:10]
+            c = float(b.get("close", 0) or 0)
+            if d and c > 0:
+                closes[d] = c
+                days.append(d)
+        if not closes:
+            return None
+        days.sort()
+
+        def _close_on(dt: str) -> float:
+            """取 dt 当日或之前最近一个交易日的收盘价。"""
+            cands = [d for d in days if d <= dt]
+            return closes[cands[-1]] if cands else 0.0
+
+        # 全部季度末时点（按日期降序，去重）
+        q_ends = sorted({d for rows in by_label.values() for (d, _) in rows}, reverse=True)
+        pes = []
+        for qd in q_ends:
+            fy = next((r for r in annuals if r[0] <= qd), None)
+            if not fy:
+                continue
+            lbl_q = next((lbl for lbl, rows in by_label.items()
+                          if any(r[0] == qd for r in rows) and lbl != "年报"), None)
+            if not lbl_q:
+                ttm = fy[1]
+            else:
+                same = by_label[lbl_q]
+                cur = next((r for r in same if r[0] == qd), None)
+                prev = next((r for r in same if r[0] < qd), None)
+                ttm = fy[1] + (cur[1] - prev[1] if (cur and prev) else 0)
+            px = _close_on(qd)
+            if ttm > 0 and px > 0:
+                pes.append(px * total_shares / ttm)
+        if len(pes) < _hp["最小时点数"]:
+            return None
+        lo, hi, med = min(pes), max(pes), median(pes)
+        result = {"min": round(lo, 1), "max": round(hi, 1), "median": round(med, 1),
+                  "points": len(pes)}
+        if current_pe > 0:
+            result["current"] = round(current_pe, 1)
+            pos = "低于区间" if current_pe < lo else ("高于区间" if current_pe > hi else "区间内")
+            pct = sum(1 for p in pes if p <= current_pe) / len(pes) * 100
+            result["文本"] = (f"近2年TTM PE区间 {lo:.1f}~{hi:.1f}倍（中位{med:.1f}，{len(pes)}个时点），"
+                             f"当前 {current_pe:.1f} 倍，{pos}（分位≈{pct:.0f}%）")
+        else:
+            result["文本"] = f"近2年TTM PE区间 {lo:.1f}~{hi:.1f}倍（中位{med:.1f}，{len(pes)}个时点）"
+        return result
     except Exception:
         return None
 
@@ -1937,34 +2024,35 @@ def _validate_scenarios(item: dict):
     check = {"arith_ok": True, "monotonic_ok": True, "notes": []}
     # FIX 情景锚定（真实测试暴露）：LLM 情景 EPS 不得脱离 TTM EPS 现实区间，
     # 否则加权价值被荒谬 EPS 假设带飞（托伦斯复验：悲观 EPS=1.2 是 TTM 0.516 的 2.3 倍，
-    # 加权价值 125 元严重高估）。钳制带：悲观[0.3×,1.0×]、基准[0.5×,1.3×]、乐观[0.7×,2.0×]，
-    # 钳制后由下游算术校验按 价格=EPS×PE 重算。
+    # 加权价值 125 元严重高估）。钳制带从 configs/scoring.json [估值守卫.情景EPS带] 读取。
     eps_ttm = None
     try:
         _e = float(item.get("_eps_ttm") or 0)
         eps_ttm = _e if _e > 0 else None
     except (TypeError, ValueError):
         eps_ttm = None
-    _EPS_BAND = {"悲观": (0.3, 1.0), "基准": (0.5, 1.3), "乐观": (0.7, 2.0)}
+    from backend.scoring_config import get_valuation_guards as _gvg
+    _EPS_BAND = {k: tuple(v) for k, v in _gvg()["scenario_eps_band"].items()}
     # 情景 PE 行业中枢锚定带（可信度锚定）：LLM 的 PE 判断保留但不出圈——
-    # 基准 [0.8×, 1.5×] 行业中枢；悲观 [max(0.6×基准, 0.5×中枢), 0.8×基准]；
-    # 乐观 [1.1×基准, min(1.3×基准, 1.5×中枢)]。跨轮方差从 ±4x 收敛到带内。
+    # 阈值从 configs/scoring.json [估值守卫.情景PE带] 读取。跨轮方差从 ±4x 收敛到带内。
     _pe_bands = None
     try:
         _ind_pe0 = float(item.get("投资评级", {}).get("估值明细", {}).get("行业PE中枢", 0) or 0)
     except Exception:
         _ind_pe0 = 0.0
     if _ind_pe0 > 0:
+        _pb = _gvg()["pe_band"]
         _base_pe_now = _num((sc.get("基准") or {}).get("PE")) or 0
-        _base_clamped = (min(max(_base_pe_now, 0.8 * _ind_pe0), 1.5 * _ind_pe0)
+        _base_clamped = (min(max(_base_pe_now, _pb["基准下限"] * _ind_pe0), _pb["基准上限"] * _ind_pe0)
                          if _base_pe_now > 0 else _ind_pe0)
-        _plo_o = 1.1 * _base_clamped
-        _phi_o = 1.5 * _ind_pe0          # 硬顶：任何情景 PE 不超过 1.5× 行业中枢
+        _plo_o = _pb["乐观对基准下限"] * _base_clamped
+        _phi_o = _pb["乐观对中枢上限"] * _ind_pe0          # 硬顶：任何情景 PE 不超过上限× 行业中枢
         if _plo_o > _phi_o:
             _plo_o = _phi_o              # 基准触顶时乐观收敛到同一硬顶
         _pe_bands = {
-            "悲观": (max(0.6 * _base_clamped, 0.5 * _ind_pe0), 0.8 * _base_clamped),
-            "基准": (0.8 * _ind_pe0, 1.5 * _ind_pe0),
+            "悲观": (max(_pb["悲观对基准"][0] * _base_clamped, _pb["悲观对中枢下限"] * _ind_pe0),
+                    _pb["悲观对基准"][1] * _base_clamped),
+            "基准": (_pb["基准下限"] * _ind_pe0, _pb["基准上限"] * _ind_pe0),
             "乐观": (_plo_o, _phi_o),
         }
     prices, probs, eps_map = {}, {}, {}
@@ -2026,20 +2114,22 @@ def _validate_scenarios(item: dict):
             pass
         _pe_now = _sp / _e0 if (_e0 and _sp > 0) else 0
         if _e0 and _pe_now > 0:
-            _pess_eps = round(_e0 * 0.85, 2)
-            _pess_pe = round(max(_pe_now * 0.6, 10), 1)
-            _base_eps = round(_e0, 2)
-            _base_pe = round(_pe_now, 1)
-            _opt_eps = round(_e0 * 1.15, 2)
-            _opt_pe = round(min(_pe_now * 1.2, _pe_now + 15), 1)
+            _ft = _gvg()["scenario_fallback"]
+            _pess_eps = round(_e0 * _ft["悲观"]["EPS"], 2)
+            _pess_pe = round(max(_pe_now * _ft["悲观"]["PE"], _ft["悲观"].get("PE下限", 10)), 1)
+            _base_eps = round(_e0 * _ft["基准"]["EPS"], 2)
+            _base_pe = round(_pe_now * _ft["基准"]["PE"], 1)
+            _opt_eps = round(_e0 * _ft["乐观"]["EPS"], 2)
+            _opt_pe = round(min(_pe_now * _ft["乐观"]["PE"],
+                                _pe_now + _ft["乐观"].get("PE上限加", 15)), 1)
             sc["悲观"] = {"价格": round(_pess_eps * _pess_pe, 2), "EPS": _pess_eps, "PE": _pess_pe,
-                         "假设": "经营恶化：订单下滑+毛利率承压（代码重建）", "概率": "20%"}
+                         "假设": "经营恶化：订单下滑+毛利率承压（代码重建）", "概率": _ft["悲观"]["概率"]}
             sc["基准"] = {"价格": round(_base_eps * _base_pe, 2), "EPS": _base_eps, "PE": _base_pe,
-                         "假设": "经营延续：现有订单与毛利水平维持（代码重建）", "概率": "60%"}
+                         "假设": "经营延续：现有订单与毛利水平维持（代码重建）", "概率": _ft["基准"]["概率"]}
             sc["乐观"] = {"价格": round(_opt_eps * _opt_pe, 2), "EPS": _opt_eps, "PE": _opt_pe,
-                         "假设": "经营改善：新订单放量+产能爬坡（代码重建）", "概率": "20%"}
+                         "假设": "经营改善：新订单放量+产能爬坡（代码重建）", "概率": _ft["乐观"]["概率"]}
             prices = {s: sc[s]["价格"] for s in ["悲观", "基准", "乐观"]}
-            probs = {"悲观": 0.2, "基准": 0.6, "乐观": 0.2}
+            probs = {s: float(sc[s]["概率"].replace("%", "")) / 100 for s in ["悲观", "基准", "乐观"]}
 
     # 单调性：悲观价 ≤ 基准价 ≤ 乐观价
     if len(prices) == 3 and not (prices["悲观"] <= prices["基准"] <= prices["乐观"]):
@@ -2707,7 +2797,7 @@ def reporter_node(state: FinBrainState) -> dict:
             try:
                 import urllib.request as _xr_urllib
                 from backend.calc_engine import cross_validate_fields as _xval
-                _secid = f"1.{sym}" if sym.startswith(("60", "00")) else f"0.{sym}"
+                _secid = f"1.{sym}" if sym.startswith(("60", "68", "9")) else f"0.{sym}"  # 68科创板同属上海（此前漏68→跨源比对对科创板失效）
                 _xr_req = _xr_urllib.Request(
                     f"http://push2.eastmoney.com/api/qt/stock/get?secid={_secid}&fields=f162,f167,f20",
                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com"})
@@ -3062,37 +3152,43 @@ def reporter_node(state: FinBrainState) -> dict:
             ):
                 # LLM未生成有效情景估值 → 代码兜底生成三情景
                 try:
+                    from backend.scoring_config import get_valuation_guards as _gvg_fb
+                    _ft = _gvg_fb()["scenario_fallback"]
                     _sp_now = stock_price
                     _eps_ttm = eps_ttm if eps_ttm > 0 else (float(latest_val.get("每股收益", 0) or 0))
                     _pe_now = _sp_now / _eps_ttm if _eps_ttm > 0 else 0
                     if _eps_ttm > 0 and _pe_now > 0:
                         # 各情景的 EPS 和 PE（先计算，再算价格=EPS×PE，确保算术一致）
-                        _pess_eps = round(_eps_ttm * 0.85, 2)
-                        _pess_pe = round(max(_pe_now * 0.6, 10), 1)
-                        _base_eps = round(_eps_ttm, 2)
-                        _base_pe = round(_pe_now, 1)
-                        _opt_eps = round(_eps_ttm * 1.15, 2)
-                        _opt_pe = round(min(_pe_now * 1.2, _pe_now + 15), 1)
+                        _pess_eps = round(_eps_ttm * _ft["悲观"]["EPS"], 2)
+                        _pess_pe = round(max(_pe_now * _ft["悲观"]["PE"], _ft["悲观"].get("PE下限", 10)), 1)
+                        _base_eps = round(_eps_ttm * _ft["基准"]["EPS"], 2)
+                        _base_pe = round(_pe_now * _ft["基准"]["PE"], 1)
+                        _opt_eps = round(_eps_ttm * _ft["乐观"]["EPS"], 2)
+                        _opt_pe = round(min(_pe_now * _ft["乐观"]["PE"],
+                                            _pe_now + _ft["乐观"].get("PE上限加", 15)), 1)
                         item["情景估值"] = {
                             "悲观": {"价格": round(_pess_eps * _pess_pe, 2),
                                      "EPS": _pess_eps,
                                      "PE": _pess_pe,
-                                     "假设": "利润下滑+估值压缩", "概率": "20%"},
+                                     "假设": "利润下滑+估值压缩", "概率": _ft["悲观"]["概率"]},
                             "基准": {"价格": round(_base_eps * _base_pe, 2),
                                      "EPS": _base_eps,
                                      "PE": _base_pe,
-                                     "假设": "当前增速延续", "概率": "60%"},
+                                     "假设": "当前增速延续", "概率": _ft["基准"]["概率"]},
                             "乐观": {"价格": round(_opt_eps * _opt_pe, 2),
                                      "EPS": _opt_eps,
                                      "PE": _opt_pe,
-                                     "假设": "超预期增长+估值扩张", "概率": "20%"},
+                                     "假设": "超预期增长+估值扩张", "概率": _ft["乐观"]["概率"]},
                         }
                         # 概率加权价值
+                        _probs_fb = {s: float(item["情景估值"][s]["概率"].replace("%", "")) / 100
+                                     for s in ["悲观", "基准", "乐观"]}
+                        _psum_fb = sum(_probs_fb.values())
                         _prices = [item["情景估值"]["悲观"]["价格"],
                                    item["情景估值"]["基准"]["价格"],
                                    item["情景估值"]["乐观"]["价格"]]
                         item["情景估值"]["概率加权价值"] = round(
-                            _prices[0]*0.2 + _prices[1]*0.6 + _prices[2]*0.2, 2
+                            sum(p * w / _psum_fb for p, w in zip(_prices, _probs_fb.values())), 2
                         )
                 except Exception:
                     pass  # 兜底生成失败不影响流程
@@ -3106,13 +3202,19 @@ def reporter_node(state: FinBrainState) -> dict:
                     _eps0 = eps_ttm if eps_ttm > 0 else (float(latest_val.get("每股收益", 0) or 0))
                     _pe0 = stock_price / _eps0 if _eps0 > 0 and stock_price > 0 else 0
                     if _eps0 > 0 and _pe0 > 0:
+                        from backend.scoring_config import get_valuation_guards as _gvg_c
+                        _ftc = _gvg_c()["scenario_fallback"]
                         _tmpl = {
-                            "悲观": {"EPS": round(_eps0 * 0.85, 2), "PE": round(max(_pe0 * 0.6, 10), 1),
-                                     "概率": "20%", "假设": "利润下滑+估值压缩（代码补全）"},
-                            "基准": {"EPS": round(_eps0, 2), "PE": round(_pe0, 1),
-                                     "概率": "60%", "假设": "当前增速延续（代码补全）"},
-                            "乐观": {"EPS": round(_eps0 * 1.15, 2), "PE": round(min(_pe0 * 1.2, _pe0 + 15), 1),
-                                     "概率": "20%", "假设": "超预期增长+估值扩张（代码补全）"},
+                            "悲观": {"EPS": round(_eps0 * _ftc["悲观"]["EPS"], 2),
+                                     "PE": round(max(_pe0 * _ftc["悲观"]["PE"], _ftc["悲观"].get("PE下限", 10)), 1),
+                                     "概率": _ftc["悲观"]["概率"], "假设": "利润下滑+估值压缩（代码补全）"},
+                            "基准": {"EPS": round(_eps0 * _ftc["基准"]["EPS"], 2),
+                                     "PE": round(_pe0 * _ftc["基准"]["PE"], 1),
+                                     "概率": _ftc["基准"]["概率"], "假设": "当前增速延续（代码补全）"},
+                            "乐观": {"EPS": round(_eps0 * _ftc["乐观"]["EPS"], 2),
+                                     "PE": round(min(_pe0 * _ftc["乐观"]["PE"],
+                                                     _pe0 + _ftc["乐观"].get("PE上限加", 15)), 1),
+                                     "概率": _ftc["乐观"]["概率"], "假设": "超预期增长+估值扩张（代码补全）"},
                         }
                         for _s, _t in _tmpl.items():
                             _si = _sc2.get(_s)
@@ -3287,6 +3389,141 @@ def reporter_node(state: FinBrainState) -> dict:
             except Exception:
                 pass  # 利润引擎解剖失败不阻塞报告
 
+            # === A1/A2：历史PE band + 可比公司估值对比 ===
+            try:
+                from backend.tools import fetch_stock_history as _fsh2
+                _hist2 = _fsh2(sym, scale=240, datalen=500)
+                _band = _historical_pe_band(profit_data, (_hist2 or {}).get("data", []),
+                                            total_shares, code_pe)
+                item["_pe_band"] = (_band["文本"] if _band else
+                                    "上市未满一年或历史数据不足，无自身历史PE区间（参考可比公司对比）")
+            except Exception:
+                pass
+            try:
+                _comps = item.get("可比公司") or []
+                _rows2 = []
+                if _comps:
+                    from backend.stock_map import fuzzy_search as _fz
+                    import urllib.request as _u2
+                    from backend.tools import _SSL_CTX as _SSL3
+                    for _cn in _comps[:4]:
+                        _m = _fz(str(_cn), limit=1)
+                        if not _m:
+                            continue
+                        _cc = _m[0]["代码"]
+                        if _cc == sym:
+                            continue
+                        _secid2 = f"1.{_cc}" if _cc.startswith(("60", "68", "9")) else f"0.{_cc}"
+                        try:
+                            _d2 = {}
+                            for _attempt in range(2):  # push2 偶发 502，重试一次
+                                try:
+                                    _rq = _u2.Request(
+                                        f"http://push2.eastmoney.com/api/qt/stock/get?secid={_secid2}&fields=f57,f58,f162,f167",
+                                        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com"})
+                                    with _u2.urlopen(_rq, timeout=8, context=_SSL3) as _resp2:
+                                        _d2 = (json.loads(_resp2.read().decode("utf-8")).get("data") or {})
+                                    if _d2.get("f162"):
+                                        break
+                                except Exception:
+                                    continue
+                            if _d2.get("f162"):
+                                _rows2.append({"代码": _cc, "名称": _d2.get("f58") or _m[0]["名称"],
+                                               "PE": round(float(_d2["f162"]) / 100, 1),
+                                               "PB": round(float(_d2["f167"]) / 100, 1) if _d2.get("f167") else None})
+                        except Exception:
+                            continue
+                if _rows2:
+                    _pes2 = [r["PE"] for r in _rows2 if r.get("PE")]
+                    item["可比公司对比"] = {
+                        "列表": _rows2,
+                        "可比PE均值": round(sum(_pes2) / len(_pes2), 1) if _pes2 else None,
+                        "本股PE": round(code_pe, 1) if code_pe > 0 else None,
+                    }
+            except Exception:
+                pass
+
+            # === A4：预期差三方对照（市场隐含 vs 机构一致预期 vs 本报告基准情景） ===
+            try:
+                _me2 = item.setdefault("市场预期拆解", {})
+                if isinstance(_me2, dict):
+                    _cmp_lines = []
+                    _cagr_v = None
+                    _ce = _calc.get("隐含增速") if _calc else None
+                    if _ce:
+                        _cagr_v = _ce.value
+                        _cmp_lines.append(f"市场隐含（现价定价）：3年利润年复合增速 ≈{_cagr_v:.0f}%")
+                    from backend.web_search import search_institutional_consensus as _sic
+                    _cons = _sic(sym, item.get("名称", sym))
+                    _np26 = (_cons.get("净利润预测") or {}).get("2026")
+                    _ninst = (_cons.get("净利润预测") or {}).get("机构数")
+                    _g26 = None
+                    if _np26 and total_shares > 0 and ann_net > 0:
+                        _eps25 = ann_net / total_shares
+                        if _eps25 > 0:
+                            _g26 = (float(_np26) / _eps25 - 1) * 100
+                            _cmp_lines.append(
+                                f"机构一致预期（{_ninst or '?'}家，同花顺）：2026E EPS {float(_np26):.2f} 元（{_g26:+.0f}%）")
+                    _sc_g = None
+                    _sb = item.get("情景估值", {}).get("基准", {})
+                    if isinstance(_sb, dict) and _sb.get("EPS") and item.get("_eps_ttm"):
+                        _sc_g = (_sb["EPS"] / item["_eps_ttm"] - 1) * 100
+                        _cmp_lines.append(f"本报告基准情景：2026E 增速 {_sc_g:+.0f}%")
+                    if len(_cmp_lines) >= 2:
+                        _me2["预期差对照"] = _cmp_lines
+                        from backend.scoring_config import get_valuation_guards as _gvg_g
+                        _gap_th = _gvg_g()["gap_conclusion_pp"]
+                        if _cagr_v is not None and _g26 is not None and _cagr_v - _g26 > _gap_th:
+                            _me2["预期差结论"] = (f"市场隐含增速（{_cagr_v:.0f}%）显著高于机构一致预期"
+                                f"（{_g26:+.0f}%），定价与卖方共识背离，修正风险大")
+                        elif _cagr_v is not None and _sc_g is not None and _cagr_v - _sc_g > _gap_th:
+                            _me2["预期差结论"] = (f"市场隐含增速（{_cagr_v:.0f}%）远超本报告基准情景"
+                                f"（{_sc_g:+.0f}%），当前价格透支基准假设")
+            except Exception:
+                pass
+
+            # === A3：机构一致预期前瞻表（同花顺多年 EPS 一致预期；无覆盖降级为本报告情景） ===
+            try:
+                from backend.web_search import _fetch_consensus_ths as _fct
+                _ths = _fct(sym) or {}
+                _years = sorted(k for k in _ths.keys() if str(k).isdigit())
+                _rows3 = []
+                _base_eps3 = (ann_net / total_shares if (ann_net > 0 and total_shares > 0)
+                              else (item.get("_eps_ttm") or 0))
+                _prev_eps = _base_eps3
+                for _yk in _years[:3]:
+                    _d3 = _ths[_yk]
+                    _eps3 = float(_d3.get("EPS一致预期", 0) or 0)
+                    if _eps3 <= 0:
+                        continue
+                    _g3 = (_eps3 / _prev_eps - 1) * 100 if _prev_eps > 0 else None
+                    _rows3.append({"年份": f"{_yk}E", "EPS": _eps3, "机构数": _d3.get("机构数"),
+                                   "增速": round(_g3) if _g3 is not None else None,
+                                   "现价PE": round(stock_price / _eps3, 1) if stock_price > 0 else None})
+                    _prev_eps = _eps3
+                if _rows3:
+                    item["一致预期前瞻"] = {"来源": _ths.get("来源", "同花顺"),
+                                          "rows": _rows3,
+                                          "基准年EPS": round(_base_eps3, 2) if _base_eps3 else None}
+                else:
+                    # 无机构覆盖（次新/冷门股）降级：前瞻以本报告情景为准
+                    _sc3b = item.get("情景估值", {})
+                    _fb_rows = []
+                    for _s3 in ("基准", "乐观"):
+                        _si3 = _sc3b.get(_s3, {})
+                        if isinstance(_si3, dict) and isinstance(_si3.get("EPS"), (int, float)) and _si3["EPS"] > 0:
+                            _g3b = ((_si3["EPS"] / item["_eps_ttm"] - 1) * 100
+                                    if item.get("_eps_ttm") else None)
+                            _fb_rows.append({"年份": f"2026E({_s3}情景)", "EPS": _si3["EPS"],
+                                             "增速": round(_g3b) if _g3b is not None else None,
+                                             "现价PE": round(stock_price / _si3["EPS"], 1) if stock_price > 0 else None})
+                    if _fb_rows:
+                        item["一致预期前瞻"] = {"来源": "无机构一致预期覆盖，前瞻以本报告情景为准",
+                                              "rows": _fb_rows, "基准年EPS": None}
+            except Exception:
+                pass
+
+
             # === 三锚点合理区间（可信度呈现）：PE乘数法 / 情景加权 / SOTP 并列 ===
             # 单点合理价值跨轮方差大，区间+出处比单点更可信
             try:
@@ -3328,6 +3565,68 @@ def reporter_node(state: FinBrainState) -> dict:
                     _tb = _trend_buy_price((_hist or {}).get("data", []), stock_price)
                     if _tb:
                         item["趋势参考买入价"] = _tb
+            except Exception:
+                pass
+
+            # === A5：监测表（风险触发器 + 观察窗口；代码日历 + LLM 证伪/观察合并） ===
+            try:
+                # 下一次财报披露窗口（按披露节奏动态推算，不写死）
+                def _next_window(lbl, end_str):
+                    try:
+                        y = int(end_str[:4])
+                    except Exception:
+                        return None
+                    nxt = {"一季报": (f"{y}-08-31", "中报"),
+                           "半年报": (f"{y}-10-31", "三季报"),
+                           "三季报": (f"{y+1}-04-30", "年报"),
+                           "年报": (f"{y+1}-04-30", "一季报")}
+                    r = nxt.get(lbl)
+                    return f"{r[0]}前（{r[1]}披露）" if r else None
+
+                from backend.tools import expected_recent_periods as _erp5
+                _win = None
+                _exp5 = _erp5(count=1)
+                if _exp5:
+                    _win = _next_window(_exp5[0][1], _exp5[0][0])
+                _mon = []
+                # 业绩预告兑现（代码）
+                _fc5 = None
+                _fd5 = item.get("_flash_data") or {}
+                if isinstance(_fd5, dict) and _fd5.get("_预告"):
+                    _fc5 = _fd5
+                elif isinstance(item.get("_nl_pack"), dict) and item["_nl_pack"].get("forecast"):
+                    _fc5 = item["_nl_pack"]["forecast"]
+                if _fc5:
+                    _trig = []
+                    if _fc5.get("营收区间(亿元)"):
+                        lo, hi = _fc5["营收区间(亿元)"]
+                        _trig.append(f"营收{lo}~{hi}亿")
+                    if _fc5.get("归母同比区间"):
+                        lo, hi = _fc5["归母同比区间"]
+                        _trig.append(f"归母净利{lo*100:+.0f}%~{hi*100:+.0f}%" if hi != lo else f"归母净利{lo*100:+.0f}%")
+                    _mon.append({"观察项": "业绩预告兑现", "触发器": "，".join(_trig) or "见预告区间",
+                                 "窗口": _win or "下次财报", "来源": "代码"})
+                # 解禁日程（代码）
+                for _lk in (item.get("_nl_pack") or {}).get("lockups", [])[:3]:
+                    if _lk.get("date"):
+                        _mon.append({"观察项": f"限售解禁（{_lk.get('type','限售股')}）",
+                                     "触发器": (f"{_lk['shares_wan']:.0f}万股" if _lk.get("shares_wan") else "规模见公告"),
+                                     "窗口": str(_lk["date"]), "来源": "代码"})
+                # 趋势支撑（代码）
+                if item.get("趋势参考买入价"):
+                    _mon.append({"观察项": "趋势支撑破位",
+                                 "触发器": f"跌破{item['趋势参考买入价']/1.05:.2f}元（近期最低×1.05反推）",
+                                 "窗口": "日内", "来源": "代码"})
+                # LLM 证伪条件（绑定观察窗口）
+                for _fz in (item.get("证伪条件") or [])[:3]:
+                    _mon.append({"观察项": f"证伪: {str(_fz)[:40]}", "触发器": "触发即逻辑失效",
+                                 "窗口": _win or "持续", "来源": "LLM"})
+                # LLM 观察指标（绑定观察窗口）
+                for _ob in (item.get("观察指标") or [])[:3]:
+                    _mon.append({"观察项": str(_ob)[:50], "触发器": "跟踪读数变化",
+                                 "窗口": _win or "持续", "来源": "LLM"})
+                if _mon:
+                    item["_monitor"] = _mon[:10]
             except Exception:
                 pass
 
