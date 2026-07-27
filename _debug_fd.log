@@ -1,0 +1,12 @@
+_fix_and_decide enter 000725
+_fix_and_decide error 000725: unhashable type: 'dict'
+_fix_and_decide enter 000725
+_fix_and_decide error 000725: unhashable type: 'dict'
+Traceback (most recent call last):
+  File "C:\Users\kunji\Desktop\work learn\agent\backend\agent.py", line 4015, in _fix_and_decide
+    _prepare_data(item, sym)
+  File "C:\Users\kunji\Desktop\work learn\agent\backend\agent.py", line 2467, in _prepare_data
+    cs_data = {{}}
+              ^^^^
+TypeError: unhashable type: 'dict'
+

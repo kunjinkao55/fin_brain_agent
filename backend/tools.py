@@ -928,7 +928,11 @@ def format_report(analysis: dict) -> str:
         lines = []
         code = analysis.get("代码", "?")
         name = analysis.get("名称", "?")
-        current_price = analysis.get("当前股价", 0) or analysis.get("投资评级", {}).get("当前价格", 0)
+        current_price = (
+            analysis.get("当前股价", 0)
+            or analysis.get("投资评级", {}).get("当前价格", 0)
+            or analysis.get("_fd_ctx", {}).get("stock_price", 0)
+        )
 
         lines.append(f"=" * 64)
         lines.append(f"  FinBrain 投资研究: {name} ({code})")
