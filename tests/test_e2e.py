@@ -448,6 +448,55 @@ class TestReportQualityGuards(unittest.TestCase):
         item2 = {"代码": "301583", "名称": "托伦斯"}
         self.assertNotIn("一致预期前瞻", format_report(item2))
 
+    def test_forecast_parse_boe_format(self):
+        """京东方真实预告格式："盈利：500,000 万元–550,000 万元"+“同向上升”+后文重复提及"""
+        from backend.new_listing import parse_performance_forecast
+        content = (
+            "京东方科技集团股份有限公司 2026 年半年度业绩预告\n"
+            "1、业绩预告期间：2026 年 1 月 1 日—2026 年 6 月 30 日\n"
+            "2、预计的业绩：同向上升\n"
+            "      项  目        本报告期            上年同期\n"
+            "                盈利：500,000 万元–550,000 万元\n"
+            " 归属于上市公司股东            盈利：324,689 万元\n"
+            "    的净利润\n"
+            "                比上年同期增长：54% - 69%\n"
+            "                盈利：308,000 万元–331,000 万元\n"
+            " 扣除非经常性损益后\n"
+            "    的净利润\n"
+            "            比上年同期增长：28% - 36%\n"
+            "三、其他说明：归属于上市公司股东的净利润以正式中报为准。\n"
+        )
+        r = parse_performance_forecast(content, "2026年半年度业绩预告")
+        self.assertIsNotNone(r)
+        self.assertAlmostEqual(r["np_min_yi"], 50.0, places=1)
+        self.assertAlmostEqual(r["np_max_yi"], 55.0, places=1)
+        self.assertAlmostEqual(r["np_growth_min"], 0.54, places=2)
+        self.assertAlmostEqual(r["np_growth_max"], 0.69, places=2)
+        self.assertEqual(r["forecast_type"], "预增")
+
+    def test_inv11_narrative_truth_check(self):
+        """INV-11 叙事真值校验：年报归母与预告金额幻觉均为 blocker，真值通过"""
+        from backend.consistency import check_invariants
+        # 京东方幻觉案例 1："2025年归母净利润92亿" vs 真值58.57亿
+        item = {"投资评级": {"评级": "SELL", "合理价值": 5.18, "买入区间": "≤3.37元"},
+                "业绩驱动力": "2025年全年归母净利润92亿元，已为周期底部提供安全垫",
+                "_truth": {"ann_net": 58.57e8, "ann_year": "2025"}}
+        issues = check_invariants(item)
+        self.assertTrue(any(i.rule == "INV-11" and i.severity == "blocker" for i in issues))
+        # 幻觉案例 2："预告归母净利润65亿(中值)" vs 公告区间[50,55]
+        item2 = {"投资评级": {"评级": "SELL", "合理价值": 5.18, "买入区间": "≤3.37元"},
+                 "投资逻辑链": "2026H1预告归母净利润65亿元（中值），全年有望达120-130亿元",
+                 "_truth": {"ann_net": 58.57e8, "ann_year": "2025",
+                            "forecast": {"np_min_yi": 50.0, "np_max_yi": 55.0}}}
+        self.assertTrue(any(i.rule == "INV-11" for i in check_invariants(item2)))
+        # 真值通过：58.57亿 + 预告52.5亿（区间内）
+        item3 = {"投资评级": {"评级": "SELL", "合理价值": 5.18, "买入区间": "≤3.37元"},
+                 "业绩驱动力": "2025年归母净利润58.57亿元",
+                 "投资逻辑链": "2026H1预告归母净利润52.5亿元（中值）",
+                 "_truth": {"ann_net": 58.57e8, "ann_year": "2025",
+                            "forecast": {"np_min_yi": 50.0, "np_max_yi": 55.0}}}
+        self.assertFalse(any(i.rule == "INV-11" for i in check_invariants(item3)))
+
     def test_monitor_table_render(self):
         """A5 监测表：有 _monitor 时替代表格渲染，无则回退旧观察指标段"""
         from backend.tools import format_report

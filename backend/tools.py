@@ -1193,7 +1193,7 @@ def format_report(analysis: dict) -> str:
             if comp.get("可比PE均值") and comp.get("本股PE"):
                 prem = comp["本股PE"] / comp["可比PE均值"] if comp["可比PE均值"] > 0 else 0
                 lines.append(f"    可比PE均值: {comp['可比PE均值']} 倍 | 本股PE: {comp['本股PE']} 倍"
-                             f" → 相对可比溢价 {prem:.1f} 倍")
+                             f" → 相对可比溢价 {prem:.1f} 倍（均值已剔除亏损股负PE）")
 
         # ---- 一致预期前瞻（A3：机构多年EPS一致预期/无覆盖降级为本报告情景）----
         fwd = analysis.get("一致预期前瞻", {})
@@ -1592,6 +1592,8 @@ def _extract_flash_report(clean: str, title: str = "") -> dict | None:
             data["营收同比区间"] = (fc["rev_growth_min"], fc.get("rev_growth_max"))
         if fc.get("np_growth_min") is not None:
             data["归母同比区间"] = (fc["np_growth_min"], fc.get("np_growth_max"))
+        if fc.get("np_min_yi") is not None:
+            data["归母净利区间(亿元)"] = (fc["np_min_yi"], fc.get("np_max_yi"))
         data["forecast"] = fc
         return data
 
@@ -1614,19 +1616,21 @@ def _extract_flash_report(clean: str, title: str = "") -> dict | None:
 
 def _format_flash_hint(flash: dict) -> str:
     """把快报数据格式化成一行提示，供公告列表渲染。"""
-    # FIX-09：业绩预告渲染区间（"预告: 营收3.83~3.98亿(+25.0%~+30.0%), 归母净利-30.0%"）
+    # FIX-09：业绩预告渲染区间（"预告: 归母净利50~55亿(+54%~+69%)，营收3.83~3.98亿"）
     if flash.get("_预告"):
         parts = []
+        if flash.get("归母净利区间(亿元)"):
+            lo, hi = flash["归母净利区间(亿元)"]
+            parts.append(f"归母净利{lo}~{hi}亿" if hi and hi != lo else f"归母净利约{lo}亿")
+        if flash.get("归母同比区间"):
+            lo, hi = flash["归母同比区间"]
+            parts.append(f"({lo*100:+.0f}%~{hi*100:+.0f}%)" if hi and hi != lo else f"({lo*100:+.0f}%)")
         if flash.get("营收区间(亿元)"):
             lo, hi = flash["营收区间(亿元)"]
             parts.append(f"营收{lo}~{hi}亿" if hi and hi != lo else f"营收约{lo}亿")
         if flash.get("营收同比区间"):
             lo, hi = flash["营收同比区间"]
-            parts.append(f"({lo*100:+.0f}%~{hi*100:+.0f}%)" if hi and hi != lo else f"({lo*100:+.0f}%)")
-        if flash.get("归母同比区间"):
-            lo, hi = flash["归母同比区间"]
-            parts.append(f"归母净利{lo*100:+.0f}%~{hi*100:+.0f}%" if hi and hi != lo
-                         else f"归母净利{lo*100:+.0f}%")
+            parts.append(f"营收{lo*100:+.0f}%~{hi*100:+.0f}%" if hi and hi != lo else f"营收{lo*100:+.0f}%")
         period = f"[{flash['报告期']}]" if flash.get("报告期") else ""
         ftype = flash.get("预告类型", "")
         return f"预告{period}{ftype}: " + " ".join(parts) if parts else ""

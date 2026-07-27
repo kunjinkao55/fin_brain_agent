@@ -332,6 +332,76 @@ def _inv10(item: dict, issues: list[Issue]) -> None:
             "周期顶部/底部利润失真将直接传导至估值，建议结合前瞻利润与PB底部复核"))
 
 
+def _narrative_text(item: dict) -> str:
+    """拼接 LLM 叙事字段（INV-11 真值校验的对象范围）。"""
+    parts = []
+    for k in ("投资逻辑链", "业绩驱动力", "估值方法", "操作建议", "止损"):
+        v = item.get(k)
+        if v:
+            parts.append(str(v))
+    for k in ("亮点", "风险", "证伪条件"):
+        v = item.get(k)
+        if isinstance(v, list):
+            parts.extend(str(x) for x in v)
+    for k in ("结论", "综合结论"):
+        v = item.get(k)
+        if isinstance(v, dict):
+            parts.extend(str(x) for x in v.values())
+        elif v:
+            parts.append(str(v))
+    for s in (item.get("关键信号") or []):
+        if isinstance(s, dict):
+            parts.append(str(s.get("数据", "")) + " " + str(s.get("解读", "")))
+    moat = item.get("竞争优势", {})
+    if isinstance(moat, dict):
+        parts.extend(str(x) for x in moat.values() if isinstance(x, str))
+    return "\n".join(parts)
+
+
+def _inv11(item: dict, issues: list[Issue]) -> None:
+    """叙事真值校验（京东方案例实证）：叙事中关键指标数字 vs 数据源真值，偏差>5% → blocker。
+
+    两类高发幻觉：
+      ① "20XX年(全年)归母净利润 X亿" vs 年报归母真值（item["_truth"]["ann_net"]）
+      ② "预告归母净利润 X亿(中值)" vs 业绩预告解析区间（item["_truth"]["forecast"]）
+    """
+    truth = item.get("_truth", {})
+    if not isinstance(truth, dict):
+        return
+    text = _narrative_text(item)
+    if not text:
+        return
+    tol = 0.05
+    ann_net = truth.get("ann_net") or 0
+    fy_year = str(truth.get("ann_year", ""))
+    if ann_net > 0 and fy_year:
+        for m in re.finditer(
+                r'(20\d{2})\s*年(?:全年|年报)?[^。\n]{0,8}?归母净利润[^。\n]{0,10}?([\d,]+(?:\.\d+)?)\s*亿',
+                text):
+            year, v = m.group(1), float(m.group(2).replace(",", ""))
+            if year != fy_year:
+                continue  # 只校验有真值的最近年报年份
+            if "扣非" in text[max(0, m.start() - 10):m.start()]:
+                continue  # 扣非口径不混入此校验
+            if abs(v * 1e8 - ann_net) / ann_net > tol:
+                issues.append(Issue(
+                    "INV-11", "blocker",
+                    f"叙事称{year}年归母净利润{v:g}亿，与数据源年报真值{ann_net/1e8:.2f}亿偏差超5%"
+                    "（疑似幻觉/过时数据，已按真值要求修正）"))
+                return
+    fc = truth.get("forecast") or {}
+    np_lo, np_hi = fc.get("np_min_yi"), fc.get("np_max_yi")
+    if np_lo is not None and np_hi is not None:
+        for m in re.finditer(r'预告[^。\n]{0,20}?归母净利润[^。\n]{0,6}?([\d,]+(?:\.\d+)?)\s*亿', text):
+            v = float(m.group(1).replace(",", ""))
+            if not (np_lo * (1 - tol) <= v <= np_hi * (1 + tol)):
+                issues.append(Issue(
+                    "INV-11", "blocker",
+                    f"叙事称业绩预告归母净利润{v:g}亿，超出公告区间[{np_lo:g},{np_hi:g}]亿"
+                    "（疑似幻觉/过时数据，已按公告真值要求修正）"))
+                return
+
+
 def check_invariants(item: dict, report_text: str = "") -> list[Issue]:
     """对报告 item 执行 10 条跨模块一致性不变量检查（INV-1~6 + 支柱五断路器 INV-7~10）。
 
@@ -341,7 +411,7 @@ def check_invariants(item: dict, report_text: str = "") -> list[Issue]:
     issues: list[Issue] = []
     if not isinstance(item, dict):
         return issues
-    for fn in (_inv1, _inv2, _inv3, _inv6, _inv7, _inv9, _inv10):
+    for fn in (_inv1, _inv2, _inv3, _inv6, _inv7, _inv9, _inv10, _inv11):
         try:
             fn(item, issues)
         except Exception:

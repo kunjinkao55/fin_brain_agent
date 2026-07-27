@@ -2600,6 +2600,11 @@ def reporter_node(state: FinBrainState) -> dict:
                 eps_ttm = float(latest_val.get("每股收益", 0) or 0)  # 回退
             eps = eps_ttm
             item["_eps_ttm"] = eps_ttm  # 供一致性校验(INV-3 情景增速对齐)使用
+            # INV-11 叙事真值校验的真值挂载：年报归母净利与年份（预告真值在次新股/预告块挂载）
+            item["_truth"] = {
+                "ann_net": ann_net,
+                "ann_year": str((annuals_prof[0].get("date") or "")[:4]) if annuals_prof else "",
+            }
             roe = float(latest_val.get("ROE(%)", 0) or 0)
             # 结构突变检测：若最新季度年化ROE远高于年报ROE（V型反转），用年化值替代
             # 避免 compute_investment_rating 用陈旧ROE计算质量乘数（如东山精密FY2025 ROE 6.9%→Q1年化20%）
@@ -3323,6 +3328,7 @@ def reporter_node(state: FinBrainState) -> dict:
                 if not _fc and isinstance(_nl, dict) and _nl.get("forecast"):
                     _fc = _nl["forecast"]
                 if _fc:
+                    item.setdefault("_truth", {})["forecast"] = _fc  # INV-11 预告真值
                     _sc3 = item.get("情景估值", {})
                     _eps_base = item.get("_eps_ttm", 0) or 0
                     _growths = {}
@@ -3434,7 +3440,7 @@ def reporter_node(state: FinBrainState) -> dict:
                         except Exception:
                             continue
                 if _rows2:
-                    _pes2 = [r["PE"] for r in _rows2 if r.get("PE")]
+                    _pes2 = [r["PE"] for r in _rows2 if r.get("PE") and r["PE"] > 0]  # 亏损股PE为负，无均值意义，剔除
                     item["可比公司对比"] = {
                         "列表": _rows2,
                         "可比PE均值": round(sum(_pes2) / len(_pes2), 1) if _pes2 else None,
@@ -4351,9 +4357,9 @@ def reporter_node(state: FinBrainState) -> dict:
         if _inv_hit:
             _audit_rows.append(("一致性守卫", "⚠️", "存在一致性违例，见预检/审计"))
         elif _disabled:
-            _audit_rows.append(("一致性守卫", "✅", f"10条不变量通过；已禁用指标: {','.join(_disabled)}（全文零引用）"))
+            _audit_rows.append(("一致性守卫", "✅", f"11条不变量通过；已禁用指标: {','.join(_disabled)}（全文零引用）"))
         else:
-            _audit_rows.append(("一致性守卫", "✅", "10条不变量通过"))
+            _audit_rows.append(("一致性守卫", "✅", "11条不变量通过"))
 
         # 12. 跨源比对（FIX-12：F10口径 vs 实时行情口径）
         if _it.get("_xval_diffs"):

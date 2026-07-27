@@ -352,27 +352,31 @@ def parse_performance_forecast(content: str, title: str = "") -> Optional[dict]:
             glo, ghi = _range_pct(rev_seg)
             result["rev_growth_min"], result["rev_growth_max"] = glo, ghi
 
-        # 归母净利金额+增速：定位"净利润"（排除"扣非"以免混入口径），
-        # 窗口向前扩 100 字符（"盈利：500,000 万元–550,000 万元"可能位于标签之前）
-        np_idx = -1
-        for kw in ("归属于上市公司股东的净利润", "的净利润", "净利润"):
-            start = 0
-            while True:
-                idx = text.find(kw, start)
-                if idx < 0:
-                    break
-                if "扣非" not in text[max(0, idx - 20):idx]:
-                    np_idx = idx
-                    break
-                start = idx + len(kw)
-            if np_idx >= 0:
+        # 归母净利金额+增速：按文档位置顺序遍历全部"净利润"出现处
+        # （所有标签都含"净利润"，按位置序而非关键词序——京东方案例：
+        #  归母标签在表格首处，扣非标签次之，文末还有"以正式中报为准"的引用）
+        # 关键词前20字符命中"扣除非经常性损益" → 该标签是扣非标签，跳过；
+        # 窗口中部命中 → 截断到扣非段落前，防止扣非数字混入归母口径。
+        np_found = False
+        start = 0
+        while True:
+            idx = text.find("净利润", start)
+            if idx < 0:
                 break
-        if np_idx >= 0:
-            np_win = text[max(0, np_idx - 100):np_idx + 150]
-            lo, hi = _np_amount_yi(np_win)
-            result["np_min_yi"], result["np_max_yi"] = lo, hi
-            glo, ghi = _range_pct(np_win)
-            result["np_growth_min"], result["np_growth_max"] = glo, ghi
+            start = idx + len("净利润")
+            if "扣除非经常性损益" in text[max(0, idx - 20):idx]:
+                continue
+            _win = text[max(0, idx - 100):idx + 150]
+            _kf = _win.find("扣除非经常性损益")
+            if _kf >= 0:
+                _win = _win[:_kf]
+            _lo, _hi = _np_amount_yi(_win)
+            _glo, _ghi = _range_pct(text[idx:idx + 150])  # 增速取标签之后（防"同比增长X%"等营收表述混入）
+            if _lo is not None or _glo is not None:
+                result["np_min_yi"], result["np_max_yi"] = _lo, _hi
+                result["np_growth_min"], result["np_growth_max"] = _glo, _ghi
+                np_found = True
+                break
 
         # 预告类型：标题/正文关键词优先，否则按净利增速方向推断
         merged = (title or "") + " " + text[:300]
