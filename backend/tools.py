@@ -933,6 +933,27 @@ def format_report(analysis: dict) -> str:
             or analysis.get("投资评级", {}).get("当前价格", 0)
             or analysis.get("_fd_ctx", {}).get("stock_price", 0)
         )
+        # 兜底：从操作建议/估值水位/财报数据中提取价格
+        if not current_price:
+            import re as _re_price
+            # 操作建议文本通常含"当前X元"或"≤X元(当前Y元)"
+            _adv = str(analysis.get("操作建议", ""))
+            _m = _re_price.search(r'当前\s*([\d.]+)\s*元', _adv)
+            if _m:
+                current_price = float(_m.group(1))
+        if not current_price:
+            # 从估值水位尝试反推：PE和EPS如果都有，价格=PE×EPS
+            _vw = analysis.get("估值水位", {})
+            _pe = _vw.get("PE") if isinstance(_vw, dict) else None
+            if _pe:
+                try:
+                    _pe = float(str(_pe).replace("倍", ""))
+                    # 从_fd_ctx获取EPS
+                    _eps = analysis.get("_fd_ctx", {}).get("eps_ttm", 0)
+                    if _eps > 0 and _pe > 0:
+                        current_price = round(_pe * _eps, 2)
+                except Exception:
+                    pass
 
         lines.append(f"=" * 64)
         lines.append(f"  FinBrain 投资研究: {name} ({code})")
@@ -951,7 +972,8 @@ def format_report(analysis: dict) -> str:
             lines.append("")
             level = rating.get("评级", "?")
             fair = rating.get("合理价值", "?")
-            margin = rating.get("实际安全边际", rating.get("安全边际要求", rating.get("安全边际", "?")))
+            margin = (rating.get("实际安全边际") or rating.get("安全边际要求")
+                      or rating.get("安全边际") or "?")
             buy_zone = rating.get("买入区间", "?")
             gap = rating.get("估值差距", "")
             weighted = rating.get("加权总分", "")
@@ -964,7 +986,8 @@ def format_report(analysis: dict) -> str:
             else:
                 lines.append(f"  [投资决策] {level_icon} {level}  {price_str}  合理价值: {fair}  安全边际: {margin}")
             if gap: lines.append(f"    估值差距: {gap}")
-            lines.append(f"    安全买入价: {buy_zone}  (需{rating.get('安全边际要求','?')}安全边际)")
+            _margin_req = rating.get('安全边际要求') or '?'
+            lines.append(f"    安全买入价: {buy_zone}  (需{_margin_req}安全边际)" if "不适用" not in str(buy_zone) else f"    安全买入价: {buy_zone}")
             # 双锚点：情景加权为主 + PE乘数法为参考地板
             _pe_ref = rating.get("合理价值(PE乘数法)") if isinstance(rating, dict) else None
             _val_note = rating.get("估值方法说明", "") if isinstance(rating, dict) else ""

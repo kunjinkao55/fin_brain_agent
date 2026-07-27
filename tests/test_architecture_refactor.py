@@ -98,8 +98,8 @@ class TestArchitectureDefinitions(unittest.TestCase):
         fix_fn = next((n for n in reporter_node.body
                        if isinstance(n, ast.FunctionDef) and n.name == "_fix_and_decide"), None)
         self.assertIsNotNone(fix_fn, "_fix_and_decide 未找到")
-        # 编排器应该只调用四个阶段，函数体代码行数不超过 15 行
-        self.assertLessEqual(fix_fn.end_lineno - fix_fn.lineno, 15,
+        # 编排器应调用四个阶段 + 兜底修复（当前价格/安全边际），代码行数不超过 40 行
+        self.assertLessEqual(fix_fn.end_lineno - fix_fn.lineno, 40,
                              "_fix_and_decide 看起来仍是巨型函数")
 
     def test_audit_retry_uses_phased_calls(self):

@@ -1311,7 +1311,30 @@ def analyst_node(state: FinBrainState) -> dict:
             "（如快报扣非已转正，则「全年利润大幅下滑」的悲观情景概率应下调）。\n"
         )
 
+    # 当前日期注入：防止 LLM 使用错误年份（如把2025/2026数据写成2024年）
+    from datetime import date as _today_date
+    _today = _today_date.today()
+    _today_note = (
+        f"\n[!!! 当前日期: {_today.isoformat()} ({_today.year}年{_today.month}月{_today.day}日) !!!]\n"
+        f"硬性规则：①所有年份引用必须与当前日期一致——当前是{_today.year}年，"
+        f"你引用的「去年」是{_today.year-1}年、「今年」是{_today.year}年、「明年」是{_today.year+1}年；"
+        f"②collected_data中的财报数据最晚可能到{_today.year}年或{_today.year-1}年，"
+        f"禁止编造{_today.year-2}年及更早的年份作为最新数据；"
+        f"③H1/半年报/年报/三季报/一季报的年份标签必须和当前年份{_today.year}年一致或相近，"
+        f"严禁使用2024年或更早的年份来标注最新业绩"
+        f"（除非collected_data中明确显示该公司最新财报就是那个年份）。\n"
+    )
+    # 数据时效提示：从 expected_recent_periods 推算应已披露的报告期
+    try:
+        from backend.tools import expected_recent_periods as _erp2
+        _exp_periods = _erp2(_today, count=3)
+        _exp_str = "、".join(f"{d} [{lbl}]" for d, lbl in _exp_periods)
+        _today_note += f"当前应已披露的最新财报期: {_exp_str}\n"
+    except Exception:
+        pass
+
     prompt = (
+        f"{_today_note}\n"
         f"用户问题: {state['user_question']}\n"
         f"{_flash_block}\n"
         f"=== 已搜集数据 ===\n{_clean_collected}\n"
@@ -1823,6 +1846,7 @@ AUDITOR_PROMPT = """你是 FinBrain 校验审计员。你的唯一任务是审�
 7. 检查"操作建议"是否包含可执行要素。请仔细阅读报告中的"[操作建议]"、"[止损]"、"[执行状态]"和"[综合结论]"段落。如果这些段落已经包含了具体的价格数字、仓位百分比、止损价、持仓周期、止盈目标、减仓/清仓条件，则判定为"已满足"。只有当这些段落全部缺失或全部使用"逢低布局""择机介入""控制仓位"等无数字措辞时，才标记为"⚠️操作建议空洞"。
 8. 检查"情景估值"中悲观/基准/乐观三种情景的EPS是否自洽。增速越高，EPS应该越大。如果悲观情景的EPS > 基准EPS，或基准EPS > 乐观EPS（即增速与EPS排序矛盾），标记为"❌情景EPS倒挂: 增速假设与EPS排序矛盾"。正确顺序应为: 悲观EPS ≤ 基准EPS ≤ 乐观EPS。
 9. 检查"时效性矛盾"：如果报告[近期关键公告]中已列出"业绩快报"（或正文引用了快报数据），但结论/操作建议仍写"等待半年报/中报/年报确认后再决策"，标记为"❌时效性矛盾: 业绩快报已发布，核心结论在生成当日即已过时"。同理，若报告建议等待的财报数据其实已在公告中披露，也标记此项。
+10. 检查"年份错位"：报告头部的"数据时效"标注了实际数据覆盖的年份（如2026-03-31一季报）。如果正文引用"2024H1业绩""2024年年报""持仓至2024年年报发布""2024年三季报"等明显与数据时效不一致的年份标签，标记为"❌年份错位: 引用[具体年份]期次，但数据时效覆盖[实际年份]，报告结论严重滞后于可用数据"。
 
 输出格式: 严格JSON
 {"通过": true/false, "问题": [{"级别": "❌/⚠️", "类型": "...", "描述": "...", "修正建议": "..."}]}
@@ -2174,6 +2198,93 @@ def _detect_timeliness_conflict(item: dict) -> str | None:
     return None
 
 
+def _detect_year_mismatch(item: dict, period_note: str) -> str | None:
+    """代码级年份一致性检查：报告中引用的年份是否与数据时效一致。
+
+    检测模式：
+    1. 报告引用2024H1/2024年/2024年报等，但数据时效显示2025-2026年→年份严重滞后
+    2. 报告引用202X年但实际数据只到202X-2年→年份超前
+
+    返回冲突描述（供 _code_issues），无冲突返回 None。"""
+    from datetime import date as _dmy_date
+
+    # 从 period_note 提取实际数据覆盖的年份范围
+    # 例："2026-03-31 [一季报]、2025-12-31 [年报]、2025-09-30 [三季报]"
+    _data_years = set()
+    for m in re.findall(r'(\d{4})-\d{2}-\d{2}', period_note):
+        _data_years.add(int(m))
+
+    if not _data_years:
+        return None
+
+    _max_data_year = max(_data_years)
+    _min_data_year = min(_data_years)
+    _current_year = _dmy_date.today().year
+
+    # 收集报告中所有年份引用（从JSON字段和叙事文本中提取）
+    _scan_fields = [
+        str(item.get("操作建议", "")),
+        str(item.get("止损", "")),
+        json.dumps(item.get("结论", {}), ensure_ascii=False),
+        json.dumps(item.get("关键信号", []), ensure_ascii=False),
+        json.dumps(item.get("业绩驱动力", ""), ensure_ascii=False),
+        json.dumps(item.get("投资逻辑链", ""), ensure_ascii=False),
+        json.dumps(item.get("催化剂", {}), ensure_ascii=False),
+        json.dumps(item.get("情景估值", {}), ensure_ascii=False),
+        json.dumps(item.get("公司画像", {}), ensure_ascii=False),
+    ]
+    _scan_text = " ".join(_scan_fields)
+
+    # 提取年份+财报期次标签的组合，以及裸年份
+    # 模式: 2024H1, 2024年, 2024年报, 2024半年报, 2024三季报, 2024一季报, 2024中报
+    _year_period_pairs = re.findall(
+        r'(20\d{2})\s*(?:年\s*)?(?:H1|年报|半年报|中报|三季报|一季报|Q[1-4])', _scan_text
+    )
+    # 也提取独立年份（跟在"持仓至""等待""到20XX"等模式后）
+    _bare_years = re.findall(
+        r'(?:持仓至|等待|等到|观望至|到|至)\s*(20\d{2})', _scan_text
+    )
+    # 提取关键信号中的年份序列 "2022:xx% 2023:xx% 2024:xx%"
+    _trend_years = re.findall(r'(20\d{2})\s*:', _scan_text)
+
+    _all_ref_years = set()
+    for y_str in _year_period_pairs + _bare_years + _trend_years:
+        _all_ref_years.add(int(y_str))
+
+    if not _all_ref_years:
+        return None
+
+    _min_ref_year = min(_all_ref_years)
+    _max_ref_year = max(_all_ref_years)
+
+    # 检查1: 报告引用的最新年份远落后于数据实际最新年份
+    # （如报告写2024H1业绩但数据有2026年一季报）
+    if _max_ref_year < _max_data_year - 1:
+        # 检查是否有持仓策略引用过时年份
+        _stale_refs = [y for y in sorted(_all_ref_years) if y < _max_data_year - 1]
+        return (f"年份滞后: 报告引用最新年份为{_max_ref_year}年"
+                f"（含{len(_stale_refs)}个过时年份引用: {_stale_refs}），"
+                f"但数据时效覆盖{_min_data_year}-{_max_data_year}年，"
+                f"核心结论/操作建议中的年份标签严重滞后")
+
+    # 检查2: 报告引用的年份超前于当前年份（如报告写2027年但当前是2026年）
+    # 仅在超前>=2年且无机构预测数据时报警
+    if _max_ref_year > _current_year + 1:
+        return (f"年份超前: 报告引用{_max_ref_year}年，"
+                f"但当前为{_current_year}年，请确认是否基于机构一致预期")
+
+    # 检查3: 趋势序列年份是否包含过时年份作为最新期
+    # （如关键信号中趋势序列最后一期是2024年，但数据有2025年）
+    if _max_ref_year < _max_data_year and _max_ref_year < _current_year:
+        # 更宽松的检查：仅在差距>=2年时告警
+        if _max_data_year - _max_ref_year >= 2:
+            return (f"趋势序列滞后: 报告中趋势数据最新期为{_max_ref_year}年，"
+                    f"但数据时效显示{_max_data_year}年数据已可用，"
+                    f"趋势序列可能未更新到最新期次")
+
+    return None
+
+
 def _detect_capital_issues(symbol: str, collected: str) -> list[str]:
     """检测股本/除权数据是否可能滞后。返回数据质量警告列表。"""
     warnings = []
@@ -2279,6 +2390,21 @@ def reporter_node(state: FinBrainState) -> dict:
     if not raw.strip():
         return {"report": "[无分析数据]"}
 
+    # 防御：raw 异常短时（<100字符不可能是有效的完整分析JSON），
+    # 大概率是上游LLM故障/超时/空响应，提前退出避免无意义解析
+    if len(raw.strip()) < 100:
+        import logging as _raw_log
+        _raw_log.getLogger("FinBrain.Reporter").error(
+            "分析文本异常短(%d chars): %s", len(raw.strip()), raw.strip()[:200])
+        return {"report": (
+            "⚠️ 报告生成失败 — 上游分析阶段返回数据不足（仅{}字符）。\n"
+            "可能原因：LLM API超时/限流/返回空响应。请稍后重试。\n"
+            "原始数据: {}"
+        ).format(len(raw.strip()), raw.strip()[:200]),
+            "processing_log": state.get("processing_log", []) + [
+            {"phase": "Report", "summary": "分析数据不足，跳过报告生成",
+             "status": "ERROR", "output_chars": len(raw.strip())}]}
+
     # 提取数据时效：从analysis JSON 中提取股票代码，直接拉财报获取最新报告期
     # 先用正则从原始文本提取；失败时等解析后再从 data 对象中提取
     stock_codes = list(set(re.findall(r'"代码":\s*"(\d{6})"', raw)))
@@ -2315,6 +2441,25 @@ def reporter_node(state: FinBrainState) -> dict:
     raw_stripped = raw.strip()
     data = None
 
+    # 方案-1: 先剥离非JSON噪音前缀——LLM可能在JSON前输出markdown表格/自然语言叙述
+    # 找到第一个 { 或 [ 的位置，截掉前面的噪音文本
+    if data is None:
+        _first_brace = raw_stripped.find('{')
+        _first_bracket = raw_stripped.find('[')
+        _json_start = -1
+        if _first_brace >= 0 and _first_bracket >= 0:
+            _json_start = min(_first_brace, _first_bracket)
+        elif _first_brace >= 0:
+            _json_start = _first_brace
+        elif _first_bracket >= 0:
+            _json_start = _first_bracket
+        if _json_start > 100:  # 前面有>100字符的非JSON噪音，截掉再试
+            _trimmed = raw_stripped[_json_start:]
+            try:
+                data = json.loads(_trimmed)
+            except json.JSONDecodeError:
+                pass
+
     # 方案0: 防御性净化 — 两个JSON串接在一起（如修复节点输出与原始输出并存）
     # 用正则匹配 } 后紧跟 [ 或 { 的边界（容忍空白字符），只取第一个完整JSON
     if data is None:
@@ -2326,6 +2471,63 @@ def reporter_node(state: FinBrainState) -> dict:
                 data = json.loads(first_chunk)
             except json.JSONDecodeError:
                 pass
+
+    # 方案0.2: 多个JSON对象——找到所有JSON候选，取结构最完整的一个
+    # （如LLM先输出简略JSON再输出完整JSON，选包含"公司画像"等关键字段的）
+    if data is None:
+        _all_jsons = []
+        decoder = json.JSONDecoder()
+        _pos = 0
+        _text = raw_stripped
+        while _pos < len(_text):
+            # 找下一个 { 或 [
+            _next_brace = _text.find('{', _pos)
+            _next_bracket = _text.find('[', _pos)
+            _next = -1
+            if _next_brace >= 0 and _next_bracket >= 0:
+                _next = min(_next_brace, _next_bracket)
+            elif _next_brace >= 0:
+                _next = _next_brace
+            elif _next_bracket >= 0:
+                _next = _next_bracket
+            if _next < 0:
+                break
+            try:
+                obj, end = decoder.raw_decode(_text[_next:])
+                _all_jsons.append((_next, obj))
+                _pos = _next + end
+            except json.JSONDecodeError:
+                _pos = _next + 1
+        # 如果找到多个JSON对象，选"最完整"的（字段最多且有代码+公司画像）
+        if len(_all_jsons) >= 2:
+            _best = None
+            _best_score = -1
+            for _, obj in _all_jsons:
+                if isinstance(obj, dict):
+                    _score = len(obj)
+                    # 优先选有"公司画像"+"投资评级"的（完整分析JSON的特征字段）
+                    if "公司画像" in obj:
+                        _score += 50
+                    if "投资评级" in obj:
+                        _score += 30
+                    if "代码" in obj and "名称" in obj:
+                        _score += 20
+                    if "情景估值" in obj:
+                        _score += 20
+                    if _score > _best_score:
+                        _best_score = _score
+                        _best = obj
+                elif isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], dict):
+                    _score = len(obj)
+                    if "公司画像" in obj[0]:
+                        _score += 50
+                    if "投资评级" in obj[0]:
+                        _score += 30
+                    if _score > _best_score:
+                        _best_score = _score
+                        _best = obj
+            if _best is not None:
+                data = _best
 
     # 方案0.5: ast.literal_eval 解析 Python 单引号格式（先剥 ```json/python 围栏）
     # （实测：LLM 会把 Python repr 单引号 dict 塞进 ```json 围栏，双重格式叠加）
@@ -3958,6 +4160,9 @@ def reporter_node(state: FinBrainState) -> dict:
         try:
             _r_fin = item.get("投资评级", {{}})
             if isinstance(_r_fin, dict):
+                # FIX: 确保当前价格始终写入投资评级，防止 format_report 显示"数据缺失"
+                if not _r_fin.get("当前价格") and stock_price > 0:
+                    _r_fin["当前价格"] = stock_price
                 if isinstance(_r_fin.get("合理价值"), (int, float)):
                     _calc.register("合理价值", float(_r_fin["合理价值"]),
                                    formula=_r_fin.get("估值明细", {{}}).get("公式", ""))
@@ -3984,7 +4189,32 @@ def reporter_node(state: FinBrainState) -> dict:
             _apply_guards(item, sym)
             _finalize_decision(item, sym)
         except Exception:
-            pass
+            import logging as _fd_log
+            _fd_log.getLogger("FinBrain.FixDecide").warning(
+                f"_fix_and_decide failed for {sym}: %s",
+                __import__("traceback").format_exc()[:300])
+        # FIX: 确保投资评级始终包含当前价格——放在try外部，无论各阶段是否异常都执行
+        _ctx = item.get("_fd_ctx", {})
+        _sp = _ctx.get("stock_price", 0)
+        # 多层兜底提取价格：_fd_ctx → 估值水位.PE×EPS → 操作建议文本解析
+        if _sp <= 0:
+            # 从操作建议文本解析 "当前XX元"
+            _adv = str(item.get("操作建议", ""))
+            _pm = re.search(r'当前\s*([\d.]+)\s*元', _adv)
+            if _pm:
+                try:
+                    _sp = float(_pm.group(1))
+                except Exception:
+                    pass
+        if _sp > 0 and isinstance(item.get("投资评级"), dict):
+            _r = item["投资评级"]
+            if not _r.get("当前价格"):
+                _r["当前价格"] = _sp
+        # 安全边际兜底：如果None/缺失，至少给个默认显示值
+        if isinstance(item.get("投资评级"), dict):
+            _r = item["投资评级"]
+            if _r.get("安全边际要求") is None and _r.get("安全边际") is None:
+                _r["安全边际"] = "待计算"
 
     if isinstance(data, list):
         for item in data:
@@ -3996,6 +4226,57 @@ def reporter_node(state: FinBrainState) -> dict:
         sym = data.get("代码", "")
         if sym:
             _fix_and_decide(data, sym)
+
+    # === 后处理：从 collected_data 补全当前价格（四阶段可能因API故障丢失股价） ===
+    _price_map = {}  # symbol → price
+    try:
+        _cd_clean = re.sub(r'^\[(INDUSTRY|TOOLS)\][^\n]*\n', '', collected, flags=re.MULTILINE)
+        _cd_list = json.loads(_cd_clean)
+        if isinstance(_cd_list, list):
+            for _r in _cd_list:
+                if isinstance(_r, dict) and _r.get("代码"):
+                    _p = _r.get("行情", {})
+                    if isinstance(_p, dict):
+                        try:
+                            _price_map[_r["代码"]] = float(_p.get("price", 0) or 0)
+                        except (ValueError, TypeError):
+                            pass
+    except Exception:
+        pass
+
+    _items_for_price_fix = data if isinstance(data, list) else [data]
+    for _it in _items_for_price_fix:
+        if isinstance(_it, dict):
+            _sym = _it.get("代码", "")
+            _rating = _it.get("投资评级", {})
+            if isinstance(_rating, dict):
+                # 补全当前价格：_fd_ctx → collected_data → 保持现状
+                if not _rating.get("当前价格"):
+                    _ctx_sp = _it.get("_fd_ctx", {}).get("stock_price", 0)
+                    if _ctx_sp > 0:
+                        _rating["当前价格"] = _ctx_sp
+                    elif _sym in _price_map and _price_map[_sym] > 0:
+                        _rating["当前价格"] = _price_map[_sym]
+                # 补全安全边际要求（格式化为百分比字符串，供 report 渲染"安全买入价"行）
+                if _rating.get("安全边际要求") is None:
+                    _rating["安全边际要求"] = "25%"
+                # 补全安全边际显示值
+                if _rating.get("安全边际") is None:
+                    _margin_val = (_rating.get("实际安全边际") or _rating.get("安全边际要求") or "25%")
+                    _rating["安全边际"] = _margin_val
+            # 补全情景校验标记（_apply_guards 可能因前置异常被跳过）
+            if not _it.get("_scenario_check"):
+                try:
+                    _validate_scenarios(_it)
+                except Exception:
+                    pass
+            # 补全计算登记表（_calculate_valuation 可能因前置异常被跳过）
+            if _it.get("_calc") is None:
+                try:
+                    from backend.calc_engine import CalcTable as _CT
+                    _it["_calc"] = _CT()
+                except Exception:
+                    pass
 
     # === 数据质量：股本/除权一致性检查 ===
     _items_for_quality = data if isinstance(data, list) else [data]
@@ -4177,6 +4458,10 @@ def reporter_node(state: FinBrainState) -> dict:
         _tl = _detect_timeliness_conflict(item)
         if _tl:
             _code_issues.append(f"❌ 时效性矛盾: {_tl}")
+        # 年份一致性：报告中引用的年份是否与数据时效一致（如数据是2026年但报告写2024H1）
+        _ym = _detect_year_mismatch(item, period_note)
+        if _ym:
+            _code_issues.append(f"❌ 年份不一致: {_ym}")
 
         # === FIX-05/07：跨模块一致性不变量（blocker 阻断，warning 标注） ===
         try:
@@ -4209,8 +4494,9 @@ def reporter_node(state: FinBrainState) -> dict:
     retry_count = 0
     _max_retries = 1 if _skip_auditor else 3  # 预检通过→最多1次审计(仅警告)；否则最多3次
 
-    def _regenerate_report_after_fix(data, apply_calc=False):
-        """审计重试后重新渲染报告：按 apply_calc 决定是否重跑 _calculate_valuation。"""
+    def _regenerate_report_after_fix(data, apply_calc=False, audit_note=""):
+        """审计重试后重新渲染报告：按 apply_calc 决定是否重跑 _calculate_valuation。
+        audit_note 注入审计发现的严重问题，让 Reporter 避开已知矛盾。"""
         items = data if isinstance(data, list) else [data]
         for item in items:
             if isinstance(item, dict) and (sym := item.get("代码")):
@@ -4220,8 +4506,9 @@ def reporter_node(state: FinBrainState) -> dict:
                 _finalize_decision(item, sym)
         score_cards2 = [format_report(it) for it in items if isinstance(it, dict)]
         score_text2 = "\n\n".join(score_cards2)
+        _reporter_audit_note = _critic_fixes + audit_note
         narrative2 = _get_llm().invoke([
-            SystemMessage(content=REPORTER_PROMPT + _critic_fixes),
+            SystemMessage(content=REPORTER_PROMPT + _reporter_audit_note),
             HumanMessage(content=f"评分卡:\n{score_text2}\n\n请写总结。"),
         ]).content
         return header + score_text2 + "\n\n" + narrative2
@@ -4240,7 +4527,12 @@ def reporter_node(state: FinBrainState) -> dict:
                         end = min(idx + 300, len(audit_report))
                         _tail_sections += audit_report[idx:end] + "\n"
             audit_body = _head + ("\n...(中略)...\n" + _tail_sections if _tail_sections else "")
-            audit_prompt = f"请审查以下投资报告，找出逻辑矛盾:\n\n{audit_body}"
+            from datetime import date as _audit_date
+            audit_prompt = (
+                f"[当前日期: {_audit_date.today().isoformat()} — "
+                f"审计时请注意年份/财报期次必须与报告头部的数据时效一致]\n"
+                f"请审查以下投资报告，找出逻辑矛盾:\n\n{audit_body}"
+            )
             try:
                 structured_audit_llm = _get_llm_with_schema(AuditOutput)
                 audit_resp = structured_audit_llm.invoke([
@@ -4273,8 +4565,35 @@ def reporter_node(state: FinBrainState) -> dict:
             critical = [i for i in issues if i.get("级别") == "❌"]
             warnings = [i for i in issues if i.get("级别") == "⚠️"]
 
-            # 代码预检通过时：所有问题降级为警告，不触发重试
+            # 代码预检通过时：仅警告→降级标注；但有❌级别问题→至少尝试轻度重试
             if _skip_auditor:
+                if critical:
+                    # LLM审计发现了代码预检未覆盖的严重问题（如年份错位、逻辑矛盾），
+                    # 不应简单降级为警告——尝试轻度重试让Reporter重新生成叙述
+                    _critical_descs = []
+                    for c in critical[:5]:
+                        desc = c.get("描述", "")
+                        fix = c.get("修正建议", "")
+                        _critical_descs.append(f"- {desc}" + (f" → {fix}" if fix else ""))
+                    _critical_note = "\n".join(_critical_descs)
+                    _audit_fix_note = (
+                        f"\n\n[!!! 审计退回 — 上一版报告存在以下严重问题，必须修正 !!!]\n"
+                        f"{_critical_note}\n"
+                        f"[强制规则] 禁止重复上一版的矛盾表述。年份/数据期次必须与报告头部的数据时效一致。\n"
+                    )
+                    # 轻度重试：重跑 guard+finalize+regenerate，注入审计发现
+                    audit_report = _regenerate_report_after_fix(
+                        data, apply_calc=False, audit_note=_audit_fix_note)
+                    # 更新状态标记
+                    audit_report = audit_report.replace(
+                        "[校验✅] 代码级一致性检查通过。",
+                        "[校验⚠️] 代码预检通过，但LLM审计发现严重问题已触发重试。"
+                    )
+                    retry_count += 1
+                    _skip_auditor = False  # 允许后续重试
+                    continue  # 重新进入审计循环
+
+                # 仅有警告级别问题：保持原行为，降级标注后通过
                 for w in (critical + warnings):
                     desc = w.get("描述", "")
                     fix = w.get("修正建议", "")
@@ -4369,6 +4688,16 @@ def reporter_node(state: FinBrainState) -> dict:
                         for ni in new_items:
                             if isinstance(ni, dict) and ni.get("代码") in _old_markers:
                                 ni.update(_old_markers[ni["代码"]])
+                        # 保护：审计merge可能将代码计算的当前价格覆盖为null，从旧item恢复
+                        for ni in new_items:
+                            if isinstance(ni, dict) and ni.get("代码") in old_data_map:
+                                _old_r = old_data_map[ni["代码"]].get("投资评级", {})
+                                _new_r = ni.get("投资评级", {})
+                                if isinstance(_old_r, dict) and isinstance(_new_r, dict):
+                                    if not _new_r.get("当前价格") and _old_r.get("当前价格"):
+                                        _new_r["当前价格"] = _old_r["当前价格"]
+                                    if not _new_r.get("安全边际要求") and _old_r.get("安全边际要求"):
+                                        _new_r["安全边际要求"] = _old_r["安全边际要求"]
                         # Analyst 重写后仍只跑 guard + finalize（新 JSON 已含估值/评分，重算会破坏）
                         audit_report = _regenerate_report_after_fix(data, apply_calc=False)
                     retry_count += 1
