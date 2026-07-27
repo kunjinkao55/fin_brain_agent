@@ -1,0 +1,104 @@
+% !TEX TS-program = xelatex
+% !TEX encoding = UTF-8 Unicode
+\documentclass[10pt,a4paper]{article}
+
+% 中文支持
+\usepackage{ctex}
+
+% 页面边距
+\usepackage[
+    a4paper,
+    left=0.75in,
+    right=0.75in,
+    top=0.60in,
+    bottom=0.50in,
+    nohead
+]{geometry}
+
+% 段落无缩进
+\setlength{\parindent}{0pt}
+
+% 列表与标题格式
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\hypersetup{hidelinks}
+
+\titleformat{\section}
+  {\large\bfseries\raggedright}
+  {}{0em}{}
+  [\titlerule]
+\titlespacing*{\section}{0cm}{*1.2}{*0.8}
+
+\titleformat{\subsection}
+  {\normalsize\bfseries\raggedright}
+  {}{0em}{}
+\titlespacing*{\subsection}{0cm}{*0.9}{*0.3}
+
+\setlist[itemize]{topsep=0.1em, leftmargin=1.5pc, parsep=0pt, itemsep=0.15em}
+
+% 自定义命令
+\newcommand{\name}[1]{%
+  \centerline{\LARGE\bfseries{#1}}
+  \vspace{0.8ex}
+}
+
+\newcommand{\contactInfo}[4]{%
+  \centerline{\normalsize #1 \quad | \quad #2 \quad | \quad #3 \quad | \quad #4}
+  \vspace{0.8ex}
+}
+
+\newcommand{\datedsubsection}[2]{%
+  \subsection[#1]{#1 \hfill #2}%
+}
+
+\begin{document}
+\pagenumbering{gobble}
+
+\name{严书珩}
+
+\contactInfo{(+86) 133-0971-0743}{241220152@smail.niu.edu.cn}{agent应用开发工程师（日常实习）}{随时到岗}
+
+\section{个人总结}
+南京大学计算机科学与技术本科在读，GPA 4.13/5.0。熟悉 Python/Java 后端开发与 AI Agent 工作流构建，独立完成过多 Agent 金融研究系统与数据监控系统模块，注重代码质量与工程可维护性。
+
+\section{教育背景}
+\datedsubsection{\textbf{南京大学}, 计算机科学与技术, 本科在读}{2024.09 - 至今}
+\begin{itemize}
+  \item \textbf{GPA: 4.13 / 5.0}，主修课程：计算机系统基础、操作系统、数据结构、算法设计、智能应用开发、软件分析、计算机网络
+  \item 英语能力：CET-4 (526)
+\end{itemize}
+
+\section{技术能力}
+\begin{itemize}
+  \item \textbf{编程语言}: Java（基础、集合、JVM、并发）, Python（基础、Agent 开发框架）
+  \item \textbf{后端框架}: Spring 生态、FastAPI、Flask
+  \item \textbf{数据库与中间件}: MySQL、Redis、ChromaDB
+  \item \textbf{Agent 框架}: LangChain、LangGraph、MCP
+  \item \textbf{开发与运维}: Git、Linux 基础、Docker 基础
+\end{itemize}
+
+\section{实习经历}
+\datedsubsection{\textbf{甘肃金诺安电子科技有限公司}, 软件开发实习生}{2025.06 - 2025.09}
+\begin{itemize}
+  \item 参与数据监控系统中跨账户定时自动数据通信模块的开发与测试
+  \item 基于 Python + Flask + MySQL 生态实现数据采集、传输与状态监控功能
+  \item 配合完成模块联调与问题定位，保障多账户数据通道稳定运行
+\end{itemize}
+
+\section{项目经历}
+\datedsubsection{\textbf{FinBrain — 多 Agent 金融投资研究系统}}{2024.10 - 至今}
+\begin{itemize}
+  \item \textbf{多 Agent 架构}：基于 LangGraph 构建 8 节点研究流水线（Data → Classify → Analyst → Valuation → Critics → Repair → Reporter → Audit）；Data/Critics 内多线程并行，Critic 未通过自动路由 Repair 重试。
+  \item \textbf{Harness 工程体系}：Pydantic Schema 约束 LLM 结构化输出；财务指标、评分、估值由代码计算，LLM 仅叙事；12+ 项确定性不变量守卫数字一致性。
+  \item \textbf{熔断与容错}：3 槽位 LLM Fallback（DeepSeek/OpenAI/Anthropic），单模型失败自动切换；LangGraph 条件分支处理数据不足重取、Critic 失败修复等路径。
+  \item \textbf{数据可靠性与 Trace}：正式财报 + 业绩快报双通道接入，merge\_flash 合并最新期间；代码检测股本除权滞后、时效矛盾、EPS 自洽；节点输出 Execution Trace 记录工具/RAG/LLM 槽位/修复动作，全程可回溯。
+  \item \textbf{RAG 动态知识库}：ChromaDB + ONNX 本地嵌入模型构建行业模板与会计规则向量库；按公司行业自动检索相关知识片段并注入 Prompt，替代固定知识库，提升叙事专业性与可解释性。
+  \item \textbf{配置化与产品化}：LLM 槽位、数据源、评分权重、策略 Prompt 全部外置到 `configs/`（环境变量 + JSON）；前端覆盖 Chat / 深度分析 / 模拟盘 / 回测 / 设置，形成可配置、可评测的完整 Agent 产品。
+  \item \textbf{测试与评测}：148 项测试（88 e2e + 28 golden + 32 引擎/插槽）覆盖结构化输出、路由、Fallback、数据插槽；修复无限循环、TTM EPS 错误等 9 项严重问题。技术栈：LangGraph / LangChain / Pydantic / ChromaDB / Streamlit / FastAPI / SQLite。
+\end{itemize}
+
+\datedsubsection{\textbf{Token 点评 — 高并发点评 Web 平台}}{（规划中）}
+% TODO: 项目描述待补充
+
+\end{document}
