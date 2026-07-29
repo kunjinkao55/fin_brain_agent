@@ -9,3 +9,4 @@ data/raw/
 docs/*
 !docs/README.md
 !docs/README_CN.md
+简历/*
