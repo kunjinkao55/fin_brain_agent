@@ -439,8 +439,9 @@ def get_agents():
             "phantom": _get_phantom_agent(), "classify": _classify_request}
 
 def _to_lc(h):
-    from langchain_core.messages import HumanMessage, AIMessage
-    return [HumanMessage(content=m["content"]) if m["role"]=="user" else AIMessage(content=m["content"]) for m in h]
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+    message_types = {"user": HumanMessage, "assistant": AIMessage, "system": SystemMessage}
+    return [message_types.get(m["role"], HumanMessage)(content=m["content"]) for m in h]
 
 class StreamHandler(BaseCallbackHandler):
     """捕获LLM流式输出的每个token，更新Streamlit占位符"""
@@ -459,7 +460,7 @@ def run_agent(user_input: str, stream_placeholder=None) -> tuple[str, list, str,
     agents = get_agents()
     # 历史压缩：超过阈值时用LLM摘要旧消息，只保留最近N条原文
     from backend.agent import compress_history
-    compressed = compress_history(st.session_state.chat_history)
+    compressed = compress_history(st.session_state.chat_history, query=user_input)
     msgs = _to_lc(compressed) + [{"role": "user", "content": user_input}]
     tracker = ToolCallTracker()
     callbacks = [tracker]
@@ -966,13 +967,48 @@ elif page == "Knowledge":
             help="支持 PDF/DOCX/TXT/MD/CSV/JSON，自动解析+切片+向量化",
         )
         if uploaded_file is not None:
+            with st.expander("Source Metadata (recommended for reliable retrieval)", expanded=False):
+                meta_c1, meta_c2 = st.columns(2)
+                with meta_c1:
+                    kb_source_url = st.text_input("Source URL", key="kb_source_url",
+                                                  placeholder="https://...", help="原始公告、报告或规则的链接")
+                    kb_symbol = st.text_input("Stock Code (optional)", key="kb_symbol",
+                                              placeholder="e.g. 600519")
+                    kb_industry = st.text_input("Industry (optional)", key="kb_industry",
+                                                placeholder="e.g. 半导体 / 医药")
+                with meta_c2:
+                    kb_publisher = st.text_input("Publisher (optional)", key="kb_publisher",
+                                                  placeholder="e.g. 上交所 / 公司公告")
+                    kb_published_at = st.text_input("Published Date (optional)", key="kb_published_at",
+                                                     placeholder="YYYY-MM-DD")
+                    kb_document_type = st.selectbox(
+                        "Document Type", ["auto", "annual_report", "announcement", "industry_report",
+                                          "policy", "research_note", "dataset", "note"],
+                        key="kb_document_type",
+                    )
+                kb_trust_level = st.selectbox(
+                    "Source Trust Level", ["unverified", "official", "exchange_filing", "curated"],
+                    key="kb_trust_level",
+                    help="用于后续检索过滤，不会替代人工核验。",
+                )
             if st.button("Index Document", type="primary", key="kb_index_btn"):
                 with st.spinner(f"Parsing & indexing '{uploaded_file.name}'..."):
                     try:
+                        source_metadata = {
+                            "source_url": kb_source_url.strip(),
+                            "symbol": kb_symbol.strip(),
+                            "industry": kb_industry.strip(),
+                            "publisher": kb_publisher.strip(),
+                            "published_at": kb_published_at.strip(),
+                            "trust_level": kb_trust_level,
+                        }
+                        if kb_document_type != "auto":
+                            source_metadata["document_type"] = kb_document_type
                         result = upload_document(
                             uploaded_file.getvalue(),
                             uploaded_file.name,
                             target_kb,
+                            metadata=source_metadata,
                         )
                         st.success(
                             f"Indexed: **{result['filename']}** → "
@@ -1026,19 +1062,37 @@ elif page == "Knowledge":
             key="kb_search_select",
         )
         search_query = st.text_input("Query", placeholder="e.g. 收入确认五步法 / 商誉减值测试条件", key="kb_search_input")
+        search_c1, search_c2 = st.columns(2)
+        with search_c1:
+            search_symbol_filter = st.text_input("Filter by Stock Code (optional)", key="kb_search_symbol")
+        with search_c2:
+            search_industry_filter = st.text_input("Filter by Industry (optional)", key="kb_search_industry")
 
         if search_query and st.button("Search", type="primary", key="kb_search_btn"):
             with st.spinner("Searching..."):
                 try:
-                    results = search_kb(search_query, search_kb_sel, top_k=5)
+                    metadata_filter = {}
+                    if search_symbol_filter.strip():
+                        metadata_filter["symbol"] = search_symbol_filter.strip()
+                    if search_industry_filter.strip():
+                        metadata_filter["industry"] = search_industry_filter.strip()
+                    results = search_kb(
+                        search_query, search_kb_sel, top_k=5,
+                        metadata_filter=metadata_filter or None,
+                    )
                     if results:
                         for i, r in enumerate(results):
                             score_color = "#4caf50" if r["score"] > 0.7 else ("#ff9800" if r["score"] > 0.4 else "#cc3333")
+                            citation = r.get("citation", {})
                             st.markdown(
                                 f"**#{i+1}** `{r['source']}` [{r['chunk']}] "
-                                f"<span style='color:{score_color}'>score: {r['score']}</span>",
+                                f"<span style='color:{score_color}'>retrieval score: {r['score']}</span>",
                                 unsafe_allow_html=True,
                             )
+                            if citation:
+                                st.caption(f"Citation: {citation.get('ref', '')} · {citation.get('location', '')}")
+                            if r.get("source_url"):
+                                st.markdown(f"[Open original source]({r['source_url']})")
                             st.caption(r["content"][:400] + ("..." if len(r["content"]) > 400 else ""))
                             st.divider()
                     else:
@@ -1878,11 +1932,25 @@ elif page == "Settings":
             st.success("Saved. Restart to apply.")
 
         st.divider()
-        c1,c2 = st.columns(2)
-        with c1: st.number_input("Compress Trigger", value=int(os.getenv("COMPRESS_TRIGGER","12")), min_value=4, key="ct2")
-        with c2: st.number_input("Compress Keep", value=int(os.getenv("COMPRESS_KEEP","6")), min_value=2, key="ck2")
+        st.caption("Context Memory (applies to new messages in this session)")
+        c1, c2, c3 = st.columns(3)
+        with c1: st.number_input("Recent Turns", value=int(os.getenv("CONTEXT_RECENT_TURNS", "3")), min_value=1, key="ctx_recent")
+        with c2: st.number_input("Trigger Chars", value=int(os.getenv("CONTEXT_TRIGGER_CHARS", "12000")), min_value=1000, step=1000, key="ctx_trigger")
+        with c3: st.number_input("Max Context Chars", value=int(os.getenv("CONTEXT_MAX_CHARS", "16000")), min_value=2000, step=1000, key="ctx_max")
+        c4, c5 = st.columns(2)
+        with c4: st.number_input("Memory Chars", value=int(os.getenv("CONTEXT_MEMORY_CHARS", "2400")), min_value=500, step=100, key="ctx_memory")
+        with c5: st.number_input("Structured Facts", value=int(os.getenv("CONTEXT_STRUCTURED_FACTS", "24")), min_value=8, key="ctx_facts")
         if st.button("Save Compress Config", type="primary", key="save_compress"):
-            os.environ["COMPRESS_TRIGGER"] = str(st.session_state.get("ct2",12))
-            os.environ["COMPRESS_KEEP"] = str(st.session_state.get("ck2",6))
-            st.success("Applied")
+            from backend import agent as context_agent
+            values = {
+                "CONTEXT_RECENT_TURNS": int(st.session_state.get("ctx_recent", 3)),
+                "CONTEXT_TRIGGER_CHARS": int(st.session_state.get("ctx_trigger", 12000)),
+                "CONTEXT_MAX_CHARS": int(st.session_state.get("ctx_max", 16000)),
+                "CONTEXT_MEMORY_CHARS": int(st.session_state.get("ctx_memory", 2400)),
+                "CONTEXT_STRUCTURED_FACTS": int(st.session_state.get("ctx_facts", 24)),
+            }
+            for name, value in values.items():
+                os.environ[name] = str(value)
+                setattr(context_agent, name, value)
+            st.success("Applied to new messages")
     st.divider(); st.caption("FinBrain v0.3")

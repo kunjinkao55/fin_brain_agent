@@ -14,11 +14,13 @@ FinBrain 多知识库 RAG 模块 — 用户上传文档 → 解析 → 切片 �
 
 import os
 import json
+import re
 import uuid
+import hashlib
 import logging
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import chromadb
 
@@ -29,6 +31,17 @@ _DB_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw", "chroma")
 _UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "uploads")
 _CHUNK_SIZE = 500       # 每块约500字
 _CHUNK_OVERLAP = 50     # 块间重叠50字
+
+# 文档级元数据与检索过滤白名单。字段保持 Chroma 可持久化的标量类型，避免将
+# 任意上传 JSON 直接写入向量库；其中日期使用 ISO-8601 字符串，便于后续迁移到
+# 支持范围过滤的检索后端。
+_FILTERABLE_METADATA = {
+    "source", "source_type", "document_type", "publisher", "source_url", "industry",
+    "symbol", "published_at", "effective_date", "expires_at", "trust_level", "version",
+    "is_current", "doc_id",
+}
+_METADATA_ALIASES = {"security_code": "symbol", "ticker": "symbol"}
+_FILTER_OPERATORS = {"$eq", "$ne", "$in", "$nin", "$gt", "$gte", "$lt", "$lte"}
 
 # 内置知识库定义：{kb_name: {display_name, description}}
 _BUILTIN_KBS = {
@@ -45,6 +58,206 @@ _client: Optional[chromadb.PersistentClient] = None
 _embed_fn = None
 _init_lock = threading.Lock()
 _initialized = False
+
+
+def _infer_document_type(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    return {"pdf": "report", "docx": "report", "doc": "report", "csv": "dataset",
+            "json": "dataset", "md": "note", "txt": "note"}.get(ext, "document")
+
+
+def _normalise_source_metadata(metadata: Optional[dict], *, source: str,
+                               filename: str, kb_name: str) -> dict:
+    """接受有限、可检索的金融文档元数据，并给出稳定默认值。"""
+    raw = metadata if isinstance(metadata, dict) else {}
+    clean: dict[str, Any] = {}
+    for key, value in raw.items():
+        key = _METADATA_ALIASES.get(key, key)
+        if key not in _FILTERABLE_METADATA or key in {"source", "doc_id"}:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            if isinstance(value, str) and len(value) > 500:
+                raise ValueError(f"元数据字段 {key} 不能超过 500 个字符")
+            clean[key] = value
+
+    symbol = str(clean.get("symbol", "")).strip()
+    if symbol and not (len(symbol) == 6 and symbol.isdigit()):
+        raise ValueError("symbol/security_code 必须是 6 位股票代码")
+    if symbol:
+        clean["symbol"] = symbol
+
+    source_url = str(clean.get("source_url", "")).strip()
+    if source_url and not re.match(r"^https?://", source_url, re.IGNORECASE):
+        raise ValueError("source_url 必须以 http:// 或 https:// 开头")
+    clean["source_url"] = source_url
+    for date_key in ("published_at", "effective_date", "expires_at"):
+        date_value = str(clean.get(date_key, "")).strip()
+        if date_value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value):
+            raise ValueError(f"{date_key} 必须使用 YYYY-MM-DD 格式")
+        clean[date_key] = date_value
+
+    clean.setdefault("source_type", "builtin_template" if source == "builtin" else "user_upload")
+    clean.setdefault("document_type", "template" if source == "builtin" else _infer_document_type(filename))
+    clean.setdefault("publisher", "FinBrain" if source == "builtin" else "")
+    clean.setdefault("source_url", "")
+    clean.setdefault("industry", "")
+    clean.setdefault("published_at", "")
+    clean.setdefault("effective_date", "")
+    clean.setdefault("expires_at", "")
+    clean.setdefault("trust_level", "curated" if source == "builtin" else "unverified")
+    clean.setdefault("version", "")
+    clean.setdefault("is_current", True)
+    clean["kb"] = kb_name
+    return clean
+
+
+def _chunk_metadata(*, doc_id: str, filename: str, chunk_index: int,
+                    total_chunks: int, char_count: int, kb_name: str,
+                    source: str, source_metadata: Optional[dict] = None,
+                    content_hash: str = "") -> dict:
+    metadata = {
+        "doc_id": doc_id,
+        "filename": filename,
+        "chunk_index": chunk_index,
+        "total_chunks": total_chunks,
+        "upload_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "char_count": char_count,
+        "source": source,
+        "content_hash": content_hash,
+    }
+    metadata.update(_normalise_source_metadata(source_metadata, source=source,
+                                                filename=filename, kb_name=kb_name))
+    return metadata
+
+
+def _build_metadata_filter(metadata_filter: Optional[dict]) -> Optional[dict]:
+    """将简单的字段过滤转换为 Chroma `where` 语法，拒绝未知字段。"""
+    if not metadata_filter:
+        return None
+    if not isinstance(metadata_filter, dict):
+        raise ValueError("metadata_filter 必须是字典")
+
+    predicates = []
+    for raw_key, value in metadata_filter.items():
+        key = _METADATA_ALIASES.get(raw_key, raw_key)
+        if key not in _FILTERABLE_METADATA:
+            raise ValueError(f"不支持的 RAG 过滤字段: {raw_key}")
+        if isinstance(value, dict):
+            if len(value) != 1 or next(iter(value)) not in _FILTER_OPERATORS:
+                raise ValueError(f"过滤条件 {raw_key} 仅支持: {', '.join(sorted(_FILTER_OPERATORS))}")
+            predicates.append({key: value})
+        elif isinstance(value, (str, int, float, bool)):
+            predicates.append({key: value})
+        else:
+            raise ValueError(f"过滤条件 {raw_key} 的值必须是标量或单一操作符字典")
+    if not predicates:
+        return None
+    return predicates[0] if len(predicates) == 1 else {"$and": predicates}
+
+
+def _keyword_terms(query: str) -> set[str]:
+    """轻量关键词召回信号，补足证券代码、术语和中文短语的精确匹配。"""
+    terms = set(re.findall(r"(?<!\d)\d{6}(?!\d)", query))
+    terms.update(re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,}", query.lower()))
+    for phrase in re.findall(r"[\u4e00-\u9fff]{2,}", query):
+        terms.add(phrase)
+        # 长中文短语的双字切分提升“商誉减值测试”等术语召回率。
+        if len(phrase) <= 16:
+            terms.update(phrase[i:i + 2] for i in range(len(phrase) - 1))
+    return {term.lower() for term in terms if len(term) >= 2}
+
+
+def _keyword_score(text: str, terms: set[str]) -> float:
+    if not terms:
+        return 0.0
+    lowered = text.lower()
+    matched = sum(1 for term in terms if term in lowered)
+    return matched / len(terms)
+
+
+def _citation(meta: dict) -> tuple[str, str]:
+    doc_id = str(meta.get("doc_id", "unknown"))
+    chunk_index = int(meta.get("chunk_index", 0)) + 1
+    total_chunks = meta.get("total_chunks", "?")
+    citation_id = f"{doc_id}#chunk-{chunk_index}"
+    source = meta.get("filename", "unknown")
+    publisher = meta.get("publisher", "")
+    date = meta.get("published_at") or meta.get("upload_date", "")
+    url = meta.get("source_url", "")
+    details = [str(source), f"片段 {chunk_index}/{total_chunks}"]
+    if publisher:
+        details.append(str(publisher))
+    if date:
+        details.append(str(date))
+    if url:
+        details.append(str(url))
+    return citation_id, "【来源：" + "｜".join(details) + "】"
+
+
+_BUILTIN_INDUSTRY_TAGS = {
+    "ind_semiconductor": "半导体", "ind_power": "电力/能源", "ind_pharma": "医药",
+    "ind_consumer": "消费", "ind_communication": "通信/光模块",
+    "ind_manufacturing": "制造/新能源", "ind_financial": "金融",
+    "ind_realestate": "地产/建筑", "ind_it_services": "软件/IT服务",
+}
+_BUILTIN_METADATA_BACKFILLED: set[str] = set()
+_INDUSTRY_ALIASES = (
+    ("半导体", "半导体"), ("电力", "电力/能源"), ("能源", "电力/能源"),
+    ("医药", "医药"), ("医疗", "医药"), ("消费", "消费"), ("食品", "消费"),
+    ("白酒", "消费"), ("家电", "消费"), ("通信", "通信/光模块"),
+    ("光模块", "通信/光模块"), ("新能源", "制造/新能源"), ("制造", "制造/新能源"),
+    ("汽车", "制造/新能源"), ("银行", "金融"), ("证券", "金融"), ("保险", "金融"),
+    ("地产", "地产/建筑"), ("房地产", "地产/建筑"), ("建筑", "地产/建筑"),
+    ("软件", "软件/IT服务"), ("it服务", "软件/IT服务"), ("信息服务", "软件/IT服务"),
+    ("电网信息", "软件/IT服务"),
+)
+
+
+def normalize_industry_for_rag(industry: str) -> Optional[str]:
+    """将数据源行业名映射到内置行业模板；未知分类回退为不加过滤的语义检索。"""
+    lowered = str(industry or "").strip().lower()
+    for alias, canonical in _INDUSTRY_ALIASES:
+        if alias in lowered:
+            return canonical
+    return None
+
+
+def _builtin_chunk_metadata(item: dict, *, kb_name: str, prefix: str,
+                            published_at: str = "2026-07-15") -> dict:
+    source_metadata = {
+        "publisher": "FinBrain", "published_at": published_at,
+        "version": f"builtin-{published_at}", "document_type": "template",
+        "trust_level": "curated", "is_current": True,
+    }
+    if kb_name == "industry":
+        source_metadata["industry"] = _BUILTIN_INDUSTRY_TAGS.get(item["id"], "")
+    return _chunk_metadata(
+        doc_id=item["id"], filename=f"{prefix}{item['title']}", chunk_index=0,
+        total_chunks=1, char_count=len(item["content"]), kb_name=kb_name,
+        source="builtin", source_metadata=source_metadata, content_hash=item["id"],
+    )
+
+
+def _backfill_builtin_metadata(col, items: list[dict], *, kb_name: str, prefix: str,
+                               published_at: str = "2026-07-15") -> None:
+    """为升级前已播种的 collection 补齐可过滤元数据；每个 KB 每进程只做一次。"""
+    if kb_name in _BUILTIN_METADATA_BACKFILLED or not hasattr(col, "update"):
+        return
+    try:
+        data = col.get(include=["metadatas"])
+        existing_ids = set(data.get("ids", []))
+        ids, metadatas = [], []
+        for item in items:
+            if item["id"] in existing_ids:
+                ids.append(item["id"])
+                metadatas.append(_builtin_chunk_metadata(
+                    item, kb_name=kb_name, prefix=prefix, published_at=published_at))
+        if ids:
+            col.update(ids=ids, metadatas=metadatas)
+    except Exception as e:
+        logger.warning("Failed to backfill %s RAG metadata: %s", kb_name, e)
+    finally:
+        _BUILTIN_METADATA_BACKFILLED.add(kb_name)
 
 
 def _ensure_init():
@@ -527,19 +740,12 @@ def seed_accounting_kb() -> dict:
             continue
         new_ids.append(item["id"])
         new_docs.append(f"【{item['title']}】{item['content']}")
-        new_metas.append({
-            "doc_id": item["id"],
-            "filename": f"[预置]{item['title']}",
-            "chunk_index": 0,
-            "total_chunks": 1,
-            "upload_date": "2026-07-15 (built-in)",
-            "char_count": len(item["content"]),
-            "source": "builtin",
-        })
+        new_metas.append(_builtin_chunk_metadata(item, kb_name="accounting", prefix="[预置]"))
 
     if new_docs:
         col.add(documents=new_docs, ids=new_ids, metadatas=new_metas)
         logger.info("Seeded %d accounting KB entries (skipped %d existing)", len(new_docs), skipped)
+    _backfill_builtin_metadata(col, _ACCOUNTING_SEED, kb_name="accounting", prefix="[预置]")
 
     return {"seeded": len(new_docs), "skipped": skipped}
 
@@ -739,15 +945,13 @@ def seed_slang_kb() -> dict:
             continue
         new_ids.append(item["id"])
         new_docs.append(f"【{item['title']}】{item['content']}")
-        new_metas.append({
-            "doc_id": item["id"], "filename": f"[黑话]{item['title']}",
-            "chunk_index": 0, "total_chunks": 1,
-            "upload_date": "2026-07-23 (built-in)", "char_count": len(item["content"]),
-            "source": "builtin",
-        })
+        new_metas.append(_builtin_chunk_metadata(
+            item, kb_name="slang", prefix="[黑话]", published_at="2026-07-23"))
     if new_docs:
         col.add(documents=new_docs, ids=new_ids, metadatas=new_metas)
         logger.info("Seeded %d slang entries (skipped %d existing)", len(new_docs), skipped)
+    _backfill_builtin_metadata(
+        col, _STOCK_SLANG, kb_name="slang", prefix="[黑话]", published_at="2026-07-23")
     return {"seeded": len(new_docs), "skipped": skipped}
 
 
@@ -766,16 +970,12 @@ def seed_trading_kb() -> dict:
             continue
         new_ids.append(item["id"])
         new_docs.append(f"【{item['title']}】{item['content']}")
-        new_metas.append({
-            "doc_id": item["id"], "filename": f"[模板]{item['title']}",
-            "chunk_index": 0, "total_chunks": 1,
-            "upload_date": "2026-07-15 (built-in)", "char_count": len(item["content"]),
-            "source": "builtin",
-        })
+        new_metas.append(_builtin_chunk_metadata(item, kb_name="trading", prefix="[模板]"))
 
     if new_docs:
         col.add(documents=new_docs, ids=new_ids, metadatas=new_metas)
         logger.info("Seeded %d trading templates (skipped %d existing)", len(new_docs), skipped)
+    _backfill_builtin_metadata(col, _TRADING_TEMPLATES, kb_name="trading", prefix="[模板]")
     return {"seeded": len(new_docs), "skipped": skipped}
 
 
@@ -794,16 +994,12 @@ def seed_industry_kb() -> dict:
             continue
         new_ids.append(item["id"])
         new_docs.append(f"【{item['title']}】{item['content']}")
-        new_metas.append({
-            "doc_id": item["id"], "filename": f"[模板]{item['title']}",
-            "chunk_index": 0, "total_chunks": 1,
-            "upload_date": "2026-07-15 (built-in)", "char_count": len(item["content"]),
-            "source": "builtin",
-        })
+        new_metas.append(_builtin_chunk_metadata(item, kb_name="industry", prefix="[模板]"))
 
     if new_docs:
         col.add(documents=new_docs, ids=new_ids, metadatas=new_metas)
         logger.info("Seeded %d industry templates (skipped %d existing)", len(new_docs), skipped)
+    _backfill_builtin_metadata(col, _INDUSTRY_TEMPLATES, kb_name="industry", prefix="[模板]")
     return {"seeded": len(new_docs), "skipped": skipped}
 
 
@@ -853,17 +1049,21 @@ def list_kbs() -> list[dict]:
     return result
 
 
-def search_kb(query: str, kb_name: str = "accounting", top_k: int = 5) -> list[dict]:
-    """语义检索指定知识库。
+def search_kb(query: str, kb_name: str = "accounting", top_k: int = 5,
+              metadata_filter: Optional[dict] = None,
+              max_distance: Optional[float] = None,
+              hybrid: bool = True) -> list[dict]:
+    """检索指定知识库，并返回稳定引用与可审阅的检索信号。
 
-    Args:
-        query: 自然语言查询
-        kb_name: 知识库名 (accounting/industry/trading)
-        top_k: 返回条数
-
-    Returns:
-        [{"content": "...", "source": "文件名", "score": 0.85}, ...]
+    ``metadata_filter`` 仅允许白名单金融元数据（如 ``industry``、``symbol``、
+    ``document_type``、``is_current``），会转为 Chroma ``where``。``score`` 是
+    dense 排名与关键词匹配组成的检索排序分，**不是相关性概率**；若需硬阈值应使用
+    原始 ``distance`` 与离线评测确定 ``max_distance``。
     """
+    if not isinstance(query, str) or not query.strip():
+        return []
+    if top_k < 1:
+        return []
     _ensure_init()
 
     try:
@@ -873,43 +1073,118 @@ def search_kb(query: str, kb_name: str = "accounting", top_k: int = 5) -> list[d
         return []
 
     try:
-        results = col.query(
-            query_texts=[query],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"],
-        )
+        # 先扩大候选池，再以关键词精确匹配补足纯向量检索对代码、术语的遗漏。
+        query_args = {
+            "query_texts": [query],
+            "n_results": max(top_k, min(top_k * 4, 32)),
+            "include": ["documents", "metadatas", "distances"],
+        }
+        where = _build_metadata_filter(metadata_filter)
+        if where:
+            query_args["where"] = where
+        results = col.query(**query_args)
     except Exception as e:
         logger.exception("KB search failed for kb='%s' query='%s'", kb_name, query[:100])
         return []
 
-    items = []
+    candidates = []
     if results.get("ids") and results["ids"][0]:
-        for i in range(len(results["ids"][0])):
+        total = len(results["ids"][0])
+        terms = _keyword_terms(query) if hybrid else set()
+        for i in range(total):
             dist = results.get("distances", [[1]])[0][i] if results.get("distances") else 1.0
             meta = results["metadatas"][0][i] if results.get("metadatas") else {}
-            items.append({
-                "content": results["documents"][0][i] if results.get("documents") else "",
+            if max_distance is not None and dist is not None and float(dist) > max_distance:
+                continue
+            content = results["documents"][0][i] if results.get("documents") else ""
+            meta = meta or {}
+            chunk_id = results["ids"][0][i]
+            citation_id, citation_text = _citation(meta)
+            dense_rank_score = 1.0 if total == 1 else 1 - i / (total - 1)
+            keyword_score = _keyword_score(content, terms)
+            rank_score = (0.75 * dense_rank_score + 0.25 * keyword_score) if hybrid else dense_rank_score
+            candidates.append({
+                "id": chunk_id,
+                "chunk_id": chunk_id,
+                "doc_id": meta.get("doc_id", "unknown"),
+                "content": content,
                 "source": meta.get("filename", "unknown"),
                 "chunk": f"{meta.get('chunk_index', 0) + 1}/{meta.get('total_chunks', '?')}",
-                "score": round(max(0, 1 - dist), 3),
+                "distance": dist,
+                "vector_score": round(dense_rank_score, 3),
+                "keyword_score": round(keyword_score, 3),
+                "score": round(rank_score, 3),
+                "metadata": meta,
+                "source_url": meta.get("source_url", ""),
+                "published_at": meta.get("published_at", ""),
+                "citation_id": citation_id,
+                "citation": {
+                    "ref": f"{kb_name}:{citation_id}",
+                    "kb": kb_name,
+                    "doc_id": meta.get("doc_id", "unknown"),
+                    "chunk_id": chunk_id,
+                    "chunk_index": meta.get("chunk_index", 0),
+                    "filename": meta.get("filename", "unknown"),
+                    "source_url": meta.get("source_url", ""),
+                    "published_at": meta.get("published_at", ""),
+                    "location": f"片段 {meta.get('chunk_index', 0) + 1}/{meta.get('total_chunks', '?')}",
+                },
+                "citation_text": citation_text,
             })
 
-    return items
+    # 同一文档连续切片通常高度重复；限制每文档两块，提升跨来源覆盖度。
+    selected, per_document = [], {}
+    for item in sorted(candidates, key=lambda row: row["score"], reverse=True):
+        doc_id = str(item["doc_id"])
+        if per_document.get(doc_id, 0) >= 2:
+            continue
+        selected.append(item)
+        per_document[doc_id] = per_document.get(doc_id, 0) + 1
+        if len(selected) >= top_k:
+            break
+    return selected
 
 
-def upload_document(file_bytes: bytes, filename: str, kb_name: str = "accounting") -> dict:
+def format_retrieval_context(results: list[dict], *, max_chars: int = 1_200,
+                             excerpt_chars: int = 400) -> str:
+    """统一渲染可引用 RAG 证据，供 Agent 与 API prompt 复用。"""
+    lines, used = [], 0
+    for result in results:
+        excerpt = str(result.get("content", "")).strip()
+        if len(excerpt) > excerpt_chars:
+            excerpt = excerpt[:excerpt_chars].rstrip() + "…"
+        citation = result.get("citation_text", "")
+        ref = result.get("citation", {}).get("ref", result.get("citation_id", ""))
+        block = f"[RAG:{ref}]\n{excerpt}\n{citation}"
+        if used + len(block) + 1 > max_chars:
+            continue
+        lines.append(block)
+        used += len(block) + 1
+    return "\n---\n".join(lines)
+
+
+def upload_document(file_bytes: bytes, filename: str, kb_name: str = "accounting",
+                    metadata: Optional[dict] = None) -> dict:
     """上传并索引一份文档到指定知识库。
 
     Args:
         file_bytes: 文件原始字节
         filename: 原始文件名（用于识别格式）
         kb_name: 目标知识库名
+        metadata: 可选金融元数据（行业、股票代码、来源 URL、发布日期、文档类型等）
 
     Returns:
         {"doc_id": "...", "filename": "...", "chunks": N, "size": bytes, "kb": kb_name}
     """
     _ensure_init()
 
+    if not isinstance(file_bytes, (bytes, bytearray)) or not file_bytes:
+        raise ValueError("上传文件为空")
+    filename = os.path.basename(str(filename)).strip()
+    if not filename:
+        raise ValueError("文件名不能为空")
+    normalised_metadata = _normalise_source_metadata(
+        metadata, source="user", filename=filename, kb_name=kb_name)
     doc_id = str(uuid.uuid4())[:8]
     safe_name = f"{doc_id}_{filename}"
     file_path = os.path.join(_UPLOAD_DIR, safe_name)
@@ -935,17 +1210,30 @@ def upload_document(file_bytes: bytes, filename: str, kb_name: str = "accounting
         raise ValueError(f"文档切分后无有效内容（文本{len(text)}字）: {filename}")
 
     col = _get_kb_collection(kb_name)
+    content_hash = hashlib.sha256(bytes(file_bytes)).hexdigest()
+
+    # 文档哈希用于阻止同一文件在同一知识库被反复索引。旧索引没有该字段时保持兼容。
+    try:
+        existing = col.get(include=["metadatas"])
+        for existing_meta in existing.get("metadatas", []) or []:
+            if existing_meta and existing_meta.get("content_hash") == content_hash:
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+                raise ValueError(f"文件已索引（doc_id={existing_meta.get('doc_id', 'unknown')}）")
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.warning("Duplicate-document check failed for %s: %s", filename, e)
+
     chunk_ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
     metadatas = [
-        {
-            "doc_id": doc_id,
-            "filename": filename,
-            "chunk_index": i,
-            "total_chunks": len(chunks),
-            "upload_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "char_count": len(chunks[i]),
-            "kb": kb_name,
-        }
+        _chunk_metadata(
+            doc_id=doc_id, filename=filename, chunk_index=i, total_chunks=len(chunks),
+            char_count=len(chunks[i]), kb_name=kb_name, source="user",
+            source_metadata=normalised_metadata, content_hash=content_hash,
+        )
         for i in range(len(chunks))
     ]
 
@@ -972,6 +1260,7 @@ def upload_document(file_bytes: bytes, filename: str, kb_name: str = "accounting
         "chunks": len(chunks),
         "size": len(file_bytes),
         "preview": text[:200] + ("..." if len(text) > 200 else ""),
+        "metadata": normalised_metadata,
     }
 
 

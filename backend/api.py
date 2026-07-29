@@ -147,7 +147,9 @@ async def api_prompt_analysis(body: dict):
     # 并发拉取数据
     import concurrent.futures, re
     from backend.scoring_config import get_valuation as _get_val_cfg
-    from backend.accounting_rag import search_kb, seed_industry_kb
+    from backend.accounting_rag import (
+        format_retrieval_context, normalize_industry_for_rag, search_kb, seed_industry_kb,
+    )
 
     def _fetch_one(code):
         try:
@@ -180,11 +182,18 @@ async def api_prompt_analysis(body: dict):
     industry_names = list(set(re.findall(r'"行业":\s*"([^"]+)"', collected)))
     industry_rag = ""
     for ind_name in industry_names[:3]:
-        kb_results = search_kb(f"{ind_name} 分析 估值 护城河", "industry", top_k=2)
+        canonical_industry = normalize_industry_for_rag(ind_name)
+        metadata_filter = {"industry": canonical_industry, "is_current": True} if canonical_industry else None
+        kb_results = search_kb(
+            f"{ind_name} 分析 估值 护城河", "industry", top_k=2,
+            metadata_filter=metadata_filter,
+        )
+        if not kb_results and metadata_filter:
+            kb_results = search_kb(f"{ind_name} 分析 估值 护城河", "industry", top_k=2)
         if kb_results:
-            snippets = [r["content"][:400] for r in kb_results if r.get("content")]
-            if snippets:
-                industry_rag += f"\n[RAG行业模板-{ind_name}]\n" + "\n---\n".join(snippets) + "\n"
+            context = format_retrieval_context(kb_results, max_chars=900, excerpt_chars=400)
+            if context:
+                industry_rag += f"\n[RAG行业模板-{ind_name}]\n{context}\n"
 
     # 组装 Prompt（复用 agent.py 的 ANALYST_PROMPT）
     from backend.agent import ANALYST_PROMPT
@@ -194,7 +203,9 @@ async def api_prompt_analysis(body: dict):
     user_prompt = (
         f"用户问题: {question}\n\n"
         f"=== 已搜集数据 ===\n{collected}\n{industry_rag}\n"
-        f"[任务] 基于以上数据和行业模板，撰写完整分析JSON。输出纯JSON。{multi_note}"
+        f"[任务] 基于以上数据和行业模板，撰写完整分析JSON。若使用 [RAG:...] 证据，"
+        f"请在对应行业判断末尾保留该标签；不得编造标签。实时财务/行情数字以已搜集数据为准。"
+        f"输出纯JSON。{multi_note}"
     )
 
     return {

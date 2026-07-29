@@ -23,7 +23,7 @@ if __name__ == "__main__":
                 history = []; print("[context cleared]"); continue
             if not user_input: continue
 
-            history = compress_history(history)
+            history = compress_history(history, query=user_input)
             req_type = _classify_request(user_input)
 
             if req_type == "phantom":

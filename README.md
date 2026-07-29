@@ -90,6 +90,20 @@ streamlit run frontend/app.py    # Web UI
 - `LLM_PROVIDER=deepseek|openai|anthropic`：模型提供商
 - `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`：对应密钥
 
+### 对话上下文与结构化记忆
+
+Chat/CLI 会在长对话中使用“结构化事实账本 + 相关旧轮次 + 最近轮次”控制上下文长度。账本保留风险、仓位、估值、公告、财务事实等条目的关联股票代码和来源轮次，不调用 LLM 摘要。
+
+```env
+CONTEXT_RECENT_TURNS=3
+CONTEXT_TRIGGER_CHARS=12000
+CONTEXT_MAX_CHARS=16000
+CONTEXT_MEMORY_CHARS=2400
+CONTEXT_STRUCTURED_FACTS=24
+```
+
+这些数值按字符计，用于保守地约束传给模型的历史；实时行情和公告仍会在回答时重新取数。
+
 ### 多槽位 LLM 熔断链（新）
 
 支持 3 个 LLM 槽位配置，连续失败时自动切换：

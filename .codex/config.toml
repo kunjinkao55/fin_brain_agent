@@ -1,0 +1,3 @@
+[mcp_servers.stock-server]
+command = "python"
+args = ['C:\Users\kunji\Desktop\work learn\agent\MCP_server.py']
