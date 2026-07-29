@@ -86,6 +86,7 @@
 
 \section{项目经历}
 \datedsubsection{\textbf{FinBrain — 多agent工作流金融研究系统}}{2026.6 - 至今}
+仓库地址: \url{https://github.com/kunjinkao55/fin_brain_agent}
 \begin{itemize}
   \item \textbf{工作流编排}：基于 LangGraph StateGraph 拆分数据采集、实体分类、分析、估值、并行审校、修复与报告生成；以条件路由处理数据重取、审查通过/修复等状态迁移，形成可验证的任务闭环。
   \item \textbf{质量保障层（Harness）}：以 Pydantic 定义节点输入输出契约，将关键数值和规则的代码计算/校验与 LLM 解释、综合、生成解耦；并行 Critic 从逻辑、数据与领域规则复核结果，并以结构化反馈驱动修复。

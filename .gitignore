@@ -4,3 +4,8 @@ venv/
 __pycache__/
 *.pyc
 data/raw/
+
+# 文档（排除 README 和 README_CN）
+docs/*
+!docs/README.md
+!docs/README_CN.md
