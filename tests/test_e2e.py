@@ -821,6 +821,44 @@ class TestGraphRouting(unittest.TestCase):
         report = format_report(mock)
         self.assertIn("两套框架锚点不同", report)
 
+    def test_format_report_survives_none_fields(self):
+        """format_report 对 LLM 结构化输出的 None 字段必须健壮（防 [Report Error]）"""
+        from backend.tools import format_report
+        mock = {
+            "代码": "600131", "名称": "国网信通",
+            "投资评级": None,                       # 键存在但值为 None
+            "估值水位": {"PE": "32倍", "PB": "4.4", "市值": "222亿"},
+            "评分": {"盈利能力": {"得分": 7, "依据": None}},
+            "亮点": ["次新", None],
+            "风险": [None],
+            "机构共识": {"目标价": None, "净利润预测": None, "评级分布": None},
+            "情景估值": {"悲观": None, "基准": {"价格": 20, "EPS": 1, "PE": 20, "概率": "55%"}, "乐观": None},
+            "结论": None,
+            "操作建议": "当前18.5元，等待回调",
+        }
+        report = format_report(mock)
+        self.assertNotIn("Report Error", report)
+        self.assertIn("国网信通", report)
+        self.assertIn("盈利能力", report)
+
+    def test_format_report_survives_none_nested(self):
+        """二级 None（机构共识.目标价 / 情景.悲观 等）不得崩溃"""
+        from backend.tools import format_report
+        mock = {
+            "代码": "600131", "名称": "测试",
+            "机构共识": {"目标价": None},
+            "情景估值": {"悲观": None, "乐观": None},
+            "市场情绪": None,
+        }
+        report = format_report(mock)
+        self.assertNotIn("Report Error", report)
+
+    def test_format_report_rejects_non_dict(self):
+        """非 dict 输入返回防御性错误而非崩溃"""
+        from backend.tools import format_report
+        self.assertTrue(format_report(None).startswith("[Report Error]"))
+        self.assertTrue(format_report("not a dict").startswith("[Report Error]"))
+
     def test_merge_flash_into_profit_fill_kf(self):
         """快报回灌：同期间行缺扣非时必须补齐"""
         from backend.tools import merge_flash_into_profit

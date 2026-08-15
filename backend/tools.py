@@ -925,6 +925,48 @@ def format_report(analysis: dict) -> str:
     }
     """
     try:
+        # 入口清洗：LLM 结构化输出可能返回 None 字段。dict.get(key,{}) 对
+        # "键存在但值为 None" 不生效，后续 .get() 会崩。处理规则：
+        #   1) 已知"应为 dict"的字段若为 None → 归一为 {}
+        #   2) 已知"应为 list"的字段若为 None → 归一为 []
+        #   3) 顶层其他 None → 归一为 ""（防 "None" 字符串污染报告）
+        #   4) dict 内部值再深度归一（防二级 None，如 机构共识.目标价=None）
+        # 操作副本，避免污染调用方传入的 dict。
+        if not isinstance(analysis, dict):
+            return "[Report Error] analysis 不是 dict"
+        import copy as _copy
+        analysis = _copy.deepcopy(analysis)
+
+        _DICT_KEYS = {
+            "投资评级", "_fd_ctx", "估值水位", "评分", "情景估值", "结论",
+            "市场情绪", "可比公司对比", "一致预期前瞻", "公告", "机构共识",
+            "公司画像", "竞争优势", "催化剂", "市场预期拆解", "校验",
+            "目标价", "净利润预测", "评级分布", "悲观", "基准", "乐观",
+            "行情", "参考计算值", "_engines", "SOTP参考估值",
+        }
+        _LIST_KEYS = {
+            "亮点", "风险", "关键信号", "证伪条件", "观察指标", "监测表",
+            "逻辑漏洞", "财务误读", "行业误述",
+        }
+
+        def _normalize(obj):
+            if isinstance(obj, dict):
+                for k, v in list(obj.items()):
+                    if v is None:
+                        if k in _DICT_KEYS:
+                            obj[k] = {}
+                        elif k in _LIST_KEYS:
+                            obj[k] = []
+                        else:
+                            obj[k] = ""
+                    else:
+                        obj[k] = _normalize(v)
+                return obj
+            if isinstance(obj, list):
+                return [_normalize(x) for x in obj]
+            return obj
+
+        _normalize(analysis)
         lines = []
         code = analysis.get("代码", "?")
         name = analysis.get("名称", "?")

@@ -1103,64 +1103,142 @@ elif page == "Knowledge":
 # ========== Evaluation ==========
 elif page == "Evaluation":
     st.header("Agent Evaluation")
-    st.caption("量化评估 Agent 输出的稳定性、完整性和可靠性。不评估投资建议准确性——那是回测的事。")
+    st.caption("三层评估体系：数据管道（A）/ 推理质量（B）/ 审查链守卫（C）。A/B 真实运行需 LLM 与网络，C 离线。")
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        n_stocks = st.number_input("测试股票数量", min_value=1, max_value=10, value=2, key="eval_n")
-    with c2:
-        n_runs = st.number_input("每只运行次数", min_value=1, max_value=100, value=5, key="eval_runs")
+    eval_tab = st.tabs(["工程稳定性", "Layer A 数据管道", "Layer B 推理质量", "Layer C 审查链"])
 
-    symbols = []
-    cols = st.columns(min(n_stocks, 5))
-    for i in range(n_stocks):
-        with cols[i % 5]:
-            s = st.text_input(f"股票{i+1}", placeholder="600584", key=f"eval_sym_{i}")
-            if s.strip(): symbols.append(s.strip())
+    # ---------- Tab 0: 工程稳定性（原有 evaluate_stock） ----------
+    with eval_tab[0]:
+        st.caption("量化评估 Agent 输出的稳定性、完整性和可靠性。不评估投资建议准确性——那是回测的事。")
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            n_stocks = st.number_input("测试股票数量", min_value=1, max_value=10, value=2, key="eval_n")
+        with c2:
+            n_runs = st.number_input("每只运行次数", min_value=1, max_value=100, value=5, key="eval_runs")
 
-    if st.button("Run Evaluation", type="primary", disabled=len(symbols)==0, use_container_width=True):
-        from backend.evaluation import evaluate_stock
-        results = []
-        progress = st.progress(0)
-        total = len(symbols)
-        for idx, sym in enumerate(symbols):
-            st.caption(f"Evaluating {sym} ({n_runs} runs)...")
-            r = evaluate_stock(sym, int(n_runs))
-            results.append(r)
-            progress.progress((idx + 1) / total)
-        progress.empty()
+        symbols = []
+        cols = st.columns(min(n_stocks, 5))
+        for i in range(n_stocks):
+            with cols[i % 5]:
+                s = st.text_input(f"股票{i+1}", placeholder="600584", key=f"eval_sym_{i}")
+                if s.strip(): symbols.append(s.strip())
 
-        if results:
-            st.divider()
-            st.subheader("Results")
-            # Summary table
+        if st.button("Run Evaluation", type="primary", disabled=len(symbols)==0, use_container_width=True):
+            from backend.evaluation import evaluate_stock
+            results = []
+            progress = st.progress(0)
+            total = len(symbols)
+            for idx, sym in enumerate(symbols):
+                st.caption(f"Evaluating {sym} ({n_runs} runs)...")
+                r = evaluate_stock(sym, int(n_runs))
+                results.append(r)
+                progress.progress((idx + 1) / total)
+            progress.empty()
+
+            if results:
+                st.divider()
+                st.subheader("Results")
+                # Summary table
+                st.dataframe(
+                    [{k: v for k, v in r.items() if k != "原始分数"} for r in results],
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "代码": st.column_config.TextColumn("Stock", width="small"),
+                        "评分一致性": st.column_config.ProgressColumn("Score Consistency", format="%.0f%%", min_value=0, max_value=100),
+                        "字段完整率": st.column_config.ProgressColumn("Field Completeness", format="%.0f%%", min_value=0, max_value=100),
+                        "工具成功率": st.column_config.ProgressColumn("Tool Success", format="%.0f%%", min_value=0, max_value=100),
+                        "评分标准差": st.column_config.NumberColumn("Score StdDev", format="%.2f"),
+                        "平均延迟_ms": st.column_config.NumberColumn("Avg Latency(ms)", format="%.0f"),
+                    }
+                )
+                # Overall metrics
+                avg_cons = sum(r["评分一致性"] for r in results) / len(results)
+                avg_field = sum(r["字段完整率"] for r in results) / len(results)
+                avg_tool = sum(r["工具成功率"] for r in results) / len(results)
+                total_errs = sum(r["错误次数"] for r in results)
+                c1, c2, c3, c4 = st.columns(4)
+                with c1: st.metric("Score Consistency", f"{avg_cons:.0f}%")
+                with c2: st.metric("Field Completeness", f"{avg_field:.0f}%")
+                with c3: st.metric("Tool Success", f"{avg_tool:.0f}%")
+                with c4: st.metric("Total Errors", total_errs)
+                # Score distribution
+                with st.expander("Score Distribution", expanded=False):
+                    for r in results:
+                        if r.get("原始分数"):
+                            st.caption(f"{r['代码']}: {r['原始分数']}")
+
+    # ---------- Tab 1: Layer A 数据管道 ----------
+    with eval_tab[1]:
+        st.subheader("Layer A — 数据管道黄金比对")
+        st.caption("把「数据管道正确性」和「agent 推理正确性」分开：免费 API 数据错（股本未除权/财报滞后/字段缺失）不算 agent 幻觉。real 股做精确数值比对，synthetic 股做结构校验。")
+        from backend.eval_suite.golden_pool import GOLDEN_STOCKS, SECTORS
+
+        pool_opts = {f"{g.name}({sym}) [{g.sector}]": sym for sym, g in GOLDEN_STOCKS.items()}
+        sel = st.multiselect("选择评估标的（黄金股票池，覆盖 9 大板块）", list(pool_opts.keys()), default=list(pool_opts.keys())[:1])
+        symbols_a = [pool_opts[s] for s in sel]
+
+        if st.button("Run Data Pipeline Eval", type="primary", disabled=not symbols_a, use_container_width=True):
+            from backend.eval_suite.data import evaluate_data_pipeline, format_pipeline_report
+            with st.spinner("真实抓取数据中（需网络）..."):
+                report = evaluate_data_pipeline(symbols_a)
+            st.metric("通过率", f"{report['通过率']:.0%}", help=f"{report['通过数']}/{report['股票数']} 通过")
+            for r in report["逐只"]:
+                g = GOLDEN_STOCKS.get(r["代码"])
+                tag = f"[{g.name} {g.sector}] 源={g.source}" if g else r["代码"]
+                if r.get("通过"):
+                    st.success(f"{tag} 通过")
+                else:
+                    st.error(f"{tag} 违规")
+                    for v in r.get("违规", []):
+                        st.caption(f"  ✗ {v}")
+                    for k, err in (r.get("抓取错误") or {}).items():
+                        if err:
+                            st.caption(f"  抓取错误[{k}]: {err}")
+            with st.expander("完整文本报告", expanded=False):
+                st.code(format_pipeline_report(report), language="text")
+
+    # ---------- Tab 2: Layer B 推理质量 ----------
+    with eval_tab[2]:
+        st.subheader("Layer B — analyst 推理质量")
+        st.caption("冻结黄金 collected_data，跑真实 analyst（LLM），度量幻觉率/字段完整率/黄金事实命中/结构化质量。需要 LLM 配置。")
+        from backend.eval_suite.golden_pool import GOLDEN_STOCKS as _GB
+
+        pool_opts_b = {f"{g.name}({sym}) [{g.sector}]": sym for sym, g in _GB.items()}
+        sel_b = st.selectbox("选择标的（黄金股票池）", list(pool_opts_b.keys()))
+        runs_b = st.number_input("运行次数", min_value=1, max_value=10, value=1, key="eval_b_runs")
+
+        if st.button("Run Analyst Eval", type="primary", use_container_width=True):
+            from backend.eval_suite.analyst import evaluate_analyst, format_analyst_report
+            sym_b = pool_opts_b[sel_b]
+            with st.spinner(f"运行 {sym_b} analyst 评估（真实 LLM）..."):
+                report_b = evaluate_analyst(sym_b, runs=int(runs_b))
+            st.code(format_analyst_report(report_b), language="text")
+            if "平均幻觉率" in report_b:
+                c1, c2, c3, c4 = st.columns(4)
+                with c1: st.metric("字段完整率", f"{report_b['平均字段完整率']:.0%}")
+                with c2: st.metric("幻觉率", f"{report_b['平均幻觉率']:.1%}")
+                with c3: st.metric("黄金事实命中", f"{report_b['平均黄金事实命中率']:.0%}")
+                with c4: st.metric("结构化通过", f"{report_b['结构化通过率']:.0%}")
+                if report_b.get("失败次数"):
+                    st.warning(f"{report_b['失败次数']} 次运行失败: {report_b.get('错误', [])[:3]}")
+
+    # ---------- Tab 3: Layer C 审查链 ----------
+    with eval_tab[3]:
+        st.subheader("Layer C — 审查链 fault-injection")
+        st.caption("离线（不调 LLM/网络）：把已知错误类型注入黄金数据，验证确定性守卫能否检出。检出率 100% = 守卫健全。")
+        if st.button("Run Fault Injection", type="primary", use_container_width=True):
+            from backend.eval_suite import run_fault_injection, format_report
+            with st.spinner("运行审查链故障注入..."):
+                report_c = run_fault_injection()
+            st.metric("检出率", f"{report_c['检出率']:.0%}", help=f"{report_c['检出数']}/{report_c['总故障数']} 检出")
+            st.metric("阴性误报", f"{report_c['阴性误报']}", help="干净黄金数据的误报数，应为 0")
             st.dataframe(
-                [{k: v for k, v in r.items() if k != "原始分数"} for r in results],
+                [{"ID": r["id"], "阶段": r["阶段"], "故障": r["名称"], "检出": "✅" if r["检出"] else "❌",
+                  "零误报": "✅" if r["零误报"] else "❌", "期望守卫": r["期望守卫"]} for r in report_c["明细"]],
                 use_container_width=True, hide_index=True,
-                column_config={
-                    "代码": st.column_config.TextColumn("Stock", width="small"),
-                    "评分一致性": st.column_config.ProgressColumn("Score Consistency", format="%.0f%%", min_value=0, max_value=100),
-                    "字段完整率": st.column_config.ProgressColumn("Field Completeness", format="%.0f%%", min_value=0, max_value=100),
-                    "工具成功率": st.column_config.ProgressColumn("Tool Success", format="%.0f%%", min_value=0, max_value=100),
-                    "评分标准差": st.column_config.NumberColumn("Score StdDev", format="%.2f"),
-                    "平均延迟_ms": st.column_config.NumberColumn("Avg Latency(ms)", format="%.0f"),
-                }
             )
-            # Overall metrics
-            avg_cons = sum(r["评分一致性"] for r in results) / len(results)
-            avg_field = sum(r["字段完整率"] for r in results) / len(results)
-            avg_tool = sum(r["工具成功率"] for r in results) / len(results)
-            total_errs = sum(r["错误次数"] for r in results)
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: st.metric("Score Consistency", f"{avg_cons:.0f}%")
-            with c2: st.metric("Field Completeness", f"{avg_field:.0f}%")
-            with c3: st.metric("Tool Success", f"{avg_tool:.0f}%")
-            with c4: st.metric("Total Errors", total_errs)
-            # Score distribution
-            with st.expander("Score Distribution", expanded=False):
-                for r in results:
-                    if r.get("原始分数"):
-                        st.caption(f"{r['代码']}: {r['原始分数']}")
+            with st.expander("完整报告", expanded=False):
+                st.code(format_report(report_c), language="text")
 
 # ========== Backtest ==========
 elif page == "Backtest":
